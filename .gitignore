@@ -1,0 +1,21 @@
+# Secrets and runtime state -- never commit these
+.env
+venv/
+sessions.json
+sessions.json.bak*
+allowed_groups.json
+MEMORY.md
+lite-agent.log
+
+# Generated from templates at install time -- contains YOUR real infra details
+# (node IPs, hard boundaries). Never commit a filled-in copy of these.
+/SOUL.md
+/GEMINI.md
+
+# Python
+__pycache__/
+*.pyc
+
+# OS cruft
+.DS_Store
+Thumbs.db

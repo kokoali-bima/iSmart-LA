@@ -1,0 +1,4 @@
+{
+  "_comment": "Registry of graduated skills. A 'graduated' skill is a question class already solved once and turned into a deterministic parameterized script, so answering it again costs no model exploration. Written by /graduate (explicit user command only) -- never automatically. Starts empty; entries accumulate as you use /graduate.",
+  "tools": []
+}
