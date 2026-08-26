@@ -363,13 +363,37 @@ def run_claude(prompt: str, session_id: Optional[str], session_name: str, model:
 # agy (Antigravity CLI) invocation -- native Gemini access, fixed-price
 # --------------------------------------------------------------------------
 
-def _build_agy_prompt(prompt: str) -> str:
-    """agy has no --append-system-prompt equivalent, so MEMORY.md content (if
-    any) is folded into the prompt text itself instead."""
+def _build_agy_prompt(prompt: str, include_env: bool = False) -> str:
+    """agy has no --append-system-prompt equivalent, so context is folded into
+    the prompt text itself.
+
+    GEMINI.md (the environment brief) is SUPPOSED to be auto-loaded by agy from
+    its working directory, but that behaviour is undocumented and could not be
+    verified from the outside -- and there is direct evidence against relying on
+    it: a rule added to GEMINI.md ("export images as JPEG, never PNG") was
+    ignored by the very next fresh conversation, which went on to render an 89MB
+    PNG that Telegram then refused to accept. Rather than keep guessing, the
+    brief is now injected explicitly, exactly like MEMORY.md already was.
+
+    It is only injected when STARTING a conversation (include_env=True), never
+    on a resumed turn -- once it is in the conversation history the model still
+    has it, so re-sending ~2.5k tokens every turn would be pure waste.
+    """
+    parts: list[str] = []
+    if include_env and GEMINI_PROMPT_FILE.exists():
+        env_text = GEMINI_PROMPT_FILE.read_text().strip()
+        if env_text:
+            parts.append(
+                "[Working-environment instructions -- MUST be followed for this "
+                f"entire conversation:]\n{env_text}"
+            )
     memory_text = load_memory_text()
-    if not memory_text:
+    if memory_text:
+        parts.append(f"[Cross-session facts to remember:]\n{memory_text}")
+    if not parts:
         return prompt
-    return f"[Cross-session facts to remember:]\n{memory_text}\n\n[User's question:]\n{prompt}"
+    parts.append(f"[User's question:]\n{prompt}")
+    return "\n\n".join(parts)
 
 
 def _run_agy_once(prompt: str, model: str, conversation_id: Optional[str]) -> dict:
@@ -450,13 +474,18 @@ def run_combo(prompt: str, sess: dict, session_name: str) -> tuple[dict, str, li
     attempts before the turn that actually produced the answer.
     """
     attempts: list[str] = []
-    agy_prompt = _build_agy_prompt(prompt)
     agy_convs = sess.setdefault("agy", {})  # {model_name: conversation_id}
     claude_sessions = sess.setdefault("claude", {})  # {model_name: session_id}
 
     for model in (AGY_MODEL_PRIMARY, AGY_MODEL_FALLBACK):
+        conv_id = agy_convs.get(model)
+        # Each tier keeps its OWN conversation, so "is this a fresh conversation"
+        # is a per-model question -- the env brief has to go to whichever tier is
+        # starting from nothing, which may be the fallback even while the primary
+        # is already mid-conversation.
+        agy_prompt = _build_agy_prompt(prompt, include_env=(conv_id is None))
         try:
-            parsed = _run_agy_once(agy_prompt, model, agy_convs.get(model))
+            parsed = _run_agy_once(agy_prompt, model, conv_id)
             u = parsed.get("usage", {}) or {}
             attempts.append(f"agy:{model} OK ({u.get('total_tokens', '?')} tok)")
             agy_convs[model] = parsed.get("conversation_id")

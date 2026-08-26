@@ -102,20 +102,61 @@ would be needed. Actually execute it:
 4. Deliver the final file by putting a line by itself in your final reply reading
    exactly `MEDIA:` followed by the absolute file path.
 
-## Exporting a report as an image (JPEG), not PDF
+## Exporting a report as images: SLIDE DECK format, JPEG only
 
-If asked for a picture/screenshot of a report instead of a PDF, use `wkhtmltoimage`
-(same binary as `wkhtmltopdf` above) rather than reaching for a Python imaging library --
-on a minimal VM, PIL/matplotlib/seaborn/graphviz/playwright/selenium and even `pip`
-itself are typically NOT installed, and probing for each one before failing over wastes
-a handful of tool-call round trips every time. Check once what's actually available on
-your VM and write it down here so future turns don't re-probe.
+Check ONCE what image tooling your VM actually has and record it here, so the model
+never re-probes. On a minimal Ubuntu VM the usual answer is:
+- **Works:** `wkhtmltoimage --width 1920 --disable-smart-width <in.html> <out.jpg>`
+  (same package as `wkhtmltopdf` above)
+- **NOT installed, never try:** PIL, matplotlib, seaborn, graphviz, playwright,
+  selenium, and `pip` itself. Probing each one before falling back burns several
+  tool-call round trips on every single request.
 
-**Output format: JPEG, not PNG.** A full-page dashboard screenshot in lossless PNG can
-balloon to tens of MB (a real dashboard export once hit ~59MB and was rejected outright
-by Telegram's 50MB bot upload limit -- pure wasted render time), while the identical
-screenshot as JPEG is typically 1-2MB. Produce exactly one output file in JPEG format;
-don't also save a redundant `.png` or a `.jpeg`-vs-`.jpg` duplicate "just in case".
+### Absolute rules
+
+1. **NEVER produce a PNG** -- not as a by-product, not "just in case", not as an
+   intermediate. Full-page dashboard screenshots in lossless PNG have come out at
+   59MB and 89MB in real use, over Telegram's 50MB limit, so they get thrown away:
+   pure wasted render time. The identical content as JPEG is 1-2MB. Produce `.jpg`
+   only, one extension, no `.jpeg` duplicate.
+
+2. **NEVER render one enormous full-page screenshot.** A 1600x14000px image is
+   unreadable -- the reader scrolls a wall of tiny rows, which defeats the point of
+   asking for a picture at all.
+
+3. **NEVER build a deck by slicing a long page into strips.** Equal-height cuts leave
+   headings orphaned from their content and rows sliced in half. That is not a
+   presentation.
+
+### What to produce instead
+
+A **real slide deck**: several separate HTML pages, each authored to fit ONE fixed
+slide, each rendered to its own JPEG.
+
+- Slide canvas exactly **1920x1080** -- `width:1920px; height:1080px; overflow:hidden`
+  on the slide container, rendered with `--width 1920`.
+- **Content must FIT.** Roughly 4-6 detail cards or ~12 table rows per slide, and
+  paginate BY CONTENT ("Critical VMs (1 of 2)"). If content overruns 1080px the
+  footer overlaps the last card and the slide looks broken -- when in doubt, fewer
+  items on more slides.
+- Structure by MEANING, not row order: executive overview first, then critical items
+  with a recommended action each, then warnings, then a summarised healthy section
+  (counts and groups, not one card per healthy host).
+- Every slide gets a title, a slide number ("SLIDE 02 / 06"), and a one-line subtitle.
+- Keep the interactive HTML report as a SEPARATE deliverable -- HTML is where full
+  detail and interactivity live; the JPEGs are for reading at a glance.
+
+### Delivering more than one file
+
+Past about 3 files, **zip the deck** and deliver one archive rather than a dozen
+attachments (make sure `zip` is actually installed -- it often isn't by default):
+
+```
+cd <slides_dir> && zip -j -q /path/to/cluster_slides.zip slide*.jpg
+```
+
+Deliver the `.zip` plus the HTML report via `MEDIA:` lines, and delete any oversized
+intermediate files before finishing.
 
 ## Batch independent tool calls together
 
