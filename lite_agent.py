@@ -55,6 +55,7 @@ from pathlib import Path
 from typing import Optional
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.error import BadRequest
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -532,9 +533,146 @@ def _authorized(update: Update) -> bool:
     return user_id in ALLOWED_USER_IDS
 
 
-async def _reply_chunked(update: Update, text: str) -> None:
-    for i in range(0, len(text), 4000):
-        await update.message.reply_text(text[i:i + 4000])
+# --------------------------------------------------------------------------
+# Rendering model output for Telegram
+#
+# Models write Markdown. Telegram does NOT render Markdown unless asked, and
+# even then its Markdown dialects are strict enough that one stray character in
+# a long generated report rejects the WHOLE message. So replies used to be sent
+# with no parse_mode at all -- which is why real reports arrived showing literal
+# "### Heading", "**bold**" and backticks instead of formatted text.
+#
+# HTML mode is the forgiving option: escape the text first, then emit only the
+# small tag set Telegram actually supports (b, i, u, s, code, pre, a). Anything
+# Telegram has no concept of -- headings, tables, bullet syntax, horizontal
+# rules -- is converted into something that still reads correctly rather than
+# being passed through raw.
+# --------------------------------------------------------------------------
+
+_CODE_BLOCK_RE = re.compile(r"```[ \t]*([\w+-]*)[ \t]*\n(.*?)```", re.DOTALL)
+_INLINE_CODE_RE = re.compile(r"`([^`\n]+)`")
+_BOLD_RE = re.compile(r"\*\*(.+?)\*\*", re.DOTALL)
+_ITALIC_RE = re.compile(r"(?<![\w*])\*([^*\n]+?)\*(?![\w*])")
+_LINK_RE = re.compile(r"\[([^\]\n]+)\]\((https?://[^)\s]+|file://[^)\s]+)\)")
+_HEADING_RE = re.compile(r"^[ \t]*#{1,6}[ \t]*(.+?)[ \t]*#*$", re.MULTILINE)
+_BULLET_RE = re.compile(r"^([ \t]*)[-*+][ \t]+(?=\S)", re.MULTILINE)
+_HRULE_RE = re.compile(r"^[ \t]*(?:-{3,}|\*{3,}|_{3,})[ \t]*$", re.MULTILINE)
+_TABLE_SEP_RE = re.compile(r"^[ \t]*\|?[ \t]*:?-{2,}:?[ \t]*(\|[ \t]*:?-{2,}:?[ \t]*)+\|?[ \t]*$")
+
+
+def _tg_escape(s: str) -> str:
+    return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def _wrap_tables(text: str) -> str:
+    """Telegram cannot render tables at all. Rather than let a report's table
+    arrive as a pile of stray pipes, wrap contiguous table blocks in <pre> so
+    the columns at least stay aligned in the monospace font."""
+    lines = text.split("\n")
+    out: list[str] = []
+    block: list[str] = []
+
+    def flush() -> None:
+        if not block:
+            return
+        # Only treat it as a table if a separator row was present; a lone line
+        # containing a pipe is far more likely to be prose or a shell command.
+        if any(_TABLE_SEP_RE.match(ln) for ln in block):
+            out.append("<pre>" + "\n".join(block) + "</pre>")
+        else:
+            out.extend(block)
+        block.clear()
+
+    for line in lines:
+        if line.count("|") >= 2:
+            block.append(line)
+        else:
+            flush()
+            out.append(line)
+    flush()
+    return "\n".join(out)
+
+
+def _md_to_telegram_html(text: str) -> str:
+    """Convert a model's Markdown into the subset of HTML Telegram accepts."""
+    placeholders: list[str] = []
+
+    def _stash(html: str) -> str:
+        placeholders.append(html)
+        return f"\x00{len(placeholders) - 1}\x00"
+
+    # Code first: its contents must survive untouched by every rule below.
+    def _code_block(m: re.Match) -> str:
+        lang, body = m.group(1), m.group(2)
+        body = _tg_escape(body.rstrip("\n"))
+        if lang:
+            return _stash(f'<pre><code class="language-{lang}">{body}</code></pre>')
+        return _stash(f"<pre>{body}</pre>")
+
+    text = _CODE_BLOCK_RE.sub(_code_block, text)
+    text = _INLINE_CODE_RE.sub(lambda m: _stash(f"<code>{_tg_escape(m.group(1))}</code>"), text)
+    text = _LINK_RE.sub(
+        lambda m: _stash(f'<a href="{_tg_escape(m.group(2))}">{_tg_escape(m.group(1))}</a>'),
+        text,
+    )
+
+    text = _tg_escape(text)
+    text = _wrap_tables(text)
+    text = _HRULE_RE.sub("─" * 20, text)
+    text = _HEADING_RE.sub(lambda m: f"<b>{m.group(1)}</b>", text)
+    text = _BOLD_RE.sub(lambda m: f"<b>{m.group(1)}</b>", text)
+    text = _ITALIC_RE.sub(lambda m: f"<i>{m.group(1)}</i>", text)
+    text = _BULLET_RE.sub(lambda m: f"{m.group(1)}• ", text)
+
+    for i, html in enumerate(placeholders):
+        text = text.replace(f"\x00{i}\x00", html)
+    return text
+
+
+def _chunk_lines(text: str, limit: int) -> list[str]:
+    """Split on line boundaries, never mid-line. Conversion happens per chunk,
+    so tags can never end up split across two messages (which would make
+    Telegram reject the half that has an unclosed tag)."""
+    chunks: list[str] = []
+    current = ""
+    for line in text.split("\n"):
+        while len(line) > limit:  # pathological single long line
+            if current:
+                chunks.append(current)
+                current = ""
+            chunks.append(line[:limit])
+            line = line[limit:]
+        candidate = f"{current}\n{line}" if current else line
+        if len(candidate) > limit:
+            chunks.append(current)
+            current = line
+        else:
+            current = candidate
+    if current:
+        chunks.append(current)
+    return chunks or [""]
+
+
+async def _reply_chunked(update: Update, text: str, tag_html: str = "") -> None:
+    """Send a (possibly long) model reply, formatted. `tag_html` is appended to
+    the LAST chunk only and is passed through as trusted HTML -- it's our own
+    backend label, not model output."""
+    chunks = _chunk_lines(text, 3500)
+    for idx, chunk in enumerate(chunks):
+        body = _md_to_telegram_html(chunk)
+        if idx == len(chunks) - 1 and tag_html:
+            body = f"{body}\n\n{tag_html}"
+        try:
+            await update.message.reply_text(body, parse_mode="HTML")
+        except BadRequest as exc:
+            # A malformed-entity rejection must never cost the user the whole
+            # answer -- fall back to sending it unformatted rather than losing it.
+            logger.warning("HTML formatting rejected by Telegram (%s); sending as plain text", exc)
+            plain = chunk
+            if idx == len(chunks) - 1 and tag_html:
+                plain = f"{plain}\n\n{re.sub(r'<[^>]+>', '', tag_html)}"
+            await update.message.reply_text(plain)
+
 
 
 def extract_media_paths(text: str) -> tuple[str, list[str]]:
@@ -1041,7 +1179,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     for attempt in (1, 2):
         try:
             if clean_text:
-                await _reply_chunked(update, f"{clean_text}\n\n— _by {label}_")
+                await _reply_chunked(update, clean_text, tag_html=f"— <i>by {label}</i>")
             sent_hashes: set[str] = set()
             for path in media_paths:
                 await _send_media_file(update, path, sent_hashes)
