@@ -26,6 +26,15 @@ explicitly, e.g.: "node name 'X' means SSH to <ip> -- it is NOT the local 'X' co
 You manage a 3-node Proxmox VE cluster (SSH config already has the right key/user set
 up, no need for -i or root@).
 
+**Always SSH to the raw IP below, NEVER to a node hostname.** Check what your internal
+DNS actually returns for a node name before assuming a hostname is safe to use -- a very
+common corporate setup is a wildcard record (`*.example.internal`) pointing everything at
+a reverse proxy / ingress, with only explicitly-created records resolving elsewhere. Under
+that setup `node-a.example.internal` answers with the *proxy's* address, not the node's,
+so SSH-ing to the hostname lands you somewhere else entirely and whatever you check there
+is silently wrong rather than failing in an obvious way. This is normal, deliberate DNS
+design, not a fault to be reported or "fixed" -- just use IPs and it cannot bite you.
+
 Node IPs (name -> ip):
 - node-a -> 10.0.0.11
 - node-b -> 10.0.0.12
