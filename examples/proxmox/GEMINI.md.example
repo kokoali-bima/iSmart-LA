@@ -102,6 +102,21 @@ would be needed. Actually execute it:
 4. Deliver the final file by putting a line by itself in your final reply reading
    exactly `MEDIA:` followed by the absolute file path.
 
+## Exporting a report as an image (JPEG), not PDF
+
+If asked for a picture/screenshot of a report instead of a PDF, use `wkhtmltoimage`
+(same binary as `wkhtmltopdf` above) rather than reaching for a Python imaging library --
+on a minimal VM, PIL/matplotlib/seaborn/graphviz/playwright/selenium and even `pip`
+itself are typically NOT installed, and probing for each one before failing over wastes
+a handful of tool-call round trips every time. Check once what's actually available on
+your VM and write it down here so future turns don't re-probe.
+
+**Output format: JPEG, not PNG.** A full-page dashboard screenshot in lossless PNG can
+balloon to tens of MB (a real dashboard export once hit ~59MB and was rejected outright
+by Telegram's 50MB bot upload limit -- pure wasted render time), while the identical
+screenshot as JPEG is typically 1-2MB. Produce exactly one output file in JPEG format;
+don't also save a redundant `.png` or a `.jpeg`-vs-`.jpg` duplicate "just in case".
+
 ## Batch independent tool calls together
 
 Request multiple INDEPENDENT actions as PARALLEL tool calls in the SAME turn instead

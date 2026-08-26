@@ -166,6 +166,14 @@ AGY_PRINT_TIMEOUT = os.environ.get("AGY_PRINT_TIMEOUT", "280s")
 AGY_TIMEOUT = int(os.environ.get("AGY_TIMEOUT_SECONDS", "300"))
 # Telegram Bot API's own upload limit for bot-sent documents.
 TELEGRAM_MAX_FILE_BYTES = 50 * 1024 * 1024
+# python-telegram-bot's default HTTP timeouts (~5s read/write) are tuned for
+# small text replies, not multi-MB document uploads -- a legitimately slow
+# upload (large file, or Telegram taking a moment to process/store it before
+# replying) trips a ReadTimeout on OUR side even though the file already
+# reached Telegram and the message posts anyway, producing a confusing
+# "failed to send" error alongside a file that's actually sitting right there
+# in the chat. Give document uploads a much longer budget specifically.
+MEDIA_UPLOAD_TIMEOUT = 120
 # Claude Code emits a line like "MEDIA:/tmp/report.pdf" in its final reply
 # when it wants a generated file delivered as a real attachment (see SOUL.md's
 # report-generation guidance) -- this pulls those lines out and sends the
@@ -577,7 +585,13 @@ async def _send_media_file(update: Update, path: str, sent_hashes: set[str]) -> 
         return
     try:
         with p.open("rb") as f:
-            await update.message.reply_document(document=f, filename=p.name)
+            await update.message.reply_document(
+                document=f,
+                filename=p.name,
+                read_timeout=MEDIA_UPLOAD_TIMEOUT,
+                write_timeout=MEDIA_UPLOAD_TIMEOUT,
+                connect_timeout=30,
+            )
         logger.info("sent media file: %s (%d bytes)", p, size)
         if digest is not None:
             sent_hashes.add(digest)
