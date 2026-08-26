@@ -122,7 +122,7 @@ choose.
 | `/chatid` | free, no auth needed | Reveal the current chat's ID (for group/access setup) |
 | `/registergroup` | admin only | Open this Telegram group to every member, no restart needed |
 | `/unregistergroup` | admin only | Revoke a group's access |
-| `/help` | free | Full in-chat guide |
+| `/help` | free | Full in-chat guide -- bilingual, pick EN or ID (or `/help en` / `/help id` directly) |
 
 ### Graduated skills (`/graduate`)
 
@@ -211,6 +211,6 @@ systemd/
 ## Credits
 
 🚀 **Designed by Koko Ali & Dede**
-💻 **Developed by BSCloud.id Team**
+💻 **Developed by Infrasoft.cloud & BSCloud.id Team**
 
 Happy smart working! ✨

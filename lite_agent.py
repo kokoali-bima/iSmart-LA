@@ -53,8 +53,15 @@ import sys
 from pathlib import Path
 from typing import Optional
 
-from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.ext import (
+    Application,
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
 
 # --------------------------------------------------------------------------
 # Config
@@ -832,12 +839,19 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "\U0001f44b Lite Agent is ready. Send anything to get started (status checks, "
         "investigations, reports, etc).\n\n"
         "Type /help for the full guide + command list.\n\n"
-        "\U0001f680 Designed by Koko Ali & Dede · Developed by BSCloud.id Team\n"
+        "\U0001f680 Designed by Koko Ali & Dede · Developed by Infrasoft.cloud & BSCloud.id Team\n"
         "Happy smart working! ✨"
     )
 
 
-HELP_TEXT = f"""\U0001f4d6 *Lite Agent — Usage Guide*
+_HELP_CREDITS = (
+    "━━━━━━━━━━━━━━━━━━━\n"
+    "\U0001f680 *Designed by Koko Ali & Dede*\n"
+    "\U0001f4bb *Developed by Infrasoft.cloud & BSCloud.id Team*\n\n"
+    "Happy smart working! ✨\U0001f929\U0001f60e"
+)
+
+HELP_TEXT_EN = f"""\U0001f4d6 *iSmart-LA — Usage Guide*
 
 *How it works*
 Every message is tried through 4 tiers, cheapest first:
@@ -857,7 +871,7 @@ Every reply ends with a "— by ..." tag. If it's ever NOT "{BACKEND_LABELS[AGY_
 /sessions — list all saved sessions
 /remember <fact> — save a fact PERMANENTLY, read in EVERY session & EVERY tier, even after many /new
 /memory — view current memory contents
-/help — this guide
+/help — this guide (choose EN or ID)
 
 *3 habits that keep it cheap*
 1. *`/new` every time the topic changes.* A continuing conversation history is EXPENSIVE -- the longer it gets, the more expensive every next turn (can be 10-20x if left to pile up). Infra case closed → want to ask something unrelated? `/new` first.
@@ -870,17 +884,75 @@ If this group has been registered by an admin (check with `/chatid`), EVERY memb
 2. Sessions (`/new`, `/session`) in this group are *separate* from each member's private DM -- safely isolated. But `/remember` is *GLOBAL* across every chat including this group -- if someone remembers a fact here, everyone here (and in every other chat with this bot) can see it via `/memory`.
 3. This group doesn't have access yet? An admin just needs to type `/registergroup` here -- takes effect immediately, no restart needed. (`/unregistergroup` to revoke it again.)
 
-━━━━━━━━━━━━━━━━━━━
-\U0001f680 *Designed by Koko Ali & Dede*
-\U0001f4bb *Developed by BSCloud.id Team*
+{_HELP_CREDITS}"""
 
-Happy smart working! ✨\U0001f929\U0001f60e"""
+HELP_TEXT_ID = f"""\U0001f4d6 *iSmart-LA — Panduan Pemakaian*
+
+*Cara kerjanya*
+Setiap pesan dicoba lewat 4 tingkatan, dari yang paling murah dulu:
+1. {BACKEND_LABELS[AGY_MODEL_PRIMARY]} — Gemini Flash (harga tetap, utama)
+2. {BACKEND_LABELS[AGY_MODEL_FALLBACK]} — Gemini Pro-low (cadangan #1)
+3. {BACKEND_LABELS[CLAUDE_MODEL_PRIMARY]} — Claude Haiku (cadangan #2)
+4. {BACKEND_LABELS[CLAUDE_MODEL_FALLBACK]} — Claude Sonnet (opsi terakhir)
+
+Setiap balasan diakhiri tanda "— by ...". Kalau tandanya BUKAN "{BACKEND_LABELS[AGY_MODEL_PRIMARY]}", itu sinyal ada gangguan di salah satu layanan (rate limit, auth, dll) -- gampang dipantau sekilas tanpa perlu buka log.
+
+*Daftar perintah*
+/status — cek status instan, NOL token (langsung dari script, bukan model)
+/tools — daftar skill yang sudah dijadikan script, NOL token
+/graduate <nama> — ubah case yang BARU SAJA diselesaikan jadi script yang bisa dipakai ulang (gratis dipakai lagi)
+/new — mulai ulang sesi AKTIF dari nol (riwayat percakapan direset, MEMORY.md tidak berubah)
+/session <nama> — buat/pindah ke sesi bernama, untuk memisahkan case yang berbeda
+/sessions — lihat semua sesi yang tersimpan
+/remember <fakta> — simpan fakta PERMANEN, dibaca di SETIAP sesi & SETIAP tingkatan, meski sudah berkali-kali /new
+/memory — lihat isi memori saat ini
+/help — panduan ini (pilih EN atau ID)
+
+*3 kebiasaan supaya tetap irit*
+1. *`/new` setiap topik berganti.* Riwayat percakapan yang terus nyambung itu MAHAL -- makin panjang, makin mahal setiap giliran berikutnya (bisa 10-20x kalau dibiarkan menumpuk). Case infra sudah selesai → mau tanya hal lain yang tidak nyambung? `/new` dulu.
+2. *Jangan `/new` DI ANTARA "buatkan laporan" dan "kirim ke saya".* Sesi baru tidak ingat laporan mana yang baru saja dibuat -- minta "kirim filenya" di sesi baru malah bikin dia mencari semua laporan lama yang pernah ada dan menawarkan semuanya.
+3. *Fakta penting → `/remember`, bukan riwayat chat.* Case yang sudah selesai/diputuskan masukkan ke `/remember` supaya tidak ditanyakan/diselidiki ulang -- ini SATU-SATUNYA yang bertahan lintas `/new`.
+
+*Memakainya di Grup Telegram*
+Kalau grup ini sudah didaftarkan admin (cek dengan `/chatid`), SEMUA anggota otomatis bisa kasih perintah ke bot -- tidak perlu whitelist per orang.
+1. Kalau bot cuma merespon *perintah* (`/status` dll), bukan pesan biasa -- mention botnya (`@namabot ...`) atau reply salah satu pesannya supaya pasti terlihat (ini pengaturan default Telegram sendiri, bukan keterbatasan dari sisi kita).
+2. Sesi (`/new`, `/session`) di grup ini *terpisah* dari DM pribadi masing-masing anggota -- aman terisolasi. Tapi `/remember` bersifat *GLOBAL* di semua chat termasuk grup ini -- kalau seseorang me-remember fakta di sini, semua orang di sini (dan di semua chat lain dengan bot ini) bisa melihatnya lewat `/memory`.
+3. Grup ini belum punya akses? Admin tinggal ketik `/registergroup` di sini -- langsung aktif, tanpa perlu restart. (`/unregistergroup` untuk mencabutnya lagi.)
+
+{_HELP_CREDITS}"""
+
+_HELP_LANG_KEYBOARD = InlineKeyboardMarkup(
+    [[
+        InlineKeyboardButton("\U0001f1ee\U0001f1e9 Indonesia", callback_data="help_id"),
+        InlineKeyboardButton("\U0001f1ec\U0001f1e7 English", callback_data="help_en"),
+    ]]
+)
+
+_HELP_LANG_PROMPT = "Pilih bahasa / Choose a language:"
 
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _authorized(update):
         return
-    await update.message.reply_text(HELP_TEXT, parse_mode="Markdown")
+    arg = (context.args[0].lower() if context.args else "").strip()
+    if arg in ("id", "indonesia", "indonesian"):
+        await update.message.reply_text(HELP_TEXT_ID, parse_mode="Markdown")
+        return
+    if arg in ("en", "english"):
+        await update.message.reply_text(HELP_TEXT_EN, parse_mode="Markdown")
+        return
+    await update.message.reply_text(_HELP_LANG_PROMPT, reply_markup=_HELP_LANG_KEYBOARD)
+
+
+async def cmd_help_lang_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Callback for the /help language-picker buttons."""
+    query = update.callback_query
+    if not _authorized(update):
+        await query.answer()
+        return
+    text = HELP_TEXT_ID if query.data == "help_id" else HELP_TEXT_EN
+    await query.answer()
+    await query.edit_message_text(text, parse_mode="Markdown")
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -953,6 +1025,7 @@ def main() -> None:
     app.add_handler(CommandHandler("registergroup", cmd_registergroup))
     app.add_handler(CommandHandler("unregistergroup", cmd_unregistergroup))
     app.add_handler(CommandHandler("help", cmd_help))
+    app.add_handler(CallbackQueryHandler(cmd_help_lang_chosen, pattern="^help_(en|id)$"))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("tools", cmd_tools))
     app.add_handler(CommandHandler("graduate", cmd_graduate))
