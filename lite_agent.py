@@ -42,6 +42,7 @@ Design principles:
 
 from __future__ import annotations
 
+import asyncio
 import datetime as _dt
 import hashlib
 import json
@@ -1001,11 +1002,36 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     label = BACKEND_LABELS.get(model, model)
     reply_text = result.get("result") or "(no response)"
     clean_text, media_paths = extract_media_paths(reply_text)
-    if clean_text:
-        await _reply_chunked(update, f"{clean_text}\n\n— _by {label}_")
-    sent_hashes: set[str] = set()
-    for path in media_paths:
-        await _send_media_file(update, path, sent_hashes)
+
+    # The model has ALREADY produced (and been quota-billed for) a real answer at
+    # this point -- a transient network blip talking to Telegram (seen in
+    # production: httpx ConnectTimeout / TimedOut) must never turn into the user
+    # getting silent nothing. Retry the whole delivery once after a short pause
+    # (these blips clear in seconds), and if it STILL fails, say so explicitly
+    # instead of leaving the chat looking like it's still "thinking".
+    for attempt in (1, 2):
+        try:
+            if clean_text:
+                await _reply_chunked(update, f"{clean_text}\n\n— _by {label}_")
+            sent_hashes: set[str] = set()
+            for path in media_paths:
+                await _send_media_file(update, path, sent_hashes)
+            break
+        except Exception:
+            logger.exception(
+                "delivery to Telegram failed (attempt %d/2, chat=%s session=%s model=%s)",
+                attempt, chat_id, active, model,
+            )
+            if attempt == 1:
+                await asyncio.sleep(3)
+            else:
+                try:
+                    await update.message.reply_text(
+                        "⚠️ The answer finished processing but couldn't be delivered "
+                        "(connection issue reaching Telegram). Please resend the same message."
+                    )
+                except Exception:
+                    logger.exception("even the failure notice couldn't be delivered (chat=%s)", chat_id)
 
     usage = result.get("usage", {})
     cost = result.get("total_cost_usd")
