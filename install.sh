@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# Ismart-LA (Lite Agent) installer
+# iSmart-LA (Lite Agent) installer
 #
 # Interactive setup for a fresh deployment. Designed to be run directly on a
 # Debian/Ubuntu VM with a real terminal (SSH is fine, as long as you have a
@@ -33,7 +33,7 @@ INSTALL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 INSTALL_USER="$(whoami)"
 
 echo ""
-echo "${BOLD}Ismart-LA installer${RESET}  ${DIM}(lightweight Telegram bridge to Claude Code + Antigravity CLI)${RESET}"
+echo "${BOLD}iSmart-LA installer${RESET}  ${DIM}(lightweight Telegram bridge to Claude Code + Antigravity CLI)${RESET}"
 echo "Install dir: ${INSTALL_DIR}"
 echo "Running as:  ${INSTALL_USER}"
 echo ""

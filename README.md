@@ -1,4 +1,4 @@
-# Ismart-LA (Lite Agent)
+# iSmart-LA (Lite Agent)
 
 A lightweight Telegram bridge to **Claude Code** and **Antigravity CLI (agy)**, for
 infrastructure monitoring and investigation -- built to be dramatically cheaper to run
@@ -16,7 +16,7 @@ for token spend to run away silently. In this project's own testing, one such
 background-review feature burned **~900,000 tokens in a single incident** retrying a
 broken tool call in a loop nobody was watching.
 
-Ismart-LA takes the opposite approach: instead of building more agent scaffolding, it
+iSmart-LA takes the opposite approach: instead of building more agent scaffolding, it
 shells out to two CLIs that Anthropic and Google already built and already do the hard
 part well (tool execution, reasoning, safety self-gating via a system prompt), and adds
 the smallest possible layer on top -- a Telegram relay, per-chat session bookkeeping,
@@ -31,15 +31,21 @@ Telegram message
       v
  lite_agent.py --- tries 4 tiers, cheapest first, falls through on failure ---
       |
-      +-- 1. agy (Antigravity CLI) -- Gemini Flash        "mini"       (fixed-price)
-      +-- 2. agy (Antigravity CLI) -- Gemini Pro-low       "mini pro"   (fixed-price)
-      +-- 3. claude (Claude Code CLI) via 9Router -- Haiku "dede iku"   (pay-per-token)
-      +-- 4. claude (Claude Code CLI) via 9Router -- Sonnet "dede nnet" (pay-per-token)
+      +-- 1. agy (Antigravity CLI) -- Gemini Flash        "mini"       (fixed-price, Google AI Pro/Ultra)
+      +-- 2. agy (Antigravity CLI) -- Gemini Pro-low       "mini pro"   (fixed-price, Google AI Pro/Ultra)
+      +-- 3. claude (Claude Code CLI) via 9Router -- Haiku "dede iku"   (fixed-price, Claude Pro/Max)
+      +-- 4. claude (Claude Code CLI) via 9Router -- Sonnet "dede nnet" (fixed-price, Claude Pro/Max)
 ```
 
-- **agy** runs on a **fixed-price Google AI Pro/Ultra subscription** (native, first-party
-  CLI -- not an OAuth credential borrowed through a third-party relay). Tried first, so
-  routine questions don't touch pay-per-token budget at all.
+**Both sides are fixed-price subscriptions, not pay-per-token API billing.** Gemini runs
+on a Google AI Pro/Ultra plan via agy (native, first-party CLI -- not an OAuth
+credential borrowed through a third-party relay). Claude runs on a Claude Pro (or
+higher) plan via 9Router's own Claude Code OAuth connection. Gemini is tried first not
+to dodge per-token cost (there isn't any here), but to spread routine load across a
+**separate** subscription and keep the Claude plan's own usage quota in reserve for
+when it's genuinely needed -- useful because that Claude quota is often shared with a
+human's own interactive Claude Code usage on the same account.
+
 - **Claude Code** runs through **9Router** (a local multi-provider LLM gateway) as the
   fallback for when Gemini can't handle something. 9Router is a separate project this
   repo does not include -- see [9Router setup](#9router-setup) below.
@@ -92,11 +98,11 @@ Proxmox VE cluster (the environment this was originally built and tested against
 ### 9Router setup
 
 [9Router](https://github.com/decolua/9router) is a separate open-source project (not
-included here) that Ismart-LA uses as the gateway for the Claude Code fallback tiers --
+included here) that iSmart-LA uses as the gateway for the Claude Code fallback tiers --
 it exposes a native Anthropic-compatible endpoint backed by a Claude Code OAuth login.
 The installer can install a fresh instance for you (asks a yes/no question up front),
-or you can point Ismart-LA at an existing instance if you already run one (e.g. shared
-across multiple Ismart-LA deployments). Either way, **the actual OAuth login to Claude
+or you can point iSmart-LA at an existing instance if you already run one (e.g. shared
+across multiple iSmart-LA deployments). Either way, **the actual OAuth login to Claude
 happens in 9Router's own web dashboard** -- no installer can automate a browser login
 on your behalf, so this one manual step is unavoidable regardless of which path you
 choose.
@@ -190,11 +196,12 @@ systemd/
   looked more like an intermittent internal race condition on Google's side than a hard
   expiry -- the automatic Claude fallback absorbs this gracefully when it happens, so
   it costs a failed attempt, not a broken response).
-- **No built-in rate limiting / cost cap.** The 4-tier fallback and `/new` discipline
-  keep normal usage cheap, but nothing currently stops a single very large, very
-  exploratory request from running up a real bill on the paid tiers. A hard per-turn
-  spend ceiling is a reasonable thing to add before trusting this with a wide-open
-  Telegram group.
+- **No built-in usage cap.** The 4-tier fallback and `/new` discipline keep normal usage
+  cheap, but nothing currently stops a single very large, very exploratory request from
+  eating a large chunk of a plan's usage quota in one turn (both subscriptions are
+  fixed-price, but still rate/usage-limited, not unlimited). A hard per-turn budget
+  ceiling is a reasonable thing to add before trusting this with a wide-open Telegram
+  group.
 - **`Bash`/`command(*)` access is effectively unrestricted** on both sides (this
   mirrors Claude Code's own default Bash tool, which has no built-in per-command
   scoping either). Anyone this bot answers to has, in effect, shell access on the host

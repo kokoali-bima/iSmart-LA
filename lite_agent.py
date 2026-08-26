@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Ismart-LA (Lite Agent) -- a lightweight Telegram bridge to Claude Code and
+iSmart-LA (Lite Agent) -- a lightweight Telegram bridge to Claude Code and
 Antigravity CLI, with 9Router as the Claude-side gateway.
 
 Instead of reimplementing agent logic, this script shells out to two
@@ -31,9 +31,13 @@ Design principles:
     dragging in today's unrelated context, and vice versa.
   - Four explicit fallback tiers, cheapest first: Gemini Flash ("mini") ->
     Gemini Pro-low ("mini pro") -> Claude Haiku ("dede iku") -> Claude Sonnet
-    ("dede nnet"). Gemini runs on a fixed-price subscription via the
-    Antigravity CLI (agy) -- native, first-party access, tried first to
-    protect the pay-per-token Claude tiers for when they're truly needed.
+    ("dede nnet"). BOTH sides are fixed-price subscriptions, not pay-per-
+    token API billing: Gemini via the Antigravity CLI (agy) on a Google AI
+    Pro/Ultra plan, Claude via 9Router's Claude Code OAuth connection on a
+    Claude Pro (or higher) plan. Gemini is tried first anyway -- not to dodge
+    per-token cost, but to spread routine load across a SEPARATE subscription
+    and keep the Claude plan's own usage quota in reserve for when it's
+    genuinely needed.
 """
 
 from __future__ import annotations
@@ -134,9 +138,12 @@ ALLOWED_TOOLS = os.environ.get("ALLOWED_TOOLS", "Bash,WebSearch,WebFetch")
 CLAUDE_TIMEOUT = int(os.environ.get("CLAUDE_TIMEOUT_SECONDS", "600"))
 
 # agy (Antigravity CLI) -- native, first-party Gemini access on a fixed-price
-# Google AI Pro subscription. Tried FIRST (protects the pay-per-token Claude
-# tiers); Claude via 9Router is the fallback. Two Gemini tiers are tried in
-# order before giving up on Gemini entirely: a Haiku-equivalent (fast/cheap)
+# Google AI Pro subscription. Tried FIRST -- both this and the Claude tiers
+# below are fixed-price subscriptions (not pay-per-token API billing), so this
+# ordering is about keeping the SEPARATE Claude Pro/Max quota in reserve, not
+# about dodging per-token spend. Claude via 9Router is the fallback. Two
+# Gemini tiers are tried in order before giving up on Gemini entirely: a
+# Haiku-equivalent (fast/cheap)
 # then a Sonnet-equivalent (more capable). The highest-effort Pro tier is
 # deliberately NOT used as the fallback -- in testing it blew past agy's
 # 5-minute print-timeout on even a trivial single-target query; the
