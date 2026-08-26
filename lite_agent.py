@@ -188,6 +188,32 @@ MEDIA_LINE_RE = re.compile(r"^\s*MEDIA:\s*(.+?)\s*$", re.MULTILINE)
 # follow, we just also detect its actual pattern and deliver those files
 # for real too.
 FILE_URI_RE = re.compile(r"file://(/[^\s\)\]\"'>]+)")
+
+# --------------------------------------------------------------------------
+# Self-learning environment brief (two-zone model)
+#
+# The brief files (SOUL.md / GEMINI.md) are split into two zones by a marker:
+#
+#   ... PROTECTED: persona, HARD BOUNDARIES, safety rules -- humans only ...
+#   <!-- LEARNED_ZONE -->
+#   ... facts the agent discovered about this environment -- auto-appended ...
+#
+# The model is NEVER given write access to these files. It can already run
+# arbitrary shell commands, so "please don't edit above the marker" would be a
+# request, not a boundary -- and the PROTECTED zone is exactly where the rules
+# saying which VMs must never be touched live. An agent able to quietly delete
+# its own safety rules is not a risk worth taking for convenience.
+#
+# Instead the model emits a "LEARN: <fact>" line (same convention as MEDIA:)
+# and THIS code decides where it lands -- always appended inside the LEARNED
+# zone, never anywhere else. The zone boundary is then enforced structurally
+# rather than by the model's cooperation.
+LEARN_LINE_RE = re.compile(r"^\s*LEARN:\s*(.+?)\s*$", re.MULTILINE)
+LEARNED_ZONE_MARKER = "<!-- LEARNED_ZONE -->"
+# The LEARNED zone is re-sent at the start of every new conversation, so
+# unbounded growth would quietly raise the floor cost of every future turn.
+# Oldest entries are dropped past this cap.
+LEARNED_MAX_FACTS = 60
 # Which of the 4 tiers actually answered, in one glance -- if it's ever NOT
 # "mini" (the primary/cheapest tier), that's a visible signal something
 # upstream (rate limit, auth hiccup, timeout) forced an escalation.
@@ -290,6 +316,73 @@ def load_memory_text() -> str:
         return ""
     text = MEMORY_FILE.read_text().strip()
     return text
+
+
+def _brief_files() -> list[Path]:
+    """Both backends' briefs. A fact learned while Gemini was answering is just
+    as true when Claude answers next, so learned facts go to both."""
+    return [p for p in (SYSTEM_PROMPT_FILE, GEMINI_PROMPT_FILE) if p.exists()]
+
+
+def _split_zones(text: str) -> tuple[str, str]:
+    """-> (protected_part, learned_part). A brief with no marker yet is treated
+    as entirely protected, and the marker is added on first write."""
+    if LEARNED_ZONE_MARKER in text:
+        head, _, tail = text.partition(LEARNED_ZONE_MARKER)
+        return head.rstrip(), tail.strip()
+    return text.rstrip(), ""
+
+
+def append_learned(facts: list[str]) -> list[str]:
+    """Append discovered environment facts to the LEARNED zone of every brief.
+
+    Returns the facts actually written (duplicates and junk are dropped, so the
+    caller can tell the user what really got saved rather than what was asked
+    for). Nothing above the marker is ever read back out and rewritten -- the
+    protected half is passed through byte-for-byte.
+    """
+    cleaned: list[str] = []
+    for fact in facts:
+        fact = " ".join(fact.split())
+        # Guard against the model "learning" something useless or enormous.
+        if 10 <= len(fact) <= 400:
+            cleaned.append(fact)
+    if not cleaned:
+        return []
+
+    written: list[str] = []
+    ts = _dt.datetime.now().strftime("%Y-%m-%d")
+    for path in _brief_files():
+        protected, learned = _split_zones(path.read_text())
+        existing_lines = [ln for ln in learned.split("\n") if ln.strip().startswith("- ")]
+        # Case-insensitive dedup on the fact text, ignoring the date prefix, so
+        # the same discovery re-reported next week doesn't accumulate.
+        seen = {ln.split("] ", 1)[-1].strip().lower() for ln in existing_lines}
+        for fact in cleaned:
+            if fact.lower() in seen:
+                continue
+            seen.add(fact.lower())
+            existing_lines.append(f"- [{ts}] {fact}")
+            if fact not in written:
+                written.append(fact)
+        existing_lines = existing_lines[-LEARNED_MAX_FACTS:]
+        body = "\n".join(existing_lines)
+        path.write_text(
+            f"{protected}\n\n{LEARNED_ZONE_MARKER}\n"
+            "## Learned about this environment\n\n"
+            "Facts the agent discovered and recorded itself. Safe to edit or delete by\n"
+            "hand -- nothing above the marker line is ever touched automatically.\n\n"
+            f"{body}\n"
+        )
+    if written:
+        logger.info("learned %d new fact(s): %s", len(written), " | ".join(written))
+    return written
+
+
+def extract_learned(text: str) -> tuple[str, list[str]]:
+    """Pull LEARN: lines out of a reply and strip them from the visible text."""
+    facts = [f.strip() for f in LEARN_LINE_RE.findall(text)]
+    return LEARN_LINE_RE.sub("", text).strip(), facts
 
 
 def append_memory(fact: str) -> None:
@@ -1053,6 +1146,8 @@ Every reply ends with a "— by ..." tag. If it's ever NOT "{BACKEND_LABELS[AGY_
 /sessions — list all saved sessions
 /remember <fact> — save a fact PERMANENTLY, read in EVERY session & EVERY tier, even after many /new
 /memory — view current memory contents
+/learned — see what the agent figured out about this environment BY ITSELF
+/forget <number> — delete one wrong learned fact (numbers come from /learned)
 /help — this guide (choose EN or ID)
 
 *3 habits that keep it cheap*
@@ -1137,6 +1232,378 @@ async def cmd_help_lang_chosen(update: Update, context: ContextTypes.DEFAULT_TYP
     await query.edit_message_text(text, parse_mode="Markdown")
 
 
+def _learned_facts() -> list[str]:
+    """Learned entries as displayed, read from the first brief that has any."""
+    for path in _brief_files():
+        _, learned = _split_zones(path.read_text())
+        lines = [ln.strip() for ln in learned.split("\n") if ln.strip().startswith("- ")]
+        if lines:
+            return lines
+    return []
+
+
+async def cmd_learned(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Everything the agent worked out about this environment by itself."""
+    if not _authorized(update):
+        return
+    facts = _learned_facts()
+    if not facts:
+        await update.message.reply_text(
+            "The agent hasn't recorded anything about this environment yet.\n\n"
+            "Environment knowledge fills itself in as you use it. Safety rules "
+            "(hard boundaries) live in the protected zone and never change with it."
+        )
+        return
+    numbered = "\n".join(f"{i}. {f[2:]}" for i, f in enumerate(facts, 1))
+    await _reply_chunked(
+        update,
+        f"🧠 What the agent has worked out about this environment ({len(facts)}):\n\n{numbered}"
+        "\n\nSomething wrong in there? Remove it with /forget <number>.",
+    )
+
+
+async def cmd_forget(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Remove one learned fact. The counterpart to automatic learning: anything
+    written without being asked must be just as easy to take back."""
+    if not _authorized(update):
+        return
+    arg = (context.args[0] if context.args else "").strip()
+    facts = _learned_facts()
+    if not arg.isdigit() or not (1 <= int(arg) <= len(facts)):
+        await update.message.reply_text(
+            f"Usage: /forget <number>\nNumbers come from /learned "
+            f"({len(facts)} recorded right now)."
+        )
+        return
+    idx = int(arg) - 1
+    target = facts[idx]
+    target_text = target.split("] ", 1)[-1].strip().lower()
+    removed = False
+    for path in _brief_files():
+        protected, learned = _split_zones(path.read_text())
+        kept = [
+            ln for ln in learned.split("\n")
+            if not (ln.strip().startswith("- ")
+                    and ln.split("] ", 1)[-1].strip().lower() == target_text)
+        ]
+        kept_facts = [ln for ln in kept if ln.strip().startswith("- ")]
+        path.write_text(
+            f"{protected}\n\n{LEARNED_ZONE_MARKER}\n"
+            "## Learned about this environment\n\n"
+            "Facts the agent discovered and recorded itself. Safe to edit or delete by\n"
+            "hand -- nothing above the marker line is ever touched automatically.\n\n"
+            + "\n".join(kept_facts) + "\n"
+        )
+        removed = True
+    logger.info("forgot learned fact: %s", target)
+    await update.message.reply_text(
+        f"🗑 Forgotten:\n{target[2:]}" if removed else "Nothing was removed."
+    )
+
+
+async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Cluster status with ZERO model tokens: runs the snapshot collector directly
+    and prints its already-digested output. This is the 'graduated skill' path --
+    a question we've already solved is answered by a script, not by re-deriving it
+    with an LLM every time."""
+    if not _authorized(update):
+        return
+    if not SNAPSHOT_SCRIPT.exists():
+        await update.message.reply_text(f"⚠️ Collector belum terpasang: {SNAPSHOT_SCRIPT}")
+        return
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+    force = bool(context.args and context.args[0].lower() in ("force", "fresh", "-f"))
+    cmd = ["python3", str(SNAPSHOT_SCRIPT)] + (["--force"] if force else [])
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    except subprocess.TimeoutExpired:
+        await update.message.reply_text("⚠️ Collector timeout (>120s).")
+        return
+    if proc.returncode != 0:
+        await update.message.reply_text(f"⚠️ Collector gagal: {proc.stderr[-500:]}")
+        return
+    logger.info("status command served (0 model tokens, force=%s)", force)
+    await _reply_chunked(update, f"```\n{proc.stdout.strip()}\n```")
+
+
+async def cmd_tools(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """List graduated skills. Zero model tokens -- just reads the registry."""
+    if not _authorized(update):
+        return
+    if not LIST_TOOLS_SCRIPT.exists():
+        await update.message.reply_text(f"⚠️ Belum terpasang: {LIST_TOOLS_SCRIPT}")
+        return
+    proc = subprocess.run(
+        ["python3", str(LIST_TOOLS_SCRIPT)], capture_output=True, text=True, timeout=30
+    )
+    out = proc.stdout.strip() or proc.stderr.strip() or "(kosong)"
+    await _reply_chunked(update, f"```\n{out}\n```")
+
+
+async def cmd_graduate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Turn the case just solved in this session into a reusable script.
+
+    Explicitly user-triggered, one bounded call, fixed instruction -- deliberately
+    NOT a background job that decides on its own what is worth saving."""
+    if not _authorized(update):
+        return
+    name = "-".join(context.args).strip().lower() if context.args else ""
+    if not name or not re.fullmatch(r"[a-z0-9][a-z0-9_-]*", name):
+        await update.message.reply_text(
+            "Usage: /graduate <script-name>\n"
+            "Example: /graduate backup-coverage\n"
+            "(lowercase letters, digits, - and _ only)"
+        )
+        return
+
+    chat_id = str(update.effective_chat.id)
+    sessions = load_sessions()
+    state = get_chat_state(sessions, chat_id)
+    active = state["active"]
+    claude_session_id = state["sessions"].get(active, {}).get("claude", {}).get(CLAUDE_MODEL_PRIMARY)
+    if not claude_session_id:
+        await update.message.reply_text(
+            "Belum ada percakapan Claude (dede iku) di sesi ini buat di-graduate (kalau turn "
+            "terakhir dijawab Gemini/mini, /graduate belum bisa lihat history-nya -- "
+            "keterbatasan saat ini, tiap backend punya history sendiri). Coba tanya ulang "
+            "sampai dijawab Claude dulu, atau selesaikan kasusnya, baru /graduate."
+        )
+        return
+
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+    try:
+        result = run_claude(GRADUATE_INSTRUCTION.format(name=name), claude_session_id, active, CLAUDE_MODEL_PRIMARY)
+    except Exception as exc:
+        logger.exception("graduate failed")
+        await update.message.reply_text(f"⚠️ Error: {exc}")
+        return
+
+    new_session_id = result.get("session_id")
+    if new_session_id:
+        sessions = load_sessions()
+        state = get_chat_state(sessions, chat_id)
+        state["sessions"][active]["claude"][CLAUDE_MODEL_PRIMARY] = new_session_id
+        save_sessions(sessions)
+
+    usage = result.get("usage", {})
+    logger.info(
+        "graduate done: name=%s in=%s out=%s cache_read=%s",
+        name, usage.get("input_tokens"), usage.get("output_tokens"),
+        usage.get("cache_read_input_tokens"),
+    )
+    await _reply_chunked(update, result.get("result") or "(tidak ada respons)")
+
+
+async def cmd_chatid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Deliberately NOT gated by _authorized() -- its only job is to reveal IDs
+    needed for setup (registering a group in ALLOWED_GROUP_IDS, or a person in
+    ALLOWED_USER_IDS). It reveals no infra data and takes no action, so it's
+    safe to leave open even to people not yet authorized for anything else."""
+    chat = update.effective_chat
+    user = update.effective_user
+    kind = {"private": "DM pribadi", "group": "Grup", "supergroup": "Supergrup", "channel": "Channel"}.get(
+        chat.type, chat.type
+    )
+    lines = [
+        f"\U0001f4cd Chat ID ({kind}): `{chat.id}`",
+    ]
+    if user:
+        lines.append(f"\U0001f464 User ID kamu: `{user.id}`")
+    if chat.type != "private":
+        lines.append(
+            "\nBuat buka akses bot ini ke SEMUA anggota grup ini, minta admin ketik "
+            "`/registergroup` di grup ini (atau kirim Chat ID di atas ke admin)."
+        )
+    else:
+        lines.append(
+            "\nBuat minta akses personal (bukan lewat grup), kirim User ID di atas "
+            "ke admin buat ditambahkan ke `ALLOWED_USER_IDS`."
+        )
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
+def _is_admin(update: Update) -> bool:
+    """Stricter than _authorized(): TRUE only for someone in the named
+    ALLOWED_USER_IDS list, never via group-wide access. Granting a NEW group
+    access is deliberately not something being authorized-via-an-existing-
+    group is enough to do -- otherwise trust could cascade to groups the
+    original admin never intended (member of group A adds group B, etc.)."""
+    user = update.effective_user
+    return bool(user and user.id in ALLOWED_USER_IDS)
+
+
+async def cmd_registergroup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Admin-only, self-service group authorization -- no SSH/restart needed.
+    Mutates ALLOWED_GROUP_IDS in place (takes effect immediately for this
+    running process) and persists to allowed_groups.json (survives restart)."""
+    if not _is_admin(update):
+        # Deliberately don't reveal *why* -- same denial shape whether the
+        # command doesn't exist or the user isn't allowed to use it.
+        return
+    chat = update.effective_chat
+    if chat.type == "private":
+        await update.message.reply_text(
+            "Command ini buat grup, bukan DM pribadi -- jalankan di dalam grup yang mau dibuka aksesnya."
+        )
+        return
+    if chat.id in ALLOWED_GROUP_IDS:
+        await update.message.reply_text(f"Grup ini (`{chat.id}`) sudah terdaftar sebelumnya.", parse_mode="Markdown")
+        return
+    ALLOWED_GROUP_IDS.add(chat.id)
+    _save_allowed_groups_file(ALLOWED_GROUP_IDS)
+    logger.info("group registered by admin: chat_id=%s title=%s", chat.id, chat.title)
+    await update.message.reply_text(
+        f"✅ Grup *{chat.title or chat.id}* terdaftar. Semua anggota sekarang bisa pakai bot ini.",
+        parse_mode="Markdown",
+    )
+
+
+async def cmd_unregistergroup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Admin-only. Revokes a group's whole-group access; per-person entries in
+    ALLOWED_USER_IDS (if any of that group's members were also individually
+    whitelisted) are untouched."""
+    if not _is_admin(update):
+        return
+    chat = update.effective_chat
+    if chat.id not in ALLOWED_GROUP_IDS:
+        await update.message.reply_text("Grup ini belum/tidak terdaftar.")
+        return
+    ALLOWED_GROUP_IDS.discard(chat.id)
+    _save_allowed_groups_file(ALLOWED_GROUP_IDS)
+    logger.info("group unregistered by admin: chat_id=%s title=%s", chat.id, chat.title)
+    await update.message.reply_text(f"Akses grup *{chat.title or chat.id}* dicabut.", parse_mode="Markdown")
+
+
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _authorized(update):
+        await update.message.reply_text("Maaf, kamu belum diotorisasi buat pakai bot ini.")
+        return
+    await update.message.reply_text(
+        "\U0001f44b Lite Agent siap. Kirim pesan apa aja buat mulai (cek status VM, "
+        "investigasi, bikin laporan, dll).\n\n"
+        "Ketik /help buat panduan lengkap + daftar semua command.\n\n"
+        "\U0001f680 Designed by Koko Ali & Dede · Developed by Infrasoft.cloud & BSCloud.id Team\n"
+        "Happy smart working! ✨"
+    )
+
+
+_HELP_CREDITS = (
+    "━━━━━━━━━━━━━━━━━━━\n"
+    "\U0001f680 *Designed by Koko Ali & Dede*\n"
+    "\U0001f4bb *Developed by Infrasoft.cloud & BSCloud.id Team*\n\n"
+    "Happy smart working! ✨\U0001f929\U0001f60e"
+)
+
+HELP_TEXT_ID = f"""\U0001f4d6 *Lite Agent — Panduan Pakai*
+
+*Cara kerja singkat*
+Tiap pesan dicoba lewat 4 tingkatan model, dari yang paling murah dulu:
+1. {BACKEND_LABELS[AGY_MODEL_PRIMARY]} — Gemini Flash (fixed-price, utama)
+2. {BACKEND_LABELS[AGY_MODEL_FALLBACK]} — Gemini Pro-low (fallback ke-1)
+3. {BACKEND_LABELS[CLAUDE_MODEL_PRIMARY]} — Claude Haiku (fallback ke-2)
+4. {BACKEND_LABELS[CLAUDE_MODEL_FALLBACK]} — Claude Sonnet (fallback terakhir)
+
+Tiap jawaban diakhiri tanda "— by ...". Kalau yang jawab BUKAN "{BACKEND_LABELS[AGY_MODEL_PRIMARY]}", itu tanda ada yang lagi bermasalah di tingkat sebelumnya (rate limit, auth, dll) — bisa dipakai buat mantau kesehatan sistem.
+
+*Command tersedia*
+/status — kondisi cluster instan, NOL token (langsung dari script, bukan model)
+/tools — daftar skill yang sudah jadi script, NOL token
+/graduate <nama> — ubah kasus yang BARU SAJA selesai jadi script reusable (nol biaya kalau dipakai ulang lewat /status-style tools)
+/new — mulai ulang sesi AKTIF dari nol (riwayat percakapan direset, MEMORY.md tetap ada)
+/session <nama> — buat/pindah ke sesi bernama, buat pisahin kasus berbeda
+/sessions — lihat semua sesi tersimpan
+/remember <fakta> — simpan fakta PERMANEN, ikut kebaca di SEMUA sesi & SEMUA model, walau sudah /new berkali-kali
+/memory — lihat isi memory saat ini
+/learned — lihat apa saja yang agent pelajari SENDIRI soal lingkungan ini
+/forget <nomor> — hapus satu catatan hasil belajar yang keliru (nomornya dari /learned)
+/help — panduan ini (pilih EN atau ID)
+
+*Biar tetap irit, 3 kebiasaan penting*
+1. *`/new` tiap ganti topik.* Riwayat percakapan yang nyambung itu MAHAL — makin panjang, makin mahal tiap turn berikutnya (bisa 10-20x lipat kalau dibiarkan menumpuk). Infra hari ini beres → mau nanya hal lain (berita, dll)? `/new` dulu.
+2. *Jangan `/new` di ANTARA "bikin laporan" dan "kirim ke saya".* Sesi fresh nggak ingat laporan mana yang baru dibuat — kalau langsung tanya "kirim filenya" di sesi baru, dia bakal nyari SEMUA laporan lama yang ada dan nawarin semuanya.
+3. *Fakta penting → `/remember`, bukan andalkan riwayat chat.* Kasus yang sudah kelar/diputuskan, taruh di `/remember` biar nggak ditanyain ulang atau terulang — ini SATU-SATUNYA hal yang bertahan lintas `/new`.
+
+*Pakai di Grup Telegram*
+Kalau grup ini sudah didaftarkan admin (lihat status pakai `/chatid`), SEMUA anggota grup otomatis bisa kasih command ke bot — nggak perlu izin satu-satu.
+1. Kalau bot cuma respons *command* (`/status` dst), bukan chat biasa — mention bot-nya (`@namabot ...`) atau reply pesan bot biar tetap kebaca (ini pengaturan default Telegram, bukan batasan kita).
+2. Sesi (`/new`, `/session`) di grup ini *terpisah* dari DM pribadi masing-masing anggota — aman nggak nyampur. Tapi `/remember` itu *GLOBAL* buat SEMUA chat termasuk grup ini — kalau ada yang `/remember` sesuatu, semua orang di sini (dan di chat lain bot ini) bisa lihat lewat `/memory`.
+3. Grup ini belum otomatis punya akses? Admin tinggal ketik `/registergroup` di grup ini — langsung aktif, nggak perlu restart apapun. (`/unregistergroup` buat cabut lagi.)
+
+{_HELP_CREDITS}"""
+
+HELP_TEXT_EN = f"""\U0001f4d6 *Lite Agent — Usage Guide*
+
+*How it works*
+Every message is tried through 4 tiers, cheapest first:
+1. {BACKEND_LABELS[AGY_MODEL_PRIMARY]} — Gemini Flash (fixed-price, primary)
+2. {BACKEND_LABELS[AGY_MODEL_FALLBACK]} — Gemini Pro-low (fallback #1)
+3. {BACKEND_LABELS[CLAUDE_MODEL_PRIMARY]} — Claude Haiku (fallback #2)
+4. {BACKEND_LABELS[CLAUDE_MODEL_FALLBACK]} — Claude Sonnet (last resort)
+
+Every reply ends with a "— by ..." tag. If it's ever NOT "{BACKEND_LABELS[AGY_MODEL_PRIMARY]}", that's a signal something upstream is having trouble (rate limit, auth, etc) -- useful for keeping an eye on system health at a glance.
+
+*Available commands*
+/status — instant status check, ZERO tokens (straight from a script, not a model)
+/tools — list of skills already turned into scripts, ZERO tokens
+/graduate <name> — turn the case you JUST solved into a reusable script (free to reuse afterward)
+/new — restart the ACTIVE session from scratch (conversation history reset, MEMORY.md untouched)
+/session <name> — create/switch to a named session, for keeping different cases separate
+/sessions — list all saved sessions
+/remember <fact> — save a fact PERMANENTLY, read in EVERY session & EVERY tier, even after many /new
+/memory — view current memory contents
+/learned — see what the agent figured out about this environment BY ITSELF
+/forget <number> — delete one wrong learned fact (numbers come from /learned)
+/learned — see what the agent figured out about this environment BY ITSELF
+/forget <number> — delete one wrong learned fact (numbers come from /learned)
+/help — this guide (choose EN or ID)
+
+*3 habits that keep it cheap*
+1. *`/new` every time the topic changes.* A continuing conversation history is EXPENSIVE -- the longer it gets, the more expensive every next turn (can be 10-20x if left to pile up). Infra case closed → want to ask something unrelated? `/new` first.
+2. *Don't `/new` BETWEEN "generate a report" and "send it to me".* A fresh session has no memory of which report was just made -- ask "send the file" in a new session and it'll go looking through every old report that exists and offer all of them.
+3. *Important facts → `/remember`, not chat history.* Cases that are closed/decided go into `/remember` so they don't get re-asked or re-investigated -- this is the ONLY thing that survives across `/new`.
+
+*Using it in a Telegram Group*
+If this group has been registered by an admin (check with `/chatid`), EVERY member can give the bot commands automatically -- no per-person whitelist needed.
+1. If the bot only responds to *commands* (`/status` etc), not plain messages -- mention it (`@botname ...`) or reply to one of its messages to make sure it's seen (that's Telegram's own default setting, not a limitation on our end).
+2. Sessions (`/new`, `/session`) in this group are *separate* from each member's private DM -- safely isolated. But `/remember` is *GLOBAL* across every chat including this group -- if someone remembers a fact here, everyone here (and in every other chat with this bot) can see it via `/memory`.
+3. This group doesn't have access yet? An admin just needs to type `/registergroup` here -- takes effect immediately, no restart needed. (`/unregistergroup` to revoke it again.)
+
+{_HELP_CREDITS}"""
+
+_HELP_LANG_KEYBOARD = InlineKeyboardMarkup(
+    [[
+        InlineKeyboardButton("\U0001f1ee\U0001f1e9 Indonesia", callback_data="help_id"),
+        InlineKeyboardButton("\U0001f1ec\U0001f1e7 English", callback_data="help_en"),
+    ]]
+)
+
+_HELP_LANG_PROMPT = "Pilih bahasa / Choose a language:"
+
+
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _authorized(update):
+        return
+    arg = (context.args[0].lower() if context.args else "").strip()
+    if arg in ("id", "indonesia", "indonesian"):
+        await update.message.reply_text(HELP_TEXT_ID, parse_mode="Markdown")
+        return
+    if arg in ("en", "english"):
+        await update.message.reply_text(HELP_TEXT_EN, parse_mode="Markdown")
+        return
+    await update.message.reply_text(_HELP_LANG_PROMPT, reply_markup=_HELP_LANG_KEYBOARD)
+
+
+async def cmd_help_lang_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Callback for the /help language-picker buttons."""
+    query = update.callback_query
+    if not _authorized(update):
+        await query.answer()
+        return
+    text = HELP_TEXT_ID if query.data == "help_id" else HELP_TEXT_EN
+    await query.answer()
+    await query.edit_message_text(text, parse_mode="Markdown")
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _authorized(update):
         return
@@ -1168,7 +1635,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     label = BACKEND_LABELS.get(model, model)
     reply_text = result.get("result") or "(no response)"
+    reply_text, learned_facts = extract_learned(reply_text)
     clean_text, media_paths = extract_media_paths(reply_text)
+
+    # Persist BEFORE delivery: if Telegram is having a bad moment, the thing the
+    # agent worked out about this environment shouldn't be lost with the message.
+    newly_learned = append_learned(learned_facts) if learned_facts else []
 
     # The model has ALREADY produced (and been quota-billed for) a real answer at
     # this point -- a transient network blip talking to Telegram (seen in
@@ -1183,6 +1655,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             sent_hashes: set[str] = set()
             for path in media_paths:
                 await _send_media_file(update, path, sent_hashes)
+            if newly_learned:
+                # Visible, not silent: auto-writes the user can't see are how a
+                # brief quietly drifts away from what they think it says.
+                bullets = "\n".join(f"• {_tg_escape(f)}" for f in newly_learned)
+                await update.message.reply_text(
+                    f"🧠 <i>Recorded to environment knowledge ({len(newly_learned)} new):</i>\n{bullets}",
+                    parse_mode="HTML",
+                )
             break
         except Exception:
             logger.exception(
@@ -1241,6 +1721,8 @@ def main() -> None:
     app.add_handler(CommandHandler("sessions", cmd_sessions))
     app.add_handler(CommandHandler("remember", cmd_remember))
     app.add_handler(CommandHandler("memory", cmd_memory))
+    app.add_handler(CommandHandler("learned", cmd_learned))
+    app.add_handler(CommandHandler("forget", cmd_forget))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     logger.info("Lite Agent starting (allowed users: %s)", ALLOWED_USER_IDS or "ANY (no allowlist!)")

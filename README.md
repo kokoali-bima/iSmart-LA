@@ -84,16 +84,45 @@ cd lite-agent
 
 The installer is interactive and walks through: system dependencies, Python venv,
 Claude Code CLI, Antigravity CLI (agy) + its OAuth login, 9Router (use an existing
-instance, or install one fresh), your Telegram bot token + admin user ID, and a
-systemd service. Full detail: [`install.sh`](./install.sh) is heavily commented --
-read it before running if you want to know exactly what it does first.
+instance, or install one fresh), your Telegram bot token + admin user ID, the
+environment brief, and a systemd service. Full detail: [`install.sh`](./install.sh)
+is heavily commented -- read it before running if you want to know exactly what it
+does first.
 
-**What it does NOT do for you** (see [`SOUL.md.template`](./SOUL.md.template) /
-[`GEMINI.md.template`](./GEMINI.md.template)): describe *your* actual infrastructure.
-That's the one part that's genuinely different for every deployment -- node IPs, what
-must never be touched, what commands are useful. Copy the template, fill it in. See
-[`examples/proxmox/`](./examples/proxmox/) for a complete filled-in reference against a
-Proxmox VE cluster (the environment this was originally built and tested against).
+**Not just for Proxmox.** Nothing in the core assumes Proxmox, or infrastructure at
+all. [`examples/proxmox/`](./examples/proxmox/) is one worked example, not a required
+shape -- a Kubernetes cluster, a fleet of web servers, or a CI estate all work the
+same way.
+
+### The environment brief, and how it fills itself in
+
+The one genuinely per-deployment thing is what the agent is looking after, how it
+reaches it, and what it must never touch. That lives in `SOUL.md` (Claude's brief)
+and `GEMINI.md` (agy's). You don't hand-author them:
+[`bootstrap.py`](./bootstrap.py) asks a few plain-language questions during install
+and writes both. Re-run it any time to start over.
+
+From then on the brief maintains itself. Both files are split in two by a marker:
+
+```
+  ... persona, how to reach things, HARD BOUNDARIES ...   <- yours, humans only
+  <!-- LEARNED_ZONE -->
+  ... facts the agent verified for itself ...             <- appended automatically
+```
+
+When the agent works out something durable ("wkhtmltoimage is the only working
+HTML-to-image tool here", "that host answers on .37, the hostname points at a
+proxy"), it emits a `LEARN:` line, which is stripped from the reply and appended
+below the marker -- so the next conversation starts already knowing it. `/learned`
+lists what it has picked up; `/forget <n>` removes anything it got wrong.
+
+**The model is never given write access to these files.** It can already run shell
+commands, so "please don't edit above the marker" would be a request, not a boundary
+-- and above the marker is exactly where the rules about what must never be touched
+live. Instead the model only supplies the fact text via `LEARN:`, and the bot decides
+where it lands: always inside the learned zone, never anywhere else. The boundary is
+enforced by code, not by the model's cooperation. Bootstrap follows the same rule --
+your hard boundaries are copied in verbatim, never paraphrased by a model.
 
 ### 9Router setup
 
@@ -119,6 +148,8 @@ choose.
 | `/sessions` | free | List saved sessions |
 | `/remember <fact>` | free | Save a fact permanently, read in every session & every tier |
 | `/memory` | free | View current memory contents |
+| `/learned` | free | What the agent worked out about this environment by itself |
+| `/forget <n>` | free | Delete one wrong learned fact (numbers from `/learned`) |
 | `/chatid` | free, no auth needed | Reveal the current chat's ID (for group/access setup) |
 | `/registergroup` | admin only | Open this Telegram group to every member, no restart needed |
 | `/unregistergroup` | admin only | Revoke a group's access |
@@ -153,6 +184,17 @@ can't cascade sideways from one group to another. See `/help` in-chat for the
 member-facing explanation (Telegram's own group privacy setting also matters here --
 covered there).
 
+### Why automatic *learning* but not automatic *memory*?
+
+These look like the same thing and aren't. `MEMORY.md` is injected into **every single
+turn**, so anything that grows it raises the floor cost of every future message --
+which is exactly how token spend runs away quietly. It stays manual (`/remember`).
+
+The learned zone is injected **once per conversation**, is capped at 60 entries with
+the oldest pruned, only accepts short self-contained facts, and reports in chat what
+it just recorded. Bounded input, bounded size, bounded frequency, and visible -- a
+different risk class from an agent freely deciding to rewrite its own instructions.
+
 ### Why not automatic memory?
 
 Considered and deliberately rejected. An agent that decides on its own what's worth
@@ -167,10 +209,11 @@ runaway background cost.
 ```
 lite_agent.py              the bot itself
 install.sh                 interactive installer
+bootstrap.py               generates SOUL.md / GEMINI.md from a few questions
 requirements.txt
 .env.example                every setting, documented
-SOUL.md.template            Claude Code's environment brief -- EDIT for your infra
-GEMINI.md.template          agy's environment brief (same content, different tool names)
+SOUL.md.template            fallback blank brief (bootstrap.py normally writes this)
+GEMINI.md.template          same, for agy (same content, different tool names)
 tools/
   list_tools.py              prints the graduated-skill registry
   registry.json              starts empty; /graduate appends to it

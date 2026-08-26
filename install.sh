@@ -6,11 +6,14 @@
 # Debian/Ubuntu VM with a real terminal (SSH is fine, as long as you have a
 # real TTY -- the agy/9Router OAuth login steps need one).
 #
+# The environment brief (SOUL.md / GEMINI.md) is generated for you: step 8 runs
+# bootstrap.py, which asks a few plain-language questions about what this agent
+# should look after and writes both briefs from your answers. Nothing about it
+# is Proxmox-specific -- describe any environment you like.
+#
 # What this script does NOT do for you (by design -- see README):
-#   - Fill in SOUL.md / GEMINI.md with your actual infrastructure details.
-#     It copies the templates and stops there; you edit the content.
-#   - Provide SSH access to whatever you want this agent to manage. Set up
-#     your own SSH key + ~/.ssh/config for that before or after running this.
+#   - Provide access to whatever you want this agent to manage. Set up your own
+#     SSH key + ~/.ssh/config (or kubeconfig, etc) before or after running this.
 #   - Complete OAuth logins for you. It runs `agy` and (if installing 9Router
 #     fresh) tells you to open its dashboard -- both need a human to click
 #     through a real login flow.
@@ -44,7 +47,7 @@ if [ "$INSTALL_USER" = "root" ]; then
 fi
 
 # ------------------------------------------------------------------------------
-say "Step 1/8 -- System dependencies"
+say "Step 1/9 -- System dependencies"
 # ------------------------------------------------------------------------------
 if command -v apt-get >/dev/null 2>&1; then
   NEEDED_PKGS="python3 python3-venv curl git tmux jq openssh-client"
@@ -73,7 +76,7 @@ else
 fi
 
 # ------------------------------------------------------------------------------
-say "Step 2/8 -- Python virtual environment"
+say "Step 2/9 -- Python virtual environment"
 # ------------------------------------------------------------------------------
 if [ ! -d "$INSTALL_DIR/venv" ]; then
   python3 -m venv "$INSTALL_DIR/venv"
@@ -86,7 +89,7 @@ fi
 ok "Python dependencies installed."
 
 # ------------------------------------------------------------------------------
-say "Step 3/8 -- Claude Code CLI"
+say "Step 3/9 -- Claude Code CLI"
 # ------------------------------------------------------------------------------
 if command -v claude >/dev/null 2>&1; then
   ok "Claude Code CLI already installed ($(claude --version 2>/dev/null || echo 'version unknown'))."
@@ -96,7 +99,7 @@ else
 fi
 
 # ------------------------------------------------------------------------------
-say "Step 4/8 -- Antigravity CLI (agy) + login"
+say "Step 4/9 -- Antigravity CLI (agy) + login"
 # ------------------------------------------------------------------------------
 AGY_BIN_PATH="$HOME/.local/bin/agy"
 if [ -x "$AGY_BIN_PATH" ]; then
@@ -137,7 +140,7 @@ print(f"Updated {path}")
 PYEOF
 
 # ------------------------------------------------------------------------------
-say "Step 5/8 -- 9Router (Claude side gateway)"
+say "Step 5/9 -- 9Router (Claude side gateway)"
 # ------------------------------------------------------------------------------
 ask "Do you already have a 9Router instance running that this agent should use? [y/N] " HAVE_9ROUTER
 if [[ "${HAVE_9ROUTER:-}" =~ ^[Yy]$ ]]; then
@@ -171,7 +174,7 @@ else
 fi
 
 # ------------------------------------------------------------------------------
-say "Step 6/8 -- Telegram bot"
+say "Step 6/9 -- Telegram bot"
 # ------------------------------------------------------------------------------
 echo "Create a bot with @BotFather on Telegram if you haven't already (/newbot)."
 ask "Telegram bot token: " TELEGRAM_BOT_TOKEN_INPUT
@@ -180,7 +183,7 @@ echo "bot after install and send it /chatid (works even before you're authorized
 ask "Your Telegram user ID (admin -- required, this account can grant group access): " ADMIN_ID_INPUT
 
 # ------------------------------------------------------------------------------
-say "Step 7/8 -- Write .env"
+say "Step 7/9 -- Write .env"
 # ------------------------------------------------------------------------------
 ENV_FILE="$INSTALL_DIR/.env"
 cat > "$ENV_FILE" <<EOF
@@ -200,17 +203,33 @@ EOF
 chmod 600 "$ENV_FILE"
 ok ".env written and locked down (chmod 600)."
 
-if [ ! -f "$INSTALL_DIR/SOUL.md" ]; then
-  cp "$INSTALL_DIR/SOUL.md.template" "$INSTALL_DIR/SOUL.md"
-  ok "Created SOUL.md from template -- ${BOLD}you must edit this before the bot is useful${RESET}."
-fi
-if [ ! -f "$INSTALL_DIR/GEMINI.md" ]; then
-  cp "$INSTALL_DIR/GEMINI.md.template" "$INSTALL_DIR/GEMINI.md"
-  ok "Created GEMINI.md from template -- ${BOLD}you must edit this before the bot is useful${RESET}."
+# ------------------------------------------------------------------------------
+say "Step 8/9 -- Environment brief (SOUL.md / GEMINI.md)"
+# ------------------------------------------------------------------------------
+# This is the one genuinely per-deployment part of the whole system: what the
+# agent is looking after, how it reaches it, and what it must never touch.
+# bootstrap.py asks a handful of plain-language questions and writes both briefs,
+# so a new server needs no hand-authored config. It is NOT Proxmox-specific --
+# describe whatever you want the agent to look after.
+if [ -f "$INSTALL_DIR/SOUL.md" ] && [ -f "$INSTALL_DIR/GEMINI.md" ]; then
+  ok "SOUL.md and GEMINI.md already present -- leaving them alone."
+  echo "     (Re-run ${CYAN}python3 bootstrap.py${RESET} any time to regenerate them.)"
+else
+  echo "The agent needs to be told what it's looking after. The next few questions"
+  echo "generate that brief for you -- plain sentences are fine."
+  echo ""
+  if "$INSTALL_DIR/venv/bin/python3" "$INSTALL_DIR/bootstrap.py"; then
+    ok "Environment brief written."
+  else
+    warn "Bootstrap skipped or cancelled -- falling back to blank templates."
+    [ -f "$INSTALL_DIR/SOUL.md" ] || cp "$INSTALL_DIR/SOUL.md.template" "$INSTALL_DIR/SOUL.md"
+    [ -f "$INSTALL_DIR/GEMINI.md" ] || cp "$INSTALL_DIR/GEMINI.md.template" "$INSTALL_DIR/GEMINI.md"
+    warn "You must fill in SOUL.md and GEMINI.md by hand before the bot is useful."
+  fi
 fi
 
 # ------------------------------------------------------------------------------
-say "Step 8/8 -- systemd service"
+say "Step 9/9 -- systemd service"
 # ------------------------------------------------------------------------------
 SERVICE_FILE="/etc/systemd/system/lite-agent.service"
 sed \
@@ -223,11 +242,12 @@ ok "systemd unit installed at ${SERVICE_FILE}."
 echo ""
 echo "${BOLD}${GREEN}Setup mostly done.${RESET} Before starting the service:"
 echo ""
-echo "  1. ${BOLD}Edit SOUL.md and GEMINI.md${RESET} -- fill in your actual node/target IPs,"
-echo "     hard boundaries, and anything else specific to what you're managing."
-echo "     See examples/proxmox/ for a filled-in reference."
-echo "  2. ${BOLD}Set up SSH access${RESET} from this machine to whatever you want the agent"
-echo "     to manage (key + ~/.ssh/config), matching what you wrote in step 1."
+echo "  1. ${BOLD}Review SOUL.md / GEMINI.md${RESET} -- especially the HARD BOUNDARIES section."
+echo "     Only the part below the LEARNED_ZONE marker is ever written automatically;"
+echo "     everything above it is yours. See examples/proxmox/ for a worked reference."
+echo "  2. ${BOLD}Set up access${RESET} from this machine to whatever you want the agent to"
+echo "     manage (SSH key + ~/.ssh/config, kubeconfig, etc), matching what you"
+echo "     described during the brief step."
 echo "  3. If you skipped agy login above, run: ${AGY_BIN_PATH}"
 echo ""
 echo "Then start it:"
