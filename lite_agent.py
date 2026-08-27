@@ -324,10 +324,15 @@ def write_mode_notice() -> str:
         )
     return (
         "[READ-ONLY MODE. Your credential physically cannot change the managed environment "
-        "right now -- investigate, audit and report freely, but do not attempt changes. If "
-        "the user is asking for a change, say plainly that they need to run /unlock first, "
-        "and tell them exactly what you would do once they do. Do not try to work around "
-        "this, and do not attempt to modify SSH keys or this bot's own files.]"
+        "right now -- investigate, audit and report freely, but do not attempt a change; it "
+        "would just be refused. If the user is asking for a change, do NOT tell them to run "
+        "/unlock themselves -- that skips the button flow entirely. Instead: describe what "
+        "you found and what change is needed, then add a line by itself: NEEDS_WRITE: <the "
+        "action and the machine, one short phrase>. The user gets a button to open write "
+        "access (with an automatic snapshot first, for a VM), and your request continues "
+        "automatically once they do -- you do not need them to type anything else. Do not "
+        "try to work around the lock, and do not attempt to modify SSH keys or this bot's "
+        "own files.]"
     )
 
 
@@ -953,6 +958,28 @@ def discover_proxmox(host: str, user: str, port: int) -> tuple[bool, str, list[s
 #      description and the VM id
 # Layer 1 is the one that cannot be dodged; layer 2 makes the message readable.
 # --------------------------------------------------------------------------
+
+_POWER_ONLY_RE = re.compile(
+    r"^\s*(?:please\s+|tolong\s+)?(?:re)?(boot|start|stop|restart|shutdown|"
+    r"power[\s-]?(?:on|off|cycle)?)\b", re.IGNORECASE)
+_MODIFIES_STATE_RE = re.compile(
+    r"resize|expand|shrink|disk|storage|memory|\bram\b|\bcpu\b|config|"
+    r"install|upgrade|update|migrate|\bedit\b|modify|repair|\bfix\b|"
+    r"delete|remove|destroy|attach|detach|network|firewall|password|rename",
+    re.IGNORECASE)
+
+
+def needs_snapshot_offer(reason: str) -> bool:
+    """False only when `reason` clearly names a plain power-cycle and nothing
+    that could touch disk state. True (offer it) for everything else,
+    including anything ambiguous -- restarting is reversible by definition;
+    losing data to a skipped snapshot is not, so ties go to offering it."""
+    reason = reason.strip()
+    if not reason:
+        return True
+    if _MODIFIES_STATE_RE.search(reason):
+        return True
+    return not _POWER_ONLY_RE.match(reason)
 
 NEEDS_WRITE_RE = re.compile(r"^\s*NEEDS_WRITE:\s*(.+?)\s*$", re.MULTILINE)
 GUARD_REFUSAL = "refused -- this key is read-only"
@@ -3666,17 +3693,23 @@ async def offer_unlock(update: Update, reason: str, original_prompt: str,
         "prompt": original_prompt, "reason": reason, "vmid": vmid,
         "expires": _dt.datetime.now().timestamp() + PENDING_WRITE_TTL,
     }
+    offer_snapshot = vmid and needs_snapshot_offer(reason)
     rows = []
-    if vmid:
+    if offer_snapshot:
         rows.append([InlineKeyboardButton(
             f"📸 Snapshot VM {vmid}, then unlock", callback_data="nw:snap")])
-    rows.append([InlineKeyboardButton("🔓 Unlock without a snapshot", callback_data="nw:nosnap")])
+        rows.append([InlineKeyboardButton("🔓 Unlock without a snapshot", callback_data="nw:nosnap")])
+    else:
+        rows.append([InlineKeyboardButton("🔓 Unlock", callback_data="nw:nosnap")])
     rows.append([InlineKeyboardButton("✖️ Leave it locked", callback_data="nw:cancel")])
 
     note = ("\n\n<i>Afterwards I'll tell the agent to continue — it keeps the same "
             "conversation, so it doesn't re-investigate, just carries on. That is a "
             "second turn, but a short one.</i>")
-    if not vmid:
+    if vmid and not offer_snapshot:
+        note = ("\n\n<i>No snapshot offer for a plain power operation -- it wouldn't "
+                "protect anything a reboot could touch.</i>") + note
+    elif not vmid:
         note = ("\n\n<i>I couldn't tell which VM this is about, so there's no snapshot "
                 "offer. Snapshot it yourself first if it matters.</i>") + note
     await update.message.reply_text(
