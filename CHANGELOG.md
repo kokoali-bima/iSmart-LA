@@ -1,5 +1,90 @@
 # Changelog
 
+## v0.2b.0 -- a real security boundary, self-service onboarding, no more 9Router
+
+The biggest change since initial packaging. Driven by dropping a dependency that
+turned out to be unnecessary, and by a long live-fire test against the real
+cluster that found (and fixed) several bugs no synthetic test would have caught.
+
+**9Router is gone.** Claude Code signs in to a Claude Pro/Max subscription directly
+(`claude auth login`) -- verified end to end, not assumed. That removes Node.js, npm,
+pm2, a second service to keep alive, and a separate dashboard login. The gateway path
+still works for anyone who wants it (set `ANTHROPIC_BASE_URL` + `ANTHROPIC_API_KEY`),
+it's just no longer required. The 4-tier fallback chain (Gemini Flash -> Pro-low ->
+Claude Haiku -> Sonnet) is expressed as one `TIERS` setting now, tried briefly as
+freely configurable, then locked back to those four on request -- this deployment's
+own needs, not a general knob.
+
+**`/start` replaces manual setup.** The installer's job shrinks to system deps, a
+venv, both CLIs, and a systemd service. Everything needing a browser or a human
+decision -- signing in to Gemini, signing in to Claude, setting the PIN -- happens in
+a Telegram wizard instead: a URL to open, a code to paste back (never a password or a
+key), stoppable and resumable. Groups get a self-service path too, gated to the owner
+and that group's own admins.
+
+**A real security boundary, not a polite request.** The agent now runs read-only by
+default: an SSH key whose `authorized_keys` entry forces a guard script that
+allowlists read-only verbs and refuses everything else (`pve-ro-guard` for Proxmox
+nodes, `vm-guest-guard` for generic VMs) -- enforced by sshd, not by asking the model
+nicely. `/unlock [minutes]` opens a second, unrestricted key for a bounded window,
+gated by a 6-digit PIN entered on an inline keypad -- the digits ride in
+`callback_data` and never become a chat message, so they're safe to enter even in a
+group. Changing an existing PIN always requires the current one first, so a stolen
+Telegram session can't quietly replace it.
+
+**The agent asks -- it doesn't tell the user to type a command.** Blocked by
+read-only mode, it describes the needed change and emits a line the bot recognises,
+rather than attempting something already known to fail. That surfaces an inline card:
+snapshot-then-unlock or unlock alone (the snapshot button is skipped entirely for a
+plain reboot/start/stop -- nothing a power-cycle could touch would need rolling back),
+confirmed by the same PIN keypad. Once open, the SAME conversation continues
+automatically with a short "go ahead" nudge -- not a re-ask, so the model doesn't
+re-investigate or re-explain what it already found.
+
+**Server inventory: `/addserver`, `/servers`, `/removeserver`.** Registers a machine
+through a step-by-step chat flow -- kind, address, user, port -- and shows only the
+agent's own **public** key with the one-line command to install it. No private key or
+password ever passes through Telegram. Proxmox targets get an optional read-only
+cluster scan (which nodes, how many guests) folded straight into the learned zone.
+
+**Scheduled tasks under the same visibility rule: `/schedules`, `/unschedule`,
+`/adopt`.** The agent proposes a schedule, a human confirms with the PIN before
+anything is installed, and only a clearly-marked block of the crontab is ever
+touched -- an operator's own unrelated cron entries are left alone. `/adopt` brings a
+pre-existing entry (installed before this feature existed) under the same management.
+
+**Hard boundaries are editable from chat now: `/boundaries`, `/addboundary`,
+`/rmboundary`.** Previously only settable once, at install time, by hand-editing a
+file over SSH -- which meant the most safety-critical setting in the system was also
+the hardest to keep current. Adding one is unrestricted (it only narrows the agent);
+removing one needs the PIN, since that's the direction worth slowing down.
+
+**`/agentstatus`:** a real, parallel liveness probe of every configured tier --
+distinct from `/providers`, which only reflects what recent real usage happened to
+reveal. Green/red per tier, a sliver of quota rather than a full turn, feeding the
+same cooldown table `/providers` reads.
+
+**Fixes**, several found live against the real cluster during today's testing:
+- Chunking could split a code block or table across two messages, breaking the
+  formatting entirely; it now tracks structure and keeps them intact.
+- Secrets (API keys, tokens) are now redacted at the point every outbound message is
+  built, not left to each caller to remember; facts learned from an untrusted origin
+  (a group message) are no longer written to the permanent brief.
+- Hand-built HTML (server lists, schedule cards, boundary lists) was being escaped by
+  the same converter meant for untrusted model Markdown, so the tags showed up
+  literally instead of rendering.
+- `/adopt` left the original raw cron line in place after adopting it, so the
+  adopted job would have run twice.
+- Three bugs found in sequence during one live test of the new unlock flow: the
+  read-only notice told the model to tell the user to run `/unlock` themselves
+  (bypassing the whole card+PIN+snapshot flow entirely); once fixed, the card's
+  trigger condition still required an actual guard refusal that the model was now
+  correctly avoiding causing; once fixed, a `context` parameter was missing one level
+  up the call chain, crashing the very last step of a completed PIN entry with a
+  `NameError`. All three shipped within the same short debugging session, each
+  caught by testing the actual live flow rather than a synthetic case.
+
+
 ## v0.1b.1 -- self-configuring deployments, formatted replies
 
 Driven by a production audit plus real usage on a live cluster.
