@@ -56,7 +56,7 @@ from pathlib import Path
 from typing import Optional
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.error import BadRequest
+from telegram.error import BadRequest, NetworkError, TimedOut
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "tools"))
 from cli_login import LoginHandle, tmux_available  # noqa: E402
@@ -1876,16 +1876,31 @@ async def _reply_chunked(update: Update, text: str, tag_html: str = "") -> None:
         body = _md_to_telegram_html(chunk)
         if idx == len(chunks) - 1 and tag_html:
             body = f"{body}\n\n{tag_html}"
-        try:
-            await _msg(update).reply_text(body, parse_mode="HTML")
-        except BadRequest as exc:
-            # A malformed-entity rejection must never cost the user the whole
-            # answer -- fall back to sending it unformatted rather than losing it.
-            logger.warning("HTML formatting rejected by Telegram (%s); sending as plain text", exc)
-            plain = chunk
-            if idx == len(chunks) - 1 and tag_html:
-                plain = f"{plain}\n\n{re.sub(r'<[^>]+>', '', tag_html)}"
-            await _msg(update).reply_text(plain)
+        plain = chunk
+        if idx == len(chunks) - 1 and tag_html:
+            plain = f"{plain}\n\n{re.sub(r'<[^>]+>', '', tag_html)}"
+        for attempt in (1, 2, 3):
+            try:
+                await _msg(update).reply_text(body, parse_mode="HTML")
+                break
+            except BadRequest as exc:
+                # Malformed entities: formatting is the problem, so retrying it
+                # unchanged would fail identically. Send it unformatted instead
+                # -- losing the formatting beats losing the message.
+                logger.warning("HTML rejected by Telegram (%s); sending as plain text", exc)
+                try:
+                    await _msg(update).reply_text(plain)
+                except (TimedOut, NetworkError):
+                    logger.warning("plain-text fallback also timed out", exc_info=True)
+                break
+            except (TimedOut, NetworkError) as exc:
+                # Nothing wrong with the message -- the network just hiccuped.
+                # These clear in seconds, so wait briefly and try the same text.
+                if attempt == 3:
+                    logger.error("gave up sending a reply after 3 attempts: %s", exc)
+                    raise
+                logger.warning("send failed (%s), retrying (%d/3)", exc, attempt)
+                await asyncio.sleep(2 * attempt)
 
 
 
@@ -3872,6 +3887,27 @@ async def _run_turn(update: Update, context: ContextTypes.DEFAULT_TYPE, text: st
 # Entrypoint
 # --------------------------------------------------------------------------
 
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Last line of defence.
+
+    Without this, python-telegram-bot logs an uncaught exception and carries on,
+    which from the user's side looks exactly like being ignored. Better to say
+    plainly that something broke than to leave them watching a chat that never
+    answers.
+    """
+    logger.exception("unhandled error while processing an update", exc_info=context.error)
+    if isinstance(update, Update):
+        target = _msg(update)
+        if target is not None:
+            try:
+                await target.reply_text(
+                    "⚠️ Something went wrong handling that. It is logged -- "
+                    "try again, and if it keeps happening the logs will say why."
+                )
+            except Exception:
+                logger.warning("could not even deliver the error notice", exc_info=True)
+
+
 def main() -> None:
     if not SYSTEM_PROMPT_FILE.exists():
         logger.error("System prompt file not found: %s", SYSTEM_PROMPT_FILE)
@@ -3921,6 +3957,7 @@ def main() -> None:
     app.add_handler(CommandHandler("mode", cmd_mode))
     app.add_handler(CommandHandler("learned", cmd_learned))
     app.add_handler(CommandHandler("forget", cmd_forget))
+    app.add_error_handler(on_error)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     logger.info("Lite Agent starting (allowed users: %s)", ALLOWED_USER_IDS or "ANY (no allowlist!)")
