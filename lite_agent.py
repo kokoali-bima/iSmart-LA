@@ -2928,7 +2928,7 @@ async def cmd_pin_key(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
 
     _pin_sessions.pop(token, None)
-    await _pin_verified(update, query, session)
+    await _pin_verified(update, context, query, session)
 
 
 async def _pin_capture(update: Update, query, session: dict, token: str, entered: str) -> None:
@@ -2955,7 +2955,8 @@ async def _pin_capture(update: Update, query, session: dict, token: str, entered
     )
 
 
-async def _pin_verified(update: Update, query, session: dict) -> None:
+async def _pin_verified(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                        query, session: dict) -> None:
     """PIN checked out -- carry out the action that was waiting on it."""
     action, payload = session["action"], session["payload"]
 
