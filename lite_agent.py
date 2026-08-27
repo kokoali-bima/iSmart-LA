@@ -668,6 +668,118 @@ def redact_secrets(text: str) -> tuple[str, bool]:
 # It also means fewer things to type: host, user, port. Nothing secret.
 # --------------------------------------------------------------------------
 
+# --------------------------------------------------------------------------
+# Hard boundaries, editable from Telegram
+#
+# These were only settable at install time by bootstrap.py, which meant the most
+# safety-critical setting in the system was also the one you could not revisit
+# without editing a file over SSH. Anything that hard to change stops matching
+# reality, and a boundary list that no longer matches reality is worse than none
+# -- it reads as protection that isn't there.
+#
+# They live in the PROTECTED zone of both briefs. The agent still cannot write
+# there: the bot edits on the human's behalf, exactly as bootstrap.py does.
+# --------------------------------------------------------------------------
+
+BOUNDARY_HEADER = "## HARD BOUNDARIES"
+
+
+def read_boundaries() -> list[str]:
+    for path in _brief_files():
+        protected, _ = _split_zones(path.read_text())
+        if BOUNDARY_HEADER not in protected:
+            continue
+        section = protected.split(BOUNDARY_HEADER, 1)[1]
+        # up to the next heading
+        section = re.split(r"\n## ", section, maxsplit=1)[0]
+        items = [ln.strip()[2:].strip() for ln in section.split("\n")
+                 if ln.strip().startswith("- ")]
+        if items:
+            return items
+    return []
+
+
+def write_boundaries(items: list[str]) -> None:
+    """Rewrite ONLY the boundary bullet list, in both briefs. Everything else in
+    the protected zone -- persona, access notes, report rules -- is untouched."""
+    body = "\n".join(f"- {i}" for i in items) if items else \
+        "- (none recorded yet -- add them with /boundaries, they are what stops " \
+        "a mistake from becoming an incident)"
+    for path in _brief_files():
+        text = path.read_text()
+        protected, learned = _split_zones(text)
+        if BOUNDARY_HEADER not in protected:
+            protected = protected.rstrip() + (
+                f"\n\n{BOUNDARY_HEADER} -- never do these without explicit human "
+                f"confirmation in the moment, even if asked generically:\n{body}\n")
+        else:
+            head, _, rest = protected.partition(BOUNDARY_HEADER)
+            first_line, _, after = rest.partition("\n")
+            tail = ""
+            if "\n## " in after:
+                tail = "\n## " + after.split("\n## ", 1)[1]
+            protected = f"{head}{BOUNDARY_HEADER}{first_line}\n{body}\n{tail}"
+        rebuilt = protected.rstrip() + "\n"
+        if learned or LEARNED_ZONE_MARKER in text:
+            rebuilt += (f"\n{LEARNED_ZONE_MARKER}\n## Learned about this environment\n\n"
+                        "Facts the agent discovered and recorded itself. Safe to edit or "
+                        "delete by hand -- nothing above the marker line is ever touched "
+                        f"automatically.\n\n{learned}\n")
+        path.write_text(rebuilt)
+    logger.warning("hard boundaries rewritten: %d entr(ies)", len(items))
+
+
+# --------------------------------------------------------------------------
+# VM snapshots taken before a change
+#
+# Registered here so they can be listed and cleaned up later, rather than
+# accumulating invisibly on the cluster until someone notices storage is full.
+#
+# HONEST LIMIT: this is a convention the agent is told to follow, not a lock.
+# Every command it runs on a node goes out as `ssh <node> "qm ..."`, and this
+# process never sees those individually -- so "always snapshot first" is an
+# instruction in the brief plus a tool that makes doing it easy, not something
+# the code can force. It is still worth having: the right thing becomes the
+# easy thing, and every snapshot taken is visible in /snapshots afterwards.
+# --------------------------------------------------------------------------
+
+SNAPSHOTS_FILE = BASE_DIR / "snapshots.json"
+
+
+def read_snapshots() -> list[dict]:
+    if not SNAPSHOTS_FILE.exists():
+        return []
+    try:
+        return json.loads(SNAPSHOTS_FILE.read_text())
+    except Exception:
+        logger.warning("snapshots.json unreadable", exc_info=True)
+        return []
+
+
+def register_snapshot(entry: dict) -> None:
+    items = read_snapshots()
+    items.append({**entry, "at": _dt.datetime.now().strftime("%Y-%m-%d %H:%M")})
+    SNAPSHOTS_FILE.write_text(json.dumps(items[-200:], indent=2))
+    logger.warning("SNAPSHOT registered: vm=%s name=%s", entry.get("vmid"), entry.get("snapname"))
+
+
+SNAPSHOT_LINE_RE = re.compile(r"^\s*SNAPSHOT:\s*(.+?)\s*$", re.MULTILINE)
+
+
+def extract_snapshots(text: str) -> tuple[str, list[dict]]:
+    """SNAPSHOT: vmid=105 | node=pm4 | name=pre-change-1230 | reason=resize RAM"""
+    out = []
+    for raw in SNAPSHOT_LINE_RE.findall(text):
+        fields = {}
+        for chunk in raw.split("|"):
+            k, _, v = chunk.partition("=")
+            fields[k.strip().lower()] = v.strip()
+        if fields.get("vmid") and fields.get("name"):
+            out.append({"vmid": fields["vmid"], "node": fields.get("node", "?"),
+                        "snapname": fields["name"], "reason": fields.get("reason", "")})
+    return SNAPSHOT_LINE_RE.sub("", text).strip(), out
+
+
 SERVERS_FILE = BASE_DIR / "servers.json"
 SSH_CONFIG_FILE = Path.home() / ".ssh" / "config"
 SSH_CONFIG_BEGIN = "# BEGIN iSmart-LA managed -- edited by the bot, do not hand-edit"
@@ -753,8 +865,9 @@ def _rebuild_ssh_config(items: list[dict]) -> None:
     SSH_CONFIG_FILE.chmod(0o600)
 
 
-def test_server_ssh(host: str, user: str, port: int, timeout: int = 20) -> tuple[bool, str]:
-    key, _ = agent_keypair()
+def test_server_ssh(host: str, user: str, port: int, timeout: int = 20,
+                    key_path: Optional[str] = None) -> tuple[bool, str]:
+    key = Path(key_path) if key_path else agent_keypair()[0]
     proc = subprocess.run(
         ["ssh", "-i", str(key), "-p", str(port),
          "-o", "StrictHostKeyChecking=no", "-o", "BatchMode=yes",
@@ -2283,6 +2396,9 @@ Every reply ends with a "— by ..." tag. If it's ever NOT "{TIERS[0]['label']}"
 /unschedule <name> — remove a scheduled task
 /adopt — bring pre-existing cron entries under management
 /setpin — set/change the 6-digit PIN (entered on a keypad, never typed in chat)
+/boundaries — what the agent must never do (0 tokens)
+/addboundary <rule> — add one   /rmboundary <n> — remove one (PIN)
+/snapshots — snapshots taken before changes (0 tokens)
 /servers — machines the agent may reach (0 tokens)
 /addserver — register a new machine, step by step
 /removeserver <name> — unregister one
@@ -2656,6 +2772,12 @@ async def _pin_verified(update: Update, query, session: dict) -> None:
 
     if action == "change_pin_start":
         await _begin_new_pin(update, query)
+        return
+
+    if action == "rmboundary":
+        rule = payload["rule"]
+        write_boundaries([x for x in read_boundaries() if x != rule])
+        await query.edit_message_text(f"🚧 Removed: {_tg_escape(rule)}", parse_mode="HTML")
         return
 
     if action == "addserver":
@@ -3032,7 +3154,8 @@ async def cmd_server_button(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         await query.edit_message_text("🔌 Testing the connection…")
         loop = asyncio.get_running_loop()
         ok, detail = await loop.run_in_executor(
-            None, test_server_ssh, data["host"], data["user"], data["port"])
+            None, test_server_ssh, data["host"], data["user"], data["port"],
+            20, data.get("key"))
         if not ok:
             await query.edit_message_text(
                 f"❌ Couldn't connect:\n<pre>{_tg_escape(detail)}</pre>\n\n"
@@ -3076,6 +3199,22 @@ async def _handle_server_input(update: Update, context: ContextTypes.DEFAULT_TYP
     """Text steps of /addserver. Returns True if the message was consumed."""
     chat_id = update.effective_chat.id
     state = _server_wizard.get(chat_id)
+    if state and state["step"] == "authorize":
+        text = (update.message.text or "").strip()
+        if text.lower().startswith("usekey "):
+            name = text.split(None, 1)[1].strip()
+            key = Path.home() / ".ssh" / name
+            if not key.exists() or not key.with_suffix(".pub").exists():
+                await update.message.reply_text(
+                    f"No keypair named '{name}' on this host. Send just the name, "
+                    "without .pub")
+                return True
+            state["data"]["key"] = str(key)
+            await update.message.reply_text(
+                f"🔑 Using <code>{_tg_escape(name)}</code>. Tap Test above.",
+                parse_mode="HTML")
+            return True
+        return False
     if not state or state["step"] not in ("name", "host", "user", "port"):
         return False
     if state["expires"] < _dt.datetime.now().timestamp():
@@ -3131,6 +3270,10 @@ async def _handle_server_input(update: Update, context: ContextTypes.DEFAULT_TYP
     try:
         _, pub = await loop.run_in_executor(None, agent_keypair)
         pubkey = pub.read_text().strip()
+        others = sorted(
+            k.stem for k in (Path.home() / ".ssh").glob("*.pub")
+            if k.stem not in (pub.stem, "agent_active")
+        )
     except Exception as exc:
         logger.exception("could not prepare the agent keypair")
         _server_wizard.pop(chat_id, None)
@@ -3152,6 +3295,15 @@ async def _handle_server_input(update: Update, context: ContextTypes.DEFAULT_TYP
             InlineKeyboardButton("✖️ Cancel", callback_data="srv:cancel:"),
         ]]),
     )
+    if others:
+        # Already have a key that reaches this machine? Say so instead of
+        # installing a second one. The key itself never moves through chat --
+        # you pick a name, and the file stays on this host.
+        await update.message.reply_text(
+            "🔑 <i>Already have a key that reaches it?</i> These are on this host:\n"
+            + "\n".join(f"  • <code>{_tg_escape(o)}</code>" for o in others[:10])
+            + "\n\nSend <code>usekey &lt;name&gt;</code> to use one of those instead.",
+            parse_mode="HTML")
     return True
 
 
@@ -3243,6 +3395,95 @@ async def cmd_removeserver(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         parse_mode="HTML")
 
 
+async def cmd_boundaries(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """List the hard boundaries. Readable by anyone the bot answers -- knowing
+    what is off-limits is not sensitive, and a boundary nobody can see is one
+    nobody can check."""
+    if not _authorized(update):
+        return
+    items = read_boundaries()
+    if not items:
+        return await update.message.reply_text(
+            "🚧 <b>No hard boundaries set.</b>\n\nNothing is currently marked off-limits. "
+            "Add the first with <code>/addboundary &lt;rule&gt;</code>.\n\n"
+            "<i>These are what stop a misunderstanding from becoming an incident — "
+            "the agent is told it may never do them, whatever it is asked.</i>",
+            parse_mode="HTML")
+    lines = [f"🚧 <b>Hard boundaries ({len(items)})</b>", ""]
+    lines += [f"{i}. {_tg_escape(x)}" for i, x in enumerate(items, 1)]
+    lines.append("\n<i>Add: /addboundary &lt;rule&gt;   Remove: /rmboundary &lt;number&gt;</i>")
+    await _reply_chunked(update, "\n".join(lines))
+
+
+async def cmd_addboundary(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _may_run_setup(update):
+        return
+    if not _is_owner(update) and not await _is_group_admin(update, context):
+        return await update.message.reply_text("🔒 Bot owner or a group admin only.")
+    rule = " ".join(context.args).strip() if context.args else ""
+    if len(rule) < 8:
+        return await update.message.reply_text(
+            "Usage: /addboundary <rule>\n\n"
+            'e.g. /addboundary The VM "prod-db" — never stop or restart it\n\n'
+            "Be specific: a vague rule is one the agent has to interpret.")
+    items = read_boundaries()
+    if rule in items:
+        return await update.message.reply_text("That boundary is already recorded.")
+    items.append(rule)
+    write_boundaries(items)
+    logger.warning("BOUNDARY ADDED by=%s: %s", update.effective_user.id, rule)
+    await update.message.reply_text(
+        f"🚧 Added. {len(items)} boundar{'y' if len(items) == 1 else 'ies'} now in force.\n\n"
+        "<i>It takes effect on the next new conversation — existing ones already "
+        "have the older list. Use /new to apply it right away.</i>",
+        parse_mode="HTML")
+
+
+async def cmd_rmboundary(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Removing a boundary needs the PIN. Adding one only ever restricts the
+    agent; removing one hands capability back, which is the direction worth
+    slowing down."""
+    if not _may_run_setup(update):
+        return
+    if not _is_owner(update) and not await _is_group_admin(update, context):
+        return await update.message.reply_text("🔒 Bot owner or a group admin only.")
+    arg = (context.args[0] if context.args else "").strip()
+    items = read_boundaries()
+    if not arg.isdigit() or not (1 <= int(arg) <= len(items)):
+        return await update.message.reply_text(
+            f"Usage: /rmboundary <number>\nSee /boundaries ({len(items)} recorded).")
+    target = items[int(arg) - 1]
+    if pin_is_set():
+        await request_pin(update, "rmboundary", {"rule": target},
+                          f"🚧 Removing a boundary:\n\n<i>{_tg_escape(target)}</i>")
+    else:
+        write_boundaries([x for x in items if x != target])
+        await update.message.reply_text(f"🚧 Removed: {target}")
+
+
+async def cmd_snapshots(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Snapshots the agent took before changing something. Zero tokens."""
+    if not _authorized(update):
+        return
+    items = read_snapshots()
+    if not items:
+        return await update.message.reply_text(
+            "📸 No snapshots recorded yet.\n\n"
+            "<i>The agent is told to snapshot a VM before changing it, and each one "
+            "it takes shows up here so it can be cleaned up later.</i>",
+            parse_mode="HTML")
+    lines = [f"📸 <b>Snapshots taken before changes ({len(items)})</b>", ""]
+    for i, s in enumerate(items[-25:], 1):
+        lines.append(
+            f"{i}. VM <b>{_tg_escape(str(s.get('vmid')))}</b> on "
+            f"{_tg_escape(str(s.get('node')))} — <code>{_tg_escape(s.get('snapname', '?'))}</code>\n"
+            f"   {s.get('at', '?')}" + (f" — {_tg_escape(s['reason'])}" if s.get("reason") else ""))
+    lines.append(
+        "\n<i>Delete one on the cluster with: qm delsnapshot &lt;vmid&gt; &lt;name&gt;</i>\n"
+        "<i>Snapshots hold disk space, so they are worth clearing once a change has proven good.</i>")
+    await _reply_chunked(update, "\n".join(lines))
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _authorized(update):
         return
@@ -3280,6 +3521,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     reply_text = result.get("result") or "(no response)"
     reply_text, learned_facts = extract_learned(reply_text)
     reply_text, schedule_proposals = extract_schedules(reply_text)
+    reply_text, snapshots_taken = extract_snapshots(reply_text)
+    for snap in snapshots_taken:
+        register_snapshot(snap)
     clean_text, media_paths = extract_media_paths(reply_text)
 
     # Persist BEFORE delivery: if Telegram is having a bad moment, the thing the
@@ -3389,6 +3633,10 @@ def main() -> None:
     app.add_handler(CommandHandler("memory", cmd_memory))
     app.add_handler(CommandHandler("setpin", cmd_setpin))
     app.add_handler(CallbackQueryHandler(cmd_pin_key, pattern="^pin:"))
+    app.add_handler(CommandHandler("boundaries", cmd_boundaries))
+    app.add_handler(CommandHandler("addboundary", cmd_addboundary))
+    app.add_handler(CommandHandler("rmboundary", cmd_rmboundary))
+    app.add_handler(CommandHandler("snapshots", cmd_snapshots))
     app.add_handler(CommandHandler("addserver", cmd_addserver))
     app.add_handler(CommandHandler("servers", cmd_servers))
     app.add_handler(CommandHandler("removeserver", cmd_removeserver))
