@@ -723,26 +723,72 @@ def _md_to_telegram_html(text: str) -> str:
 
 
 def _chunk_lines(text: str, limit: int) -> list[str]:
-    """Split on line boundaries, never mid-line. Conversion happens per chunk,
-    so tags can never end up split across two messages (which would make
-    Telegram reject the half that has an unclosed tag)."""
+    """Split on line boundaries, never mid-line, and never mid-STRUCTURE.
+
+    Each chunk is converted independently, so a chunk has to be valid Markdown
+    on its own. Splitting purely on length breaks that for anything spanning
+    more lines than fit: a fenced code block cut in half leaves both halves
+    with an unmatched fence (so neither converts, and the reader sees literal
+    backticks), and a table cut below its separator row leaves the tail as a
+    pile of stray pipes. Both are easy to hit here -- a long log dump, or a
+    table with a row per VM.
+
+    So structure is tracked while chunking: an open code fence is closed at the
+    break and reopened (with its original language) on the next chunk, and a
+    table's header + separator are repeated, which also just reads better --
+    the continuation arrives with its column headings instead of bare rows.
+    """
+    lines = text.split("\n")
     chunks: list[str] = []
-    current = ""
-    for line in text.split("\n"):
-        while len(line) > limit:  # pathological single long line
+    current: list[str] = []
+    size = 0
+    open_fence: Optional[str] = None   # the opening fence line, while inside one
+    table_head: list[str] = []         # [header, separator], while inside a table
+
+    def carry() -> list[str]:
+        if open_fence:
+            return [open_fence]
+        return list(table_head)
+
+    def flush() -> None:
+        nonlocal current, size
+        body = list(current)
+        if open_fence:
+            body.append("```")
+        if any(ln.strip() for ln in body):
+            chunks.append("\n".join(body))
+        current = carry()
+        size = sum(len(ln) + 1 for ln in current)
+
+    for raw in lines:
+        line = raw
+        while len(line) > limit:  # pathological single very long line
             if current:
-                chunks.append(current)
-                current = ""
+                flush()
             chunks.append(line[:limit])
             line = line[limit:]
-        candidate = f"{current}\n{line}" if current else line
-        if len(candidate) > limit:
-            chunks.append(current)
-            current = line
-        else:
-            current = candidate
-    if current:
-        chunks.append(current)
+
+        if current and size + len(line) + 1 > limit:
+            flush()
+        current.append(line)
+        size += len(line) + 1
+
+        stripped = line.strip()
+        if stripped.startswith("```"):
+            open_fence = None if open_fence else line
+            table_head = []
+        elif open_fence is None:
+            if _TABLE_SEP_RE.match(line):
+                header = current[-2] if len(current) >= 2 else ""
+                table_head = [header, line] if header.count("|") >= 2 else []
+            elif line.count("|") < 2:
+                table_head = []
+
+    body = list(current)
+    if open_fence:
+        body.append("```")
+    if any(ln.strip() for ln in body):
+        chunks.append("\n".join(body))
     return chunks or [""]
 
 
