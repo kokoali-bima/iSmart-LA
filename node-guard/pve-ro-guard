@@ -38,10 +38,21 @@ deny() {
 
 [ -z "$CMD" ] && { echo "pve-ro-guard: interactive shell is not permitted on this key." >&2; exit 126; }
 
-# Shell metacharacters that chain or redirect into something else. Pipes are
-# allowed because read-only output almost always gets piped through jq/grep, and
-# every element of the pipeline is validated below anyway.
-case "$CMD" in
+# Discarding stderr is not a write. `2>/dev/null` and `2>&1` appear in almost
+# every real read-only command -- an earlier version refused
+# `pvesh get /cluster/resources 2>/dev/null`, a perfectly ordinary status query,
+# because it contains a '>'. Strip those two forms first, then judge what's left.
+# A guard that blocks real work gets switched off, so precision here is a safety
+# property, not a nicety.
+SCRUBBED="$CMD"
+SCRUBBED="${SCRUBBED//2>\/dev\/null/}"
+SCRUBBED="${SCRUBBED//2> \/dev\/null/}"
+SCRUBBED="${SCRUBBED//2>&1/}"
+
+# Shell metacharacters that chain, substitute, or redirect into something else.
+# Pipes are allowed because read-only output almost always gets piped through
+# jq/grep, and every element of the pipeline is validated below anyway.
+case "$SCRUBBED" in
   *';'*|*'&'*|*'`'*|*'$('*|*'>'*|*'<'*|*$'\n'*) deny ;;
 esac
 
