@@ -844,9 +844,12 @@ def _rebuild_ssh_config(items: list[dict]) -> None:
     else:
         head, tail = existing.rstrip("\n"), ""
 
-    key = SSH_ACTIVE_KEY if SSH_ACTIVE_KEY.exists() else agent_keypair()[0]
+    default_key = SSH_ACTIVE_KEY if SSH_ACTIVE_KEY.exists() else agent_keypair()[0]
     block = [SSH_CONFIG_BEGIN]
     for it in items:
+        # A per-server key wins, so what was tested is what gets used. Without
+        # its own key a host follows agent_active, and therefore lock/unlock.
+        key = it.get("key") or default_key
         for host in [it["host"], *it.get("cluster_hosts", [])]:
             block += [
                 f"Host {host}",
@@ -896,8 +899,13 @@ def discover_proxmox(host: str, user: str, port: int) -> tuple[bool, str, list[s
         ).stdout
 
     try:
-        nodes_raw = run("pvesh get /nodes --output-format json 2>/dev/null")
-        nodes = json.loads(nodes_raw) if nodes_raw.strip().startswith("[") else []
+        # /cluster/status, not /nodes: it carries each node's real IP. Node
+        # NAMES are not safe to use as SSH hosts -- a wildcard DNS record can
+        # point them at a proxy, and then you are talking to the wrong machine
+        # without any error to tell you so.
+        status_raw = run("pvesh get /cluster/status --output-format json 2>/dev/null")
+        status = json.loads(status_raw) if status_raw.strip().startswith("[") else []
+        nodes = [n for n in status if n.get("type") == "node"]
         guests_raw = run("pvesh get /cluster/resources --type vm --output-format json 2>/dev/null")
         guests = json.loads(guests_raw) if guests_raw.strip().startswith("[") else []
     except Exception as exc:
@@ -906,16 +914,17 @@ def discover_proxmox(host: str, user: str, port: int) -> tuple[bool, str, list[s
     if not nodes:
         return False, "no Proxmox nodes reported -- is pvesh available for this user?", []
 
-    names = [n.get("node", "?") for n in nodes]
+    names = [n.get("name", "?") for n in nodes]
+    # Addresses, not names -- these are what end up in ~/.ssh/config.
+    addrs = [n["ip"] for n in nodes if n.get("ip")]
     running = sum(1 for g in guests if g.get("status") == "running")
-    lines = [f"Found {len(names)} node(s): {', '.join(names)}",
+    lines = [f"Found {len(nodes)} node(s)",
              f"Guests: {len(guests)} total, {running} running"]
     for n in nodes:
-        lines.append(
-            f"  • {n.get('node')}: {n.get('status', '?')}"
-            f", {round(n.get('maxmem', 0) / 1024**3)}GB RAM"
-        )
-    return True, "\n".join(lines), names
+        lines.append(f"  • {n.get('name')} — {n.get('ip', 'no ip reported')}")
+    if len(addrs) < len(nodes):
+        lines.append("\n⚠️ Some nodes reported no IP and were left out.")
+    return True, "\n".join(lines), addrs
 
 
 # --------------------------------------------------------------------------
@@ -3392,9 +3401,10 @@ async def _handle_server_input(update: Update, context: ContextTypes.DEFAULT_TYP
     try:
         _, pub = await loop.run_in_executor(None, agent_keypair)
         pubkey = pub.read_text().strip()
+        managed = {pub.stem, "agent_active", SSH_RO_KEY.stem, SSH_RW_KEY.stem}
         others = sorted(
             k.stem for k in (Path.home() / ".ssh").glob("*.pub")
-            if k.stem not in (pub.stem, "agent_active")
+            if k.stem not in managed
         )
     except Exception as exc:
         logger.exception("could not prepare the agent keypair")
@@ -3424,7 +3434,10 @@ async def _handle_server_input(update: Update, context: ContextTypes.DEFAULT_TYP
         await update.message.reply_text(
             "🔑 <i>Already have a key that reaches it?</i> These are on this host:\n"
             + "\n".join(f"  • <code>{_tg_escape(o)}</code>" for o in others[:10])
-            + "\n\nSend <code>usekey &lt;name&gt;</code> to use one of those instead.",
+            + "\n\nSend <code>usekey &lt;name&gt;</code> to use one instead.\n\n"
+            "⚠️ <i>A host pinned to its own key sits outside read-only mode — "
+            "the agent could change it at any time, without /unlock. Prefer the "
+            "key above unless this machine genuinely needs its own.</i>",
             parse_mode="HTML")
     return True
 
