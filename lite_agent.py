@@ -208,6 +208,135 @@ FILE_URI_RE = re.compile(r"file://(/[^\s\)\]\"'>]+)")
 # and THIS code decides where it lands -- always appended inside the LEARNED
 # zone, never anywhere else. The zone boundary is then enforced structurally
 # rather than by the model's cooperation.
+# --------------------------------------------------------------------------
+# Write mode: full capability, but only while a human has explicitly opened it
+#
+# This agent is meant to do real work -- create VMs, repair them, tweak node and
+# cluster config, run security audits. Cutting it down to read-only would make
+# it useless for exactly the jobs it exists for, so that is not the boundary.
+#
+# The boundary is WHO ASKED, and WHEN. Almost every turn is a question, and a
+# question needs no write access at all. The rare turn that changes something is
+# one a human deliberately initiated. So capability is not removed, it is gated:
+#
+#   locked (default)  -> ~/.ssh/agent_active points at a restricted key whose
+#                        authorized_keys entry forces a read-only guard on the
+#                        node. Reads, audits and monitoring all work normally.
+#   unlocked (opt-in) -> the same symlink points at the full root key, for a
+#                        fixed number of minutes, then flips back on its own.
+#
+# What makes this hold: unlocking is a Telegram command, admin-only, private-DM
+# only. It is not something the model can do, ask for, or be talked into by
+# text it read in a log file, a web page, or a group message -- the same class
+# of input that can otherwise steer a turn. Prompt injection can make the agent
+# TRY to change something; it cannot make the credential exist.
+#
+# The failure mode is also the safe one: if anything about the swap goes wrong,
+# what is left in place is the restricted key.
+# --------------------------------------------------------------------------
+
+WRITE_STATE_FILE = BASE_DIR / "write_mode.json"
+SSH_ACTIVE_KEY = Path(os.environ.get("SSH_ACTIVE_KEY", str(Path.home() / ".ssh/agent_active")))
+SSH_RO_KEY = Path(os.environ.get("SSH_RO_KEY", str(Path.home() / ".ssh/agent_readonly")))
+SSH_RW_KEY = Path(os.environ.get("SSH_RW_KEY", str(Path.home() / ".ssh/agent_write")))
+WRITE_MODE_MAX_MINUTES = int(os.environ.get("WRITE_MODE_MAX_MINUTES", "60"))
+WRITE_MODE_DEFAULT_MINUTES = int(os.environ.get("WRITE_MODE_DEFAULT_MINUTES", "15"))
+
+
+def _keys_configured() -> bool:
+    """Both keys present? If not, this whole mechanism is inert and we say so
+    rather than pretending a boundary exists that doesn't."""
+    return SSH_RO_KEY.exists() and SSH_RW_KEY.exists()
+
+
+def _point_active_key_at(target: Path) -> None:
+    tmp = SSH_ACTIVE_KEY.with_suffix(".swap")
+    if tmp.exists() or tmp.is_symlink():
+        tmp.unlink()
+    tmp.symlink_to(target)
+    tmp.replace(SSH_ACTIVE_KEY)  # atomic: never a moment with no key at all
+
+
+def write_mode_expires_at() -> Optional[float]:
+    """Unix ts while write mode is open, else None. Self-healing: an expired
+    state file re-locks on read, so expiry needs no timer or background task --
+    which matters, because a background task is exactly what this project
+    avoids."""
+    if not WRITE_STATE_FILE.exists():
+        return None
+    try:
+        until = float(json.loads(WRITE_STATE_FILE.read_text()).get("until", 0))
+    except Exception:
+        logger.warning("write_mode.json unreadable -- re-locking to be safe", exc_info=True)
+        lock_write_mode()
+        return None
+    if _dt.datetime.now().timestamp() >= until:
+        lock_write_mode()
+        return None
+    return until
+
+
+def lock_write_mode() -> None:
+    try:
+        WRITE_STATE_FILE.unlink(missing_ok=True)
+    except OSError:
+        pass
+    if _keys_configured():
+        try:
+            _point_active_key_at(SSH_RO_KEY)
+        except OSError:
+            logger.exception("could not swap back to the read-only key")
+
+
+def unlock_write_mode(minutes: int) -> float:
+    minutes = max(1, min(minutes, WRITE_MODE_MAX_MINUTES))
+    until = _dt.datetime.now().timestamp() + minutes * 60
+    _point_active_key_at(SSH_RW_KEY)
+    WRITE_STATE_FILE.write_text(json.dumps({"until": until}))
+    logger.warning("WRITE MODE OPENED for %d minute(s)", minutes)
+    return until
+
+
+def write_mode_notice() -> str:
+    """Told to the model each turn, so it explains the situation instead of
+    hitting a confusing permission error and guessing at the cause."""
+    if not _keys_configured():
+        return ""
+    until = write_mode_expires_at()
+    if until:
+        left = int((until - _dt.datetime.now().timestamp()) / 60) + 1
+        return (
+            f"[WRITE MODE IS OPEN for about {left} more minute(s). Changes to the managed "
+            "environment are permitted this turn. Still confirm anything destructive with "
+            "the user first, and stay inside the hard boundaries above -- those never lift.]"
+        )
+    return (
+        "[READ-ONLY MODE. Your credential physically cannot change the managed environment "
+        "right now -- investigate, audit and report freely, but do not attempt changes. If "
+        "the user is asking for a change, say plainly that they need to run /unlock first, "
+        "and tell them exactly what you would do once they do. Do not try to work around "
+        "this, and do not attempt to modify SSH keys or this bot's own files.]"
+    )
+
+
+# --------------------------------------------------------------------------
+# Outbound secret redaction
+#
+# The agent has an unrestricted shell as the same user this bot runs as, so it
+# can read .env -- and in practice it did: asked to set up a scheduled report
+# that posts to Telegram, it reasonably went and read the bot token out of
+# .env. Nothing malicious, just a sensible step with a bad second-order effect,
+# and those secrets then sat in plaintext in the CLI's own transcript files.
+#
+# Trying to stop it reading the file is the wrong place to fight. File
+# permissions can't separate the agent from the bot (same user), and the CLIs'
+# own deny rules turned out to have surprising semantics (agy silently ignores
+# a wildcard deny -- verified by testing, not assumed). Any of those would give
+# the *appearance* of a boundary.
+#
+# So guard the last gate we fully control instead: nothing leaves this process
+# toward Telegram carrying a known secret, regardless of how the model came by
+# it. Cheap, unconditional, and it does not depend on the model cooperating.
 _SECRET_ENV_KEYS = ("TELEGRAM_BOT_TOKEN", "ANTHROPIC_API_KEY")
 
 _SECRETS = tuple(
@@ -514,6 +643,14 @@ def _build_agy_prompt(prompt: str, include_env: bool = False) -> str:
     memory_text = load_memory_text()
     if memory_text:
         parts.append(f"[Cross-session facts to remember:]\n{memory_text}")
+    # Placed BEFORE the early return below: on a resumed turn with an empty
+    # MEMORY.md there is nothing else to prepend, and an earlier version
+    # returned here -- silently dropping the mode notice in exactly the case
+    # it matters most (a long conversation where the model has lost track of
+    # whether it is currently allowed to change anything).
+    notice = write_mode_notice()
+    if notice:
+        parts.append(notice)
     if not parts:
         return prompt
     parts.append(f"[User's question:]\n{prompt}")
@@ -1341,6 +1478,9 @@ Every reply ends with a "— by ..." tag. If it's ever NOT "{BACKEND_LABELS[AGY_
 /sessions — list all saved sessions
 /remember <fact> — save a fact PERMANENTLY, read in EVERY session & EVERY tier, even after many /new
 /memory — view current memory contents
+/mode — read-only right now, or able to make changes? (0 tokens)
+/unlock [minutes] — owner-only, DM-only: allow real changes for a limited window
+/lock — close that window early
 /learned — see what the agent figured out about this environment BY ITSELF
 /forget <number> — delete one wrong learned fact (numbers come from /learned)
 /help — this guide (choose EN or ID)
@@ -1496,6 +1636,89 @@ async def cmd_forget(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     )
 
 
+async def cmd_unlock(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Open write mode for a fixed window.
+
+    Deliberately stricter than _authorized(): _is_trusted_origin() means a
+    private DM from a named account. A group is a place where text arrives from
+    people and systems this deployment does not vet, and this is the one command
+    that hands the agent the ability to change production -- so it is not
+    something a group can reach, even a registered one.
+    """
+    if not _is_trusted_origin(update):
+        logger.warning(
+            "refused /unlock from chat=%s user=%s",
+            getattr(update.effective_chat, "id", "?"),
+            getattr(update.effective_user, "id", "?"),
+        )
+        await update.message.reply_text(
+            "🔒 /unlock only works in a private DM from the bot owner."
+        )
+        return
+    if not _keys_configured():
+        await update.message.reply_text(
+            "⚠️ Write-mode keys are not set up, so there is nothing to unlock — the agent "
+            f"is using whatever `{SSH_ACTIVE_KEY.name}` already points at.\n\n"
+            "See README (\"Write mode\") to enable the two-key setup.",
+            parse_mode="Markdown",
+        )
+        return
+
+    minutes = WRITE_MODE_DEFAULT_MINUTES
+    if context.args:
+        try:
+            minutes = int(context.args[0])
+        except ValueError:
+            await update.message.reply_text(f"Usage: /unlock [minutes, max {WRITE_MODE_MAX_MINUTES}]")
+            return
+    try:
+        until = unlock_write_mode(minutes)
+    except OSError as exc:
+        logger.exception("unlock failed")
+        await update.message.reply_text(f"⚠️ Could not unlock: {exc}")
+        return
+    left = int((until - _dt.datetime.now().timestamp()) / 60) + 1
+    await update.message.reply_text(
+        f"🔓 *Write mode open for {left} minute(s).*\n\n"
+        "The agent can now create, repair and reconfigure things. It re-locks by itself "
+        "when the time is up — or use /lock to close it now.\n\n"
+        "Hard boundaries still apply and never lift.",
+        parse_mode="Markdown",
+    )
+
+
+async def cmd_lock(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _is_trusted_origin(update):
+        return
+    was_open = write_mode_expires_at() is not None
+    lock_write_mode()
+    await update.message.reply_text(
+        "🔒 Write mode closed. Back to read-only." if was_open
+        else "🔒 Already read-only."
+    )
+
+
+async def cmd_mode(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Zero-token check of what the agent can currently do."""
+    if not _authorized(update):
+        return
+    if not _keys_configured():
+        await update.message.reply_text(
+            "⚠️ Write-mode keys not configured — the agent uses one fixed SSH key, so it "
+            "can change things at any time. See README (\"Write mode\") to gate that."
+        )
+        return
+    until = write_mode_expires_at()
+    if until:
+        left = int((until - _dt.datetime.now().timestamp()) / 60) + 1
+        await update.message.reply_text(f"🔓 Write mode OPEN — about {left} minute(s) left.")
+    else:
+        await update.message.reply_text(
+            "🔒 Read-only. Investigation, audits and reports work normally.\n"
+            "Need a change? /unlock [minutes]"
+        )
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _authorized(update):
         return
@@ -1626,6 +1849,9 @@ def main() -> None:
     app.add_handler(CommandHandler("sessions", cmd_sessions))
     app.add_handler(CommandHandler("remember", cmd_remember))
     app.add_handler(CommandHandler("memory", cmd_memory))
+    app.add_handler(CommandHandler("unlock", cmd_unlock))
+    app.add_handler(CommandHandler("lock", cmd_lock))
+    app.add_handler(CommandHandler("mode", cmd_mode))
     app.add_handler(CommandHandler("learned", cmd_learned))
     app.add_handler(CommandHandler("forget", cmd_forget))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))

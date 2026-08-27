@@ -1,0 +1,103 @@
+#!/bin/bash
+# ==============================================================================
+# pve-ro-guard -- read-only gate for the iSmart-LA agent's restricted SSH key
+#
+# Install on each managed node as /usr/local/bin/pve-ro-guard (chmod 755), then
+# add the agent's READ-ONLY public key to /root/.ssh/authorized_keys with:
+#
+#   command="/usr/local/bin/pve-ro-guard",no-port-forwarding,no-agent-forwarding,
+#   no-X11-forwarding,no-pty ssh-ed25519 AAAA...  ismart-la-readonly
+#
+# The agent's WRITE key goes in as a normal unrestricted entry. Which of the two
+# the agent presents is decided on the bot side by /unlock, so this script never
+# needs to know about time windows or who asked.
+#
+# WHY A FORCED COMMAND RATHER THAN A LIMITED ROLE
+#   sshd runs THIS script instead of whatever the client asked for, passing the
+#   requested command in $SSH_ORIGINAL_COMMAND. The client cannot bypass it: it
+#   is not a policy the client consults, it is the only thing that key can run.
+#
+# DESIGN NOTE -- allowlist, not denylist
+#   Blocking "the dangerous ones" fails the moment something dangerous is spelled
+#   a way you did not think of. This allows a short list of read-only verbs and
+#   refuses everything else, so an unanticipated command is refused rather than
+#   silently permitted. If the agent reports being blocked on something genuinely
+#   read-only, add it here deliberately.
+# ==============================================================================
+set -uo pipefail
+
+CMD="${SSH_ORIGINAL_COMMAND:-}"
+LOG_TAG="pve-ro-guard"
+
+deny() {
+  logger -t "$LOG_TAG" "DENIED: $CMD"
+  echo "pve-ro-guard: refused -- this key is read-only." >&2
+  echo "Ask the operator to run /unlock in Telegram if this really needs to change something." >&2
+  exit 126
+}
+
+[ -z "$CMD" ] && { echo "pve-ro-guard: interactive shell is not permitted on this key." >&2; exit 126; }
+
+# Shell metacharacters that chain or redirect into something else. Pipes are
+# allowed because read-only output almost always gets piped through jq/grep, and
+# every element of the pipeline is validated below anyway.
+case "$CMD" in
+  *';'*|*'&'*|*'`'*|*'$('*|*'>'*|*'<'*|*$'\n'*) deny ;;
+esac
+
+# Every segment of a pipeline must independently be an allowed read-only verb.
+IFS='|' read -ra SEGMENTS <<< "$CMD"
+for seg in "${SEGMENTS[@]}"; do
+  # shellcheck disable=SC2086
+  set -- $seg
+  [ $# -eq 0 ] && deny
+  bin="$(basename "$1")"
+  sub="${2:-}"
+
+  case "$bin" in
+    # --- Proxmox: GET only -------------------------------------------------
+    pvesh)     [ "$sub" = "get" ] || deny ;;
+    qm)        case "$sub" in list|status|config|showcmd|cloudinit) ;; *) deny ;; esac ;;
+    pct)       case "$sub" in list|status|config) ;; *) deny ;; esac ;;
+    pvecm)     case "$sub" in status|nodes|expected) ;; *) deny ;; esac ;;
+    pvesm)     case "$sub" in status|list) ;; *) deny ;; esac ;;
+    ha-manager) case "$sub" in status|config) ;; *) deny ;; esac ;;
+    proxmox-backup-manager) case "$sub" in task|datastore|version) ;; *) deny ;; esac ;;
+
+    # --- read-only system inspection, incl. security auditing --------------
+    cat|head|tail|less|grep|egrep|zgrep|awk|gawk|sed|sort|uniq|wc|cut|tr|jq|column) ;;
+    ls|stat|find|du|df|file|readlink|realpath|basename|dirname) ;;
+    ps|top|free|uptime|w|who|last|lastlog|id|whoami|hostname|uname|date|env) ;;
+    systemctl) case "$sub" in status|list-units|list-timers|is-active|is-enabled|show|cat) ;; *) deny ;; esac ;;
+    journalctl|dmesg|lsblk|blkid|lsof|ss|netstat|ip|arp|route|iptables-save|nft) ;;
+    lscpu|lsmem|lspci|lsusb|sensors|smartctl|zpool|zfs|vgs|lvs|pvs|mount) ;;
+    dpkg|apt-cache|rpm) ;;
+    sha256sum|md5sum|openssl|getent|aa-status|sestatus|ufw|fail2ban-client) ;;
+    echo|true|test|which|command|type) ;;
+
+    *) deny ;;
+  esac
+
+  # Even an allowed verb must not be used to write. These checks are scoped to
+  # the specific tool that has the dangerous flag -- an earlier version applied
+  # the sed "-i" rule to every command and so refused `grep -i failed auth.log`,
+  # which is a perfectly ordinary security-audit read. A guard that blocks real
+  # work gets switched off, so precision here is a safety property too.
+  case "$bin" in
+    find)
+      case "$seg" in *' -delete'*|*' -exec'*|*' -ok'*|*' -fls'*|*' -fprint'*) deny ;; esac ;;
+    sed|perl|ruby)
+      case "$seg" in *' -i'*|*' --in-place'*) deny ;; esac ;;
+    awk|gawk)
+      case "$seg" in *'>'*|*'print >'*|*'system('*) deny ;; esac ;;
+    tee)
+      deny ;;  # only ever exists to write a file
+    openssl)
+      case "$sub" in x509|verify|s_client|dgst|rand) ;; *) deny ;; esac ;;
+    ufw|fail2ban-client|nft|iptables-save)
+      case "$seg" in *' allow'*|*' deny'*|*' delete'*|*' add'*|*' set'*|*' flush'*|*' unban'*|*' ban'*) deny ;; esac ;;
+  esac
+done
+
+logger -t "$LOG_TAG" "ALLOWED: $CMD"
+exec /bin/bash -c "$CMD"

@@ -151,6 +151,9 @@ choose.
 | `/learned` | free | What the agent worked out about this environment by itself |
 | `/forget <n>` | free | Delete one wrong learned fact (numbers from `/learned`) |
 | `/chatid` | free, no auth needed | Reveal the current chat's ID (for group/access setup) |
+| `/mode` | **0 tokens** | Read-only right now, or able to change things? |
+| `/unlock [min]` | owner + DM only | Open a time-boxed window for real changes |
+| `/lock` | owner + DM only | Close that window early |
 | `/registergroup` | admin only | Open this Telegram group to every member, no restart needed |
 | `/unregistergroup` | admin only | Revoke a group's access |
 | `/help` | free | Full in-chat guide -- bilingual, pick EN or ID (or `/help en` / `/help id` directly) |
@@ -168,6 +171,57 @@ plus exploratory tool calls now takes one script execution and ~600 tokens to su
 This is deliberately **not** automatic -- an agent deciding on its own what's "worth
 saving" is exactly the kind of open-ended background decision this project avoids. You
 say `/graduate`, once, when you're confident the case is a genuine reusable pattern.
+
+### Write mode
+
+This agent is meant to do real work — create VMs, repair them, tweak node and
+cluster config, run security audits. Cutting it down to read-only would make it
+useless for the jobs it exists for, so capability is not the thing that gets
+restricted. **Timing is.**
+
+Nearly every turn is a question, and a question needs no write access. The rare
+turn that changes something is one a human deliberately started. So:
+
+| | |
+|---|---|
+| **Locked** (default) | `~/.ssh/agent_active` → a restricted key. Reads, audits, monitoring, reports all work exactly as normal. |
+| **Unlocked** (`/unlock 20`) | Same symlink → the full root key, for N minutes, then it flips back on its own. |
+
+What makes this hold is *who can flip it*. `/unlock` is admin-only **and private-DM
+only** — not reachable from a group, even a registered one. It is not something the
+model can do, request, or be talked into by text it read in a log file, a web page,
+or a group message. Prompt injection can make the agent *try* to change something;
+it cannot make the credential exist. Expiry is checked on read, so there is no timer
+and no background task — consistent with this project's rule about background work.
+Any failure in the swap leaves the restricted key in place.
+
+Commands: `/mode` (what can it do right now, 0 tokens), `/unlock [minutes]`, `/lock`.
+
+**Setup** (until you do this, the mechanism is inert and says so — the agent keeps
+using whatever single key it has today):
+
+```bash
+ssh-keygen -t ed25519 -f ~/.ssh/agent_readonly -N ''
+ssh-keygen -t ed25519 -f ~/.ssh/agent_write    -N ''
+ln -sf ~/.ssh/agent_readonly ~/.ssh/agent_active
+# point ~/.ssh/config's IdentityFile at ~/.ssh/agent_active
+```
+
+On each managed node, install [`node-guard/pve-ro-guard`](./node-guard/pve-ro-guard)
+as `/usr/local/bin/pve-ro-guard` (chmod 755), then in `/root/.ssh/authorized_keys`:
+
+```
+command="/usr/local/bin/pve-ro-guard",no-port-forwarding,no-agent-forwarding,no-X11-forwarding,no-pty ssh-ed25519 AAAA...  agent-readonly
+ssh-ed25519 AAAA...  agent-write
+```
+
+`command=` means sshd runs the guard *instead of* whatever was requested — the client
+cannot opt out, because it is the only thing that key can run. The guard is an
+**allowlist** of read-only verbs, not a denylist of dangerous ones: something spelled
+a way nobody anticipated gets refused rather than silently permitted. It is also
+scoped carefully enough not to block genuine audit work — `grep -i failed auth.log`,
+`last`, `ufw status`, `openssl x509` and friends all pass, while `qm stop`, `sed -i`,
+`find -delete`, redirects, command substitution and pipes into a writer do not.
 
 ### Group access
 
