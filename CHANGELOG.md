@@ -1,5 +1,35 @@
 # Changelog
 
+## v0.2b.2 -- group admins can open write mode too, on a shorter leash
+
+**`/unlock` now works for a registered group's own admin**, not just the bot
+owner in a DM -- the same trust level `/addserver` and scheduling already
+carry. It stayed DM-only through v0.2b.0/v0.2b.1 on purpose: it opens write
+access to *any* change the agent decides to make next, not one visible
+pre-approved action like a schedule install, so it got the strictest gate
+available. Rather than keep it locked out of groups entirely, a window opened
+from a group is now capped at **10 minutes** regardless of what's requested
+(`/unlock 45` in a group still only opens for 10) -- well under the 60-minute
+ceiling a DM gets, and under the 15-minute default too. A DM's own default and
+ceiling are unchanged.
+
+This also fixes the same interactive card the read-only wall offers when the
+agent hits a wall (`NEEDS_WRITE:`) -- previously that card, its buttons, and
+the resulting PIN prompt were DM-owner-only outright, so a group admin got
+nothing but the agent's prose when a group-sent prompt needed a change. Now
+the card appears and the PIN keypad accepts a registered group's own admin
+there too, capped the same way.
+
+`_may_manage_schedules` (the permission check scheduling introduced in
+v0.2b.1) is renamed to `_may_authorize_group_action` -- it now gates `/unlock`
+as well, so a scheduling-specific name no longer fit what it actually checks.
+
+15/15 tests pass for the extended permission matrix (owner / registered-group
+admin / unregistered-group admin / plain member / DM stranger) plus explicit
+enforcement that a 45-minute request from a group is actually clamped to 10
+minutes while the same request from a DM is not.
+
+
 ## v0.2b.1 -- group admins can manage schedules, credit hardened, stale header fixed
 
 **A registered group's own admin can now install and remove scheduled tasks**, not

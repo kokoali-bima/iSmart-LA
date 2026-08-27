@@ -4,7 +4,7 @@ A lightweight Telegram bridge to **Claude Code** and **Antigravity CLI (agy)**, 
 infrastructure monitoring and investigation -- built to be dramatically cheaper to run
 than a full agent framework, while staying just as capable for real operational work.
 
-> **Status: v0.2b.1 -- early/beta.** Built and battle-tested against a real production
+> **Status: v0.2b.2 -- early/beta.** Built and battle-tested against a real production
 > Proxmox VE cluster over several days of iteration, including a live-fire test of the
 > unlock/PIN/snapshot flow against real infrastructure. Works well; still has known
 > rough edges (see [Known limitations](#known-limitations)).
@@ -177,8 +177,8 @@ Ollama, say), since something has to translate between protocols.
 | `/agentstatus` | tiny probe each | Live check: is each tier actually up right now? |
 | `/providers` | **0 tokens** | Which AI tiers are configured, and which are healthy |
 | `/mode` | **0 tokens** | Read-only right now, or able to change things? |
-| `/unlock [min]` | owner + DM only | Open a time-boxed window for real changes |
-| `/lock` | owner + DM only | Close that window early |
+| `/unlock [min]` | owner/admin | Open a time-boxed window for real changes (capped at 10 min from a group) |
+| `/lock` | owner/admin | Close that window early |
 | `/registergroup` | admin only | Open this Telegram group to every member, no restart needed |
 | `/unregistergroup` | admin only | Revoke a group's access |
 | `/help` | free | Full in-chat guide -- bilingual, pick EN or ID (or `/help en` / `/help id` directly) |
@@ -221,17 +221,18 @@ them:
 | Action | DM | Group |
 |---|---|---|
 | `/setpin` — set or change the PIN | ✅ | ✅ |
-| `/unlock` — open write mode | ✅ | ❌ |
+| `/unlock` — open write mode | ✅ (up to 60 min) | ✅ registered group's own admin (up to 10 min) |
 | Installing / removing a scheduled task | ✅ | ✅ (registered group's own admin) |
 
 `/setpin` works in a group because nothing secret is exposed there: the digits
 travel in `callback_data`, so the group sees a keypad and a row of dots, never
-the PIN. `/unlock` stays DM-only — it opens write access for *any* change, to
-whatever the agent decides to touch next, so it needs the strictest gate.
-Scheduling is different: the proposal is always shown first (nothing installs
-silently), so it gets the same trust level `/addserver` already has — the bot
-owner anywhere, or an admin of a **registered** group, confirmed by that
-group's own Telegram admin status. Anyone else's tap is refused, regardless of
+the PIN. `/unlock` gets the same trust level `/addserver` and scheduling
+already have — the bot owner anywhere, or an admin of a **registered** group,
+confirmed by that group's own Telegram admin status — but a group-opened
+window is capped at 10 minutes regardless of what's asked for, well short of
+the 60-minute ceiling a DM gets. It still opens write access for *any* change
+the agent decides to make next, so the shorter leash is the trade-off for
+reaching it from a group at all. Anyone else's tap is refused, regardless of
 which action they're trying to confirm.
 
 **Changing an existing PIN always requires the current one first.** That is what
@@ -312,13 +313,15 @@ turn that changes something is one a human deliberately started. So:
 | **Locked** (default) | `~/.ssh/agent_active` → a restricted key. Reads, audits, monitoring, reports all work exactly as normal. |
 | **Unlocked** (`/unlock 20`) | Same symlink → the full root key, for N minutes, then it flips back on its own. |
 
-What makes this hold is *who can flip it*. `/unlock` is admin-only **and private-DM
-only** — not reachable from a group, even a registered one. It is not something the
-model can do, request, or be talked into by text it read in a log file, a web page,
-or a group message. Prompt injection can make the agent *try* to change something;
-it cannot make the credential exist. Expiry is checked on read, so there is no timer
-and no background task — consistent with this project's rule about background work.
-Any failure in the swap leaves the restricted key in place.
+What makes this hold is *who can flip it*. `/unlock` is owner-or-group-admin, same
+as `/addserver` and scheduling — a registered group's own admin can reach it, but a
+window opened from a group is capped at 10 minutes regardless of what's requested,
+against 60 for a DM. Whichever chat opens it, it is not something the model can do,
+request, or be talked into by text it read in a log file, a web page, or a group
+message. Prompt injection can make the agent *try* to change something; it cannot
+make the credential exist. Expiry is checked on read, so there is no timer and no
+background task — consistent with this project's rule about background work. Any
+failure in the swap leaves the restricted key in place.
 
 Commands: `/mode` (what can it do right now, 0 tokens), `/unlock [minutes]`, `/lock`.
 

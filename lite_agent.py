@@ -261,6 +261,10 @@ SSH_RO_KEY = Path(os.environ.get("SSH_RO_KEY", str(Path.home() / ".ssh/agent_rea
 SSH_RW_KEY = Path(os.environ.get("SSH_RW_KEY", str(Path.home() / ".ssh/agent_write")))
 WRITE_MODE_MAX_MINUTES = int(os.environ.get("WRITE_MODE_MAX_MINUTES", "60"))
 WRITE_MODE_DEFAULT_MINUTES = int(os.environ.get("WRITE_MODE_DEFAULT_MINUTES", "15"))
+# Ceiling when /unlock is opened from a group rather than a DM -- open-ended
+# write access for the whole window, not one pre-approved action, so it gets
+# a shorter leash than the 60-minute DM ceiling regardless of what is asked for.
+WRITE_MODE_GROUP_MAX_MINUTES = int(os.environ.get("WRITE_MODE_GROUP_MAX_MINUTES", "10"))
 
 
 def _keys_configured() -> bool:
@@ -308,8 +312,8 @@ def lock_write_mode() -> None:
             logger.exception("could not swap back to the read-only key")
 
 
-def unlock_write_mode(minutes: int) -> float:
-    minutes = max(1, min(minutes, WRITE_MODE_MAX_MINUTES))
+def unlock_write_mode(minutes: int, max_minutes: Optional[int] = None) -> float:
+    minutes = max(1, min(minutes, max_minutes or WRITE_MODE_MAX_MINUTES))
     until = _dt.datetime.now().timestamp() + minutes * 60
     _point_active_key_at(SSH_RW_KEY)
     WRITE_STATE_FILE.write_text(json.dumps({"until": until}))
@@ -398,6 +402,7 @@ _pin_sessions: dict[str, dict] = {}
 # not vet arrives, so it is not the place to authorise production changes.
 PIN_ACTIONS_ALLOWED_IN_GROUP = frozenset({
     "new_pin_capture", "new_pin_confirm", "change_pin_start", "schedule_install",
+    "unlock", "unlock_and_resume",
 })
 _pin_lockout_until: float = 0.0
 
@@ -2355,10 +2360,21 @@ def _may_run_setup(update: Update) -> bool:
     return bool(chat and chat.type != "private" and chat.id in ALLOWED_GROUP_IDS)
 
 
-async def _may_manage_schedules(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+def _effective_unlock_cap(update: Update) -> int:
+    """The ceiling that applies to an /unlock opened from THIS chat -- the
+    DM ceiling, or the shorter group one if this isn't a private chat."""
+    chat = update.effective_chat
+    if chat and chat.type != "private":
+        return WRITE_MODE_GROUP_MAX_MINUTES
+    return WRITE_MODE_MAX_MINUTES
+
+
+async def _may_authorize_group_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     """Owner anywhere, or an admin of a REGISTERED group -- the same trust
     level already granted to /addserver. A PIN still confirms the actual
-    install/removal, so this only decides who may reach that PIN prompt."""
+    action, so this only decides who may reach that PIN prompt. Used for
+    scheduling and for /unlock; the two differ in how long a window /unlock
+    grants when it's this path that opened it (see _effective_unlock_cap)."""
     if _is_owner(update):
         return True
     chat = update.effective_chat
@@ -2778,14 +2794,14 @@ async def cmd_unlock(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     that hands the agent the ability to change production -- so it is not
     something a group can reach, even a registered one.
     """
-    if not _is_trusted_origin(update):
+    if not await _may_authorize_group_action(update, context):
         logger.warning(
             "refused /unlock from chat=%s user=%s",
             getattr(update.effective_chat, "id", "?"),
             getattr(update.effective_user, "id", "?"),
         )
         await update.message.reply_text(
-            "🔒 /unlock only works in a private DM from the bot owner."
+            "🔒 Bot owner, or a registered group's own admin."
         )
         return
     if not _keys_configured():
@@ -2797,12 +2813,13 @@ async def cmd_unlock(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         )
         return
 
-    minutes = WRITE_MODE_DEFAULT_MINUTES
+    cap = _effective_unlock_cap(update)
+    minutes = min(WRITE_MODE_DEFAULT_MINUTES, cap)
     if context.args:
         try:
             minutes = int(context.args[0])
         except ValueError:
-            await update.message.reply_text(f"Usage: /unlock [minutes, max {WRITE_MODE_MAX_MINUTES}]")
+            await update.message.reply_text(f"Usage: /unlock [minutes, max {cap} here]")
             return
     # Opening write access is the most consequential thing this bot can do,
     # so it takes more than a tap from a signed-in device. The PIN is the
@@ -2810,12 +2827,12 @@ async def cmd_unlock(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     # entered on a keypad so it never becomes a message in the chat.
     await request_pin(
         update, "unlock", {"minutes": minutes},
-        f"🔓 Confirm opening write mode for {minutes} minute(s).",
+        f"🔓 Confirm opening write mode for {min(minutes, cap)} minute(s).",
     )
 
 
 async def cmd_lock(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not _is_trusted_origin(update):
+    if not await _may_authorize_group_action(update, context):
         return
     was_open = write_mode_expires_at() is not None
     lock_write_mode()
@@ -2894,8 +2911,8 @@ async def cmd_pin_key(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     # Who may drive the keypad depends on the action: most stay owner-only,
     # but a registered group's own admin may complete a schedule they were
     # just shown -- the same trust level /addserver already grants them.
-    if session["action"] == "schedule_install":
-        may_touch = await _may_manage_schedules(update, context)
+    if session["action"] in ("schedule_install", "unlock", "unlock_and_resume"):
+        may_touch = await _may_authorize_group_action(update, context)
     else:
         may_touch = _is_owner(update)
     if not may_touch:
@@ -3024,7 +3041,7 @@ async def _pin_verified(update: Update, context: ContextTypes.DEFAULT_TYPE,
 
     if action == "unlock":
         try:
-            until = unlock_write_mode(payload["minutes"])
+            until = unlock_write_mode(payload["minutes"], max_minutes=_effective_unlock_cap(update))
         except OSError as exc:
             logger.exception("unlock failed")
             await query.edit_message_text(f"⚠️ Could not unlock: {exc}")
@@ -3117,7 +3134,7 @@ async def offer_schedules(update: Update, proposals: list[dict]) -> None:
 async def cmd_schedule_decision(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     action, _, token = query.data.partition(":")
-    if not await _may_manage_schedules(update, context):
+    if not await _may_authorize_group_action(update, context):
         await query.answer("Bot owner, or a registered group's own admin.", show_alert=True)
         return
     item = _pending_schedules.pop(token, None)
@@ -3177,7 +3194,7 @@ async def cmd_schedules(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 async def cmd_unschedule(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await _may_manage_schedules(update, context):
+    if not await _may_authorize_group_action(update, context):
         await update.message.reply_text("🔒 Bot owner, or a registered group's own admin.")
         return
     name = (context.args[0] if context.args else "").strip()
@@ -3750,8 +3767,8 @@ async def cmd_needwrite_button(update: Update, context: ContextTypes.DEFAULT_TYP
     query = update.callback_query
     choice = query.data.split(":", 1)[1]
     chat_id = update.effective_chat.id
-    if not _is_trusted_origin(update):
-        await query.answer("Only the bot owner, in a private DM.", show_alert=True)
+    if not await _may_authorize_group_action(update, context):
+        await query.answer("Bot owner, or a registered group's own admin.", show_alert=True)
         return
     pending = _pending_write.get(chat_id)
     if not pending or pending["expires"] < _dt.datetime.now().timestamp():
@@ -3806,7 +3823,7 @@ async def _do_unlock_and_resume(update: Update, context: ContextTypes.DEFAULT_TY
                                       parse_mode="HTML")
 
     try:
-        until = unlock_write_mode(WRITE_MODE_DEFAULT_MINUTES)
+        until = unlock_write_mode(WRITE_MODE_DEFAULT_MINUTES, max_minutes=_effective_unlock_cap(update))
     except OSError as exc:
         logger.exception("unlock failed")
         await query.message.reply_text(f"⚠️ Couldn't unlock: {exc}")
@@ -4022,7 +4039,7 @@ async def _run_turn(update: Update, context: ContextTypes.DEFAULT_TYPE, text: st
             sent_hashes: set[str] = set()
             for path in media_paths:
                 await _send_media_file(update, path, sent_hashes)
-            if schedule_proposals and await _may_manage_schedules(update, context):
+            if schedule_proposals and await _may_authorize_group_action(update, context):
                 await offer_schedules(update, schedule_proposals)
             elif schedule_proposals:
                 logger.warning(
@@ -4057,7 +4074,7 @@ async def _run_turn(update: Update, context: ContextTypes.DEFAULT_TYPE, text: st
     # Refused by the node guard? Offer to unlock (snapshotting first if the
     # operator wants) and re-run. Nothing is guessed from the wording of the
     # request -- the guard already decided; we are only reacting to it.
-    if (_is_trusted_origin(update) and _keys_configured()
+    if (await _may_authorize_group_action(update, context) and _keys_configured()
             and not write_mode_expires_at()
             and (needs_write
                  or blocked_by_readonly(result.get("result") or "", attempts))):
