@@ -368,6 +368,14 @@ PIN_LOCKOUT_SECONDS = 900          # 15 min after burning through the attempts
 PIN_ENTRY_TTL_SECONDS = 180        # a half-finished entry expires on its own
 # token -> {action, payload, digits, attempts, expires, chat_id}
 _pin_sessions: dict[str, dict] = {}
+# PIN flows that are safe to run in a group: the digits ride in callback_data,
+# so a group only ever sees "somebody is entering a PIN", never the PIN. The
+# actions NOT listed here (opening write access, installing an unattended job)
+# stay private-DM-only -- a group is exactly where input this deployment does
+# not vet arrives, so it is not the place to authorise production changes.
+PIN_ACTIONS_ALLOWED_IN_GROUP = frozenset({
+    "new_pin_capture", "new_pin_confirm", "change_pin_start",
+})
 _pin_lockout_until: float = 0.0
 
 
@@ -1632,6 +1640,18 @@ async def cmd_chatid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
+def _is_owner(update: Update) -> bool:
+    """Is this the bot owner, regardless of WHERE they're speaking from?
+
+    Weaker than _is_trusted_origin: it says who, not where. Used for actions
+    that are safe to run in a group because nothing secret is exposed there --
+    /setpin being the case that matters, since the digits travel in
+    callback_data and never become a visible message.
+    """
+    user = update.effective_user
+    return bool(user and user.id in ALLOWED_USER_IDS)
+
+
 def _is_trusted_origin(update: Update) -> bool:
     """A private DM from a named ALLOWED_USER_IDS account.
 
@@ -2026,9 +2046,15 @@ async def cmd_pin_key(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if not session:
         await query.answer("This PIN entry expired — start again.", show_alert=True)
         return
-    # The PIN guards owner-only actions, so only the owner may drive the keypad.
-    if not _is_trusted_origin(update):
+    # Only the owner may drive the keypad, wherever they are...
+    if not _is_owner(update):
         await query.answer("Not permitted.", show_alert=True)
+        return
+    # ...but the action decides whether this is an acceptable PLACE to do it.
+    if (session["action"] not in PIN_ACTIONS_ALLOWED_IN_GROUP
+            and not _is_trusted_origin(update)):
+        await query.answer("This action can only be confirmed in a private DM.",
+                           show_alert=True)
         return
     if session["expires"] < _dt.datetime.now().timestamp():
         _pin_sessions.pop(token, None)
@@ -2150,10 +2176,16 @@ async def _pin_verified(update: Update, query, session: dict) -> None:
 
 async def _begin_new_pin(update: Update, query=None) -> None:
     token = _new_pin_session("new_pin_capture", {}, update.effective_chat.id)
+    chat = update.effective_chat
+    in_group = bool(chat and chat.type != "private")
     text = (
         f"🔢 Choose a new {PIN_LENGTH}-digit PIN.\n"
         "Avoid birthdays and 123456 — this is the last gate in front of "
-        f"production changes.\n{_pin_masked(0)}"
+        f"production changes.\n"
+        + ("\n\u2139\ufe0f You're doing this in a group. Your digits stay private "
+           "(they never become a message), but the group can see that you're "
+           "setting a PIN right now.\n" if in_group else "")
+        + f"{_pin_masked(0)}"
     )
     kb = _pin_keyboard(token, 0)
     if query is not None:
@@ -2163,10 +2195,17 @@ async def _begin_new_pin(update: Update, query=None) -> None:
 
 
 async def cmd_setpin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Set or change the PIN. Entered on the keypad like every other PIN, so it
-    is never typed into the chat -- including the very first time."""
-    if not _is_trusted_origin(update):
-        await update.message.reply_text("🔒 Only the bot owner, in a private DM.")
+    """Set or change the PIN.
+
+    Works in a group as well as a DM: the digits ride in callback_data, so a
+    group sees a keypad and a row of dots, never the PIN. Changing an existing
+    PIN always requires entering the CURRENT one first, so a stolen Telegram
+    session cannot quietly replace it -- which is what makes the group case
+    acceptable in the first place.
+    """
+    if not _is_owner(update):
+        # Silent for non-owners: the same non-response whether the command
+        # doesn't exist or they simply aren't allowed to use it.
         return
     if pin_is_set():
         await request_pin(update, "change_pin_start", {},

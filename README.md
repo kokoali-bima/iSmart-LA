@@ -154,7 +154,7 @@ choose.
 | `/schedules` | **0 tokens** | Everything that runs on a timer, and what it does |
 | `/unschedule <name>` | owner + DM only | Remove a scheduled task |
 | `/adopt` | owner + DM only | Bring pre-existing cron entries under management |
-| `/setpin` | owner + DM only | Set/change the 6-digit PIN (keypad, never typed in chat) |
+| `/setpin` | owner, DM **or group** | Set/change the 6-digit PIN (keypad, never typed in chat) |
 | `/mode` | **0 tokens** | Read-only right now, or able to change things? |
 | `/unlock [min]` | owner + DM only | Open a time-boxed window for real changes |
 | `/lock` | owner + DM only | Close that window early |
@@ -192,8 +192,30 @@ is the factor that doesn't come along with a stolen session.
 
 Stored as a salted scrypt hash, never the PIN itself. Five wrong tries locks it
 for 15 minutes — six digits is only a million combinations, so that lockout is
-doing real work. Set it with `/setpin` (owner, private DM; entered on the keypad
-both times, including the very first).
+doing real work.
+
+**Where each PIN action is allowed** is decided per action, not once for all of
+them:
+
+| Action | DM | Group |
+|---|---|---|
+| `/setpin` — set or change the PIN | ✅ | ✅ |
+| `/unlock` — open write mode | ✅ | ❌ |
+| Installing a scheduled task | ✅ | ❌ |
+
+`/setpin` works in a group because nothing secret is exposed there: the digits
+travel in `callback_data`, so the group sees a keypad and a row of dots, never
+the PIN. The other two stay DM-only — a group is precisely where input this
+deployment doesn't vet arrives, so it isn't the place to authorise a production
+change. Only the owner can drive the keypad anywhere; a tap from anyone else is
+refused.
+
+**Changing an existing PIN always requires the current one first.** That is what
+makes the group case safe: a stolen Telegram session can't quietly replace the
+PIN, because it would have to know it. There is no reset path through Telegram at
+all — deliberately. (Someone with shell access on the host could delete
+`pin.json`; the PIN defends against a compromised Telegram account, not a
+compromised server. If the host is owned, the SSH keys are gone anyway.)
 
 ### Scheduled tasks
 
