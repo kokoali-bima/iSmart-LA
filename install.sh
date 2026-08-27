@@ -43,12 +43,12 @@ echo "Running as:  ${INSTALL_USER}"
 echo ""
 
 if [ "$INSTALL_USER" = "root" ]; then
-  warn "Running as root. This is fine, but the systemd service will run as root too."
-  warn "For most setups, create a dedicated non-root user first and re-run as that user."
+warn "Running as root. This is fine, but the systemd service will run as root too."
+warn "For most setups, create a dedicated non-root user first and re-run as that user."
 fi
 
 # ------------------------------------------------------------------------------
-say "Step 1/9 -- System dependencies"
+say "Step 1/8 -- System dependencies"
 # ------------------------------------------------------------------------------
 if command -v apt-get >/dev/null 2>&1; then
   NEEDED_PKGS="python3 python3-venv curl git tmux jq openssh-client"
@@ -56,137 +56,78 @@ if command -v apt-get >/dev/null 2>&1; then
   for p in $NEEDED_PKGS; do
     dpkg -s "$p" >/dev/null 2>&1 || MISSING="$MISSING $p"
   done
-  if [ -n "$MISSING" ]; then
+if [ -n "$MISSING" ]; then
     say "Installing missing packages:${MISSING}"
     sudo apt-get update -y
     sudo apt-get install -y $MISSING
-  else
+else
     ok "All required system packages already present."
-  fi
-  if ! command -v wkhtmltopdf >/dev/null 2>&1; then
+fi
+if ! command -v wkhtmltopdf >/dev/null 2>&1; then
     ask "Install wkhtmltopdf too? Needed only if you want PDF (not just HTML) reports. [y/N] " INSTALL_PDF
     if [[ "${INSTALL_PDF:-}" =~ ^[Yy]$ ]]; then
       sudo apt-get install -y wkhtmltopdf
     fi
-  fi
+fi
 else
-  warn "Non-apt system detected. Please make sure these are installed manually:"
-  warn "  python3 (3.10+), python3-venv, curl, git, tmux, jq, an ssh client"
-  warn "  (optional) wkhtmltopdf, if you want PDF report generation"
-  ask "Press Enter once you've confirmed these are installed... " _dummy
+warn "Non-apt system detected. Please make sure these are installed manually:"
+warn "  python3 (3.10+), python3-venv, curl, git, tmux, jq, an ssh client"
+warn "  (optional) wkhtmltopdf, if you want PDF report generation"
+ask "Press Enter once you've confirmed these are installed... " _dummy
 fi
 
 # ------------------------------------------------------------------------------
-say "Step 2/9 -- Python virtual environment"
+say "Step 2/8 -- Python virtual environment"
 # ------------------------------------------------------------------------------
 if [ ! -d "$INSTALL_DIR/venv" ]; then
-  python3 -m venv "$INSTALL_DIR/venv"
-  ok "Created venv at $INSTALL_DIR/venv"
+python3 -m venv "$INSTALL_DIR/venv"
+ok "Created venv at $INSTALL_DIR/venv"
 else
-  ok "venv already exists, reusing it."
+ok "venv already exists, reusing it."
 fi
 "$INSTALL_DIR/venv/bin/pip" install --quiet --upgrade pip
 "$INSTALL_DIR/venv/bin/pip" install --quiet -r "$INSTALL_DIR/requirements.txt"
 ok "Python dependencies installed."
 
 # ------------------------------------------------------------------------------
-say "Step 3/9 -- Which AI providers do you want to use?"
-# ------------------------------------------------------------------------------
-# Both providers are fixed-price subscriptions, so "which ones" is really a
-# question about which plans you already pay for. Using both is the usual answer
-# -- it spreads routine load across two separate quotas -- but either alone works
-# fine, and the choice here is what decides everything downstream: what gets
-# installed, which logins you're asked for, and the fallback chain in .env.
-echo "  ${BOLD}1)${RESET} Gemini via Antigravity CLI  ${DIM}(needs a Google AI Pro/Ultra plan)${RESET}"
-echo "  ${BOLD}2)${RESET} Claude Code via 9Router     ${DIM}(needs a Claude Pro/Max plan)${RESET}"
-echo "  ${BOLD}3)${RESET} Both  ${DIM}(recommended -- one covers the other when it rate-limits)${RESET}"
-echo ""
-ask "Choose [1/2/3, default 3]: " PROVIDER_CHOICE
-PROVIDER_CHOICE="${PROVIDER_CHOICE:-3}"
-
-USE_AGY=no; USE_CLAUDE=no
-case "$PROVIDER_CHOICE" in
-  1) USE_AGY=yes ;;
-  2) USE_CLAUDE=yes ;;
-  *) USE_AGY=yes; USE_CLAUDE=yes ;;
-esac
-
-PRIMARY_PROVIDER=agy
-if [ "$USE_AGY" = yes ] && [ "$USE_CLAUDE" = yes ]; then
-  echo ""
-  echo "Which should be tried ${BOLD}first${RESET} on every message?"
-  echo "  ${BOLD}1)${RESET} Gemini first  ${DIM}(recommended -- keeps the Claude plan's quota in reserve,"
-  echo "     which matters if you also use Claude Code interactively on that account)${RESET}"
-  echo "  ${BOLD}2)${RESET} Claude first"
-  ask "Choose [1/2, default 1]: " ORDER_CHOICE
-  [ "${ORDER_CHOICE:-1}" = "2" ] && PRIMARY_PROVIDER=claude
-elif [ "$USE_CLAUDE" = yes ]; then
-  PRIMARY_PROVIDER=claude
-fi
-
-# The tier chain: each entry is provider:model:label, tried left to right. The
-# label is what shows up as "— by <label>" under every reply, so you can see at a
-# glance when something fell through to a more expensive tier.
-AGY_TIERS="agy:gemini-3.7-flash-medium:mini,agy:gemini-3.1-pro-low:mini pro"
-CLAUDE_TIERS="claude:cc/claude-haiku-4-5-20251001:dede iku,claude:cc/claude-sonnet-5:dede nnet"
-if [ "$USE_AGY" = yes ] && [ "$USE_CLAUDE" = yes ]; then
-  if [ "$PRIMARY_PROVIDER" = agy ]; then
-    TIERS_VALUE="${AGY_TIERS},${CLAUDE_TIERS}"
-  else
-    TIERS_VALUE="${CLAUDE_TIERS},${AGY_TIERS}"
-  fi
-elif [ "$USE_AGY" = yes ]; then
-  TIERS_VALUE="$AGY_TIERS"
-else
-  TIERS_VALUE="$CLAUDE_TIERS"
-fi
-ok "Fallback chain: ${TIERS_VALUE}"
-echo "   ${DIM}Edit TIERS in .env later to reorder, drop a tier, or change models.${RESET}"
-
-# ------------------------------------------------------------------------------
-say "Step 4/9 -- Provider setup"
+say "Step 3/8 -- AI providers"
 # ------------------------------------------------------------------------------
 AGY_BIN_PATH="$HOME/.local/bin/agy"
 
-if [ "$USE_CLAUDE" = yes ]; then
-  if command -v claude >/dev/null 2>&1; then
+if command -v claude >/dev/null 2>&1; then
     ok "Claude Code CLI already installed ($(claude --version 2>/dev/null || echo 'version unknown'))."
-  else
+else
     say "Installing Claude Code CLI (native installer)..."
     curl -fsSL https://claude.ai/install.sh | bash \
       || warn "Automatic install failed -- install manually: https://docs.claude.com/en/docs/claude-code"
-  fi
-else
-  ok "Skipping Claude Code CLI (not selected)."
 fi
 
-if [ "$USE_AGY" = yes ]; then
-  if [ -x "$AGY_BIN_PATH" ]; then
+if [ -x "$AGY_BIN_PATH" ]; then
     ok "agy already installed ($("$AGY_BIN_PATH" --version 2>/dev/null || echo 'version unknown'))."
-  else
+else
     say "Installing Antigravity CLI..."
     curl -fsSL https://antigravity.google/cli/install.sh | bash
-  fi
-  export PATH="$HOME/.local/bin:$PATH"
+fi
+export PATH="$HOME/.local/bin:$PATH"
 
-  echo ""
-  say "Signing in to Antigravity."
-  echo "  You'll get a URL to open, then paste back the code it gives you."
-  echo "  ${DIM}(This drives agy's own login screen for you, so it doesn't take over"
-  echo "  the terminal mid-install. Skip it and run tools/agy_login.py later.)${RESET}"
-  ask "Press Enter to sign in now, or type 's' to skip: " AGY_LOGIN_CHOICE
-  if [ "${AGY_LOGIN_CHOICE:-}" = "s" ]; then
+echo ""
+say "Signing in to Antigravity."
+echo "  You'll get a URL to open, then paste back the code it gives you."
+echo "  ${DIM}(This drives agy's own login screen for you, so it doesn't take over"
+echo "  the terminal mid-install. Skip it and run tools/agy_login.py later.)${RESET}"
+ask "Press Enter to sign in now, or type 's' to skip: " AGY_LOGIN_CHOICE
+if [ "${AGY_LOGIN_CHOICE:-}" = "s" ]; then
     warn "Skipped. Run ${CYAN}python3 $INSTALL_DIR/tools/agy_login.py${RESET} before starting the service."
-  else
+else
     python3 "$INSTALL_DIR/tools/agy_login.py" --agy "$AGY_BIN_PATH" \
       || warn "Sign-in didn't complete. Re-run: python3 $INSTALL_DIR/tools/agy_login.py"
-  fi
+fi
 
-  mkdir -p "$HOME/.gemini/antigravity-cli"
+mkdir -p "$HOME/.gemini/antigravity-cli"
   AGY_SETTINGS="$HOME/.gemini/antigravity-cli/settings.json"
-  say "Writing agy permissions (broad allow, same trust level as Claude Code's Bash tool;"
-  say "plus a deny-list for outright destructive local commands -- see README)."
-  python3 - "$AGY_SETTINGS" <<'PYEOF'
+say "Writing agy permissions (broad allow, same trust level as Claude Code's Bash tool;"
+say "plus a deny-list for outright destructive local commands -- see README)."
+python3 - "$AGY_SETTINGS" <<'PYEOF'
 import json, sys
 path = sys.argv[1]
 try:
@@ -210,53 +151,44 @@ with open(path, "w") as f:
     json.dump(cfg, f, indent=2)
 print(f"Updated {path}")
 PYEOF
-else
-  ok "Skipping Antigravity CLI (not selected)."
-fi
 
 # ------------------------------------------------------------------------------
-say "Step 5/9 -- 9Router (Claude side gateway)"
+say "Step 4/8 -- 9Router (Claude side gateway)"
 # ------------------------------------------------------------------------------
-if [ "$USE_CLAUDE" != yes ]; then
-  ok "Skipping 9Router -- only needed for the Claude tiers, which you did not select."
-  ANTHROPIC_BASE_URL_INPUT="http://127.0.0.1:20128"
-  ANTHROPIC_API_KEY_INPUT="unused"
-else
 ask "Do you already have a 9Router instance running that this agent should use? [y/N] " HAVE_9ROUTER
 if [[ "${HAVE_9ROUTER:-}" =~ ^[Yy]$ ]]; then
-  ask "9Router base URL (e.g. http://127.0.0.1:20128): " ANTHROPIC_BASE_URL_INPUT
-  ask "9Router API key: " ANTHROPIC_API_KEY_INPUT
-  echo ""
-  ok "Using existing 9Router at ${ANTHROPIC_BASE_URL_INPUT}."
-  warn "Make sure Claude Code is logged in on 9Router's own dashboard (Providers -> Claude"
-  warn "Code -> OAuth) -- this installer cannot do that step for you."
+ask "9Router base URL (e.g. http://127.0.0.1:20128): " ANTHROPIC_BASE_URL_INPUT
+ask "9Router API key: " ANTHROPIC_API_KEY_INPUT
+echo ""
+ok "Using existing 9Router at ${ANTHROPIC_BASE_URL_INPUT}."
+warn "Make sure Claude Code is logged in on 9Router's own dashboard (Providers -> Claude"
+warn "Code -> OAuth) -- this installer cannot do that step for you."
 else
-  say "Installing 9Router locally..."
-  if ! command -v node >/dev/null 2>&1; then
+say "Installing 9Router locally..."
+if ! command -v node >/dev/null 2>&1; then
     warn "Node.js not found. 9Router requires it -- installing via NodeSource (LTS)..."
     curl -fsSL https://deb.nodesource.com/setup_lts.x | sudo -E bash -
     sudo apt-get install -y nodejs
-  fi
+fi
   sudo npm install -g 9router
-  say "Starting 9Router (pm2 recommended for persistence across reboots)..."
-  if ! command -v pm2 >/dev/null 2>&1; then
+say "Starting 9Router (pm2 recommended for persistence across reboots)..."
+if ! command -v pm2 >/dev/null 2>&1; then
     sudo npm install -g pm2
-  fi
+fi
   pm2 start 9router --name 9router -- --skip-update || pm2 restart 9router
   pm2 save
-  echo ""
-  warn "9Router is now running, but it still needs manual setup via its own dashboard:"
-  warn "  1. Open the 9Router dashboard (default: http://<this-server-ip>:20128)"
-  warn "  2. Providers -> add & log in to Claude Code (OAuth) and Antigravity (OAuth)"
-  warn "  3. Note the API key 9Router gives you for its native /v1/messages endpoint"
+echo ""
+warn "9Router is now running, but it still needs manual setup via its own dashboard:"
+warn "  1. Open the 9Router dashboard (default: http://<this-server-ip>:20128)"
+warn "  2. Providers -> add & log in to Claude Code (OAuth) and Antigravity (OAuth)"
+warn "  3. Note the API key 9Router gives you for its native /v1/messages endpoint"
   ANTHROPIC_BASE_URL_INPUT="http://127.0.0.1:20128"
-  ask "Paste the 9Router API key once you've completed the dashboard setup above: " ANTHROPIC_API_KEY_INPUT
+ask "Paste the 9Router API key once you've completed the dashboard setup above: " ANTHROPIC_API_KEY_INPUT
 fi
 
-fi
 
 # ------------------------------------------------------------------------------
-say "Step 6/9 -- Telegram bot"
+say "Step 5/8 -- Telegram bot"
 # ------------------------------------------------------------------------------
 echo "Create a bot with @BotFather on Telegram if you haven't already (/newbot)."
 ask "Telegram bot token: " TELEGRAM_BOT_TOKEN_INPUT
@@ -265,7 +197,7 @@ echo "bot after install and send it /chatid (works even before you're authorized
 ask "Your Telegram user ID (admin -- required, this account can grant group access): " ADMIN_ID_INPUT
 
 # ------------------------------------------------------------------------------
-say "Step 7/9 -- Write .env"
+say "Step 6/8 -- Write .env"
 # ------------------------------------------------------------------------------
 ENV_FILE="$INSTALL_DIR/.env"
 cat > "$ENV_FILE" <<EOF
@@ -284,13 +216,13 @@ AGY_MODEL_FALLBACK=gemini-3.1-pro-low
 
 # The fallback chain, tried left to right: provider:model:label.
 # Reorder, drop an entry, or swap a model here -- no code change needed.
-TIERS=${TIERS_VALUE}
+TIERS=agy:gemini-3.7-flash-medium:mini,agy:gemini-3.1-pro-low:mini pro,claude:cc/claude-haiku-4-5-20251001:dede iku,claude:cc/claude-sonnet-5:dede nnet
 EOF
 chmod 600 "$ENV_FILE"
 ok ".env written and locked down (chmod 600)."
 
 # ------------------------------------------------------------------------------
-say "Step 8/9 -- Environment brief (SOUL.md / GEMINI.md)"
+say "Step 7/8 -- Environment brief (SOUL.md / GEMINI.md)"
 # ------------------------------------------------------------------------------
 # This is the one genuinely per-deployment part of the whole system: what the
 # agent is looking after, how it reaches it, and what it must never touch.
@@ -298,24 +230,24 @@ say "Step 8/9 -- Environment brief (SOUL.md / GEMINI.md)"
 # so a new server needs no hand-authored config. It is NOT Proxmox-specific --
 # describe whatever you want the agent to look after.
 if [ -f "$INSTALL_DIR/SOUL.md" ] && [ -f "$INSTALL_DIR/GEMINI.md" ]; then
-  ok "SOUL.md and GEMINI.md already present -- leaving them alone."
-  echo "     (Re-run ${CYAN}python3 bootstrap.py${RESET} any time to regenerate them.)"
+ok "SOUL.md and GEMINI.md already present -- leaving them alone."
+echo "     (Re-run ${CYAN}python3 bootstrap.py${RESET} any time to regenerate them.)"
 else
-  echo "The agent needs to be told what it's looking after. The next few questions"
-  echo "generate that brief for you -- plain sentences are fine."
-  echo ""
-  if "$INSTALL_DIR/venv/bin/python3" "$INSTALL_DIR/bootstrap.py"; then
+echo "The agent needs to be told what it's looking after. The next few questions"
+echo "generate that brief for you -- plain sentences are fine."
+echo ""
+if "$INSTALL_DIR/venv/bin/python3" "$INSTALL_DIR/bootstrap.py"; then
     ok "Environment brief written."
-  else
+else
     warn "Bootstrap skipped or cancelled -- falling back to blank templates."
     [ -f "$INSTALL_DIR/SOUL.md" ] || cp "$INSTALL_DIR/SOUL.md.template" "$INSTALL_DIR/SOUL.md"
     [ -f "$INSTALL_DIR/GEMINI.md" ] || cp "$INSTALL_DIR/GEMINI.md.template" "$INSTALL_DIR/GEMINI.md"
     warn "You must fill in SOUL.md and GEMINI.md by hand before the bot is useful."
-  fi
+fi
 fi
 
 # ------------------------------------------------------------------------------
-say "Step 9/9 -- systemd service"
+say "Step 8/8 -- systemd service"
 # ------------------------------------------------------------------------------
 SERVICE_FILE="/etc/systemd/system/lite-agent.service"
 sed \
@@ -334,10 +266,8 @@ echo "     everything above it is yours. See examples/proxmox/ for a worked refe
 echo "  2. ${BOLD}Set up access${RESET} from this machine to whatever you want the agent to"
 echo "     manage (SSH key + ~/.ssh/config, kubeconfig, etc), matching what you"
 echo "     described during the brief step."
-if [ "$USE_AGY" = yes ]; then
 echo "  3. If you skipped the Antigravity sign-in above, run:"
 echo "     ${CYAN}python3 ${INSTALL_DIR}/tools/agy_login.py${RESET}"
-fi
 echo ""
 echo "Then start it:"
 echo "  ${CYAN}sudo systemctl enable --now lite-agent${RESET}"

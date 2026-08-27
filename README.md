@@ -94,34 +94,6 @@ all. [`examples/proxmox/`](./examples/proxmox/) is one worked example, not a req
 shape -- a Kubernetes cluster, a fleet of web servers, or a CI estate all work the
 same way.
 
-### Choosing providers
-
-The installer asks which providers you want (Gemini, Claude, or both) and — if
-both — which is tried first. That single answer decides what gets installed, which
-logins you're asked for, and the fallback chain written to `.env`. Both are
-fixed-price subscriptions, so the real question is which plans you already pay for.
-
-The chain lives in one setting, tried left to right:
-
-```
-TIERS=agy:gemini-3.7-flash-medium:mini,agy:gemini-3.1-pro-low:mini pro,claude:cc/claude-haiku-4-5-20251001:dede iku,claude:cc/claude-sonnet-5:dede nnet
-       ^^^ provider  ^^^ model                  ^^^ label, shown as "— by mini"
-```
-
-One ordered list rather than four PRIMARY/FALLBACK variables, because the useful
-setups aren't all two-plus-two: Gemini only, Claude only, one Gemini then straight
-to Sonnet, three of one and one of the other. Reordering, dropping a tier, or
-swapping a model is a `.env` edit and a restart — never a code change. `/providers`
-shows the live chain and which tiers are currently healthy.
-
-The **Antigravity sign-in** is handled for you: the installer prints a URL, you open
-it on any device, and paste the code back. (`agy` has no `login` subcommand — signing
-in means its full-screen TUI, which needs a real TTY and takes over the terminal
-mid-install. [`tools/agy_login.py`](./tools/agy_login.py) drives that screen in tmux
-so you only see the two steps that need you. Run it standalone any time.)
-
-The **Claude side** still needs one manual step: logging in on 9Router's own
-dashboard. No installer can click through a browser login for you.
 
 ### The environment brief, and how it fills itself in
 
