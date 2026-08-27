@@ -45,6 +45,7 @@ from __future__ import annotations
 import asyncio
 import datetime as _dt
 import hashlib
+import hmac
 import json
 import logging
 import os
@@ -78,6 +79,7 @@ MEMORY_FILE = BASE_DIR / "MEMORY.md"
 LOG_FILE = BASE_DIR / "lite-agent.log"
 # Deterministic collectors: known questions answered by a script, no LLM
 # involved, so a repeat of an already-solved case costs zero tokens. See /status.
+RUN_SCHEDULED = BASE_DIR / "tools" / "run_scheduled.py"
 SNAPSHOT_SCRIPT = BASE_DIR / "tools" / "cluster_snapshot.py"
 LIST_TOOLS_SCRIPT = BASE_DIR / "tools" / "list_tools.py"
 
@@ -337,6 +339,268 @@ def write_mode_notice() -> str:
 # So guard the last gate we fully control instead: nothing leaves this process
 # toward Telegram carrying a known secret, regardless of how the model came by
 # it. Cheap, unconditional, and it does not depend on the model cooperating.
+# --------------------------------------------------------------------------
+# PIN gate for sensitive actions
+#
+# A button tap only proves "somebody holding this Telegram account pressed it".
+# That is not enough for the cases actually worth defending against: a member's
+# phone being compromised, or someone getting into a group they shouldn't be in.
+# In both, the attacker HAS the account, so a tap proves nothing. A PIN is a
+# second factor that does not travel with the device session.
+#
+# THE PIN IS NEVER TYPED AS A MESSAGE.
+#   Digits are entered on an inline keypad, so they ride in callback_data and
+#   never become a chat message. Nothing lands in the chat history, nothing is
+#   left for someone scrolling back later, and there is no message to forget to
+#   delete. This is the whole reason not to use a typed password: a password in
+#   a chat log is a permanent credential sitting in cleartext on servers we do
+#   not control.
+#
+# Stored as a salted scrypt hash -- never the PIN itself. Six digits is only a
+# million combinations, so the lockout below is doing real work, not decoration:
+# without it, a compromised account could simply walk the space.
+# --------------------------------------------------------------------------
+
+PIN_FILE = BASE_DIR / "pin.json"
+PIN_LENGTH = 6
+PIN_MAX_ATTEMPTS = 5
+PIN_LOCKOUT_SECONDS = 900          # 15 min after burning through the attempts
+PIN_ENTRY_TTL_SECONDS = 180        # a half-finished entry expires on its own
+# token -> {action, payload, digits, attempts, expires, chat_id}
+_pin_sessions: dict[str, dict] = {}
+_pin_lockout_until: float = 0.0
+
+
+def pin_is_set() -> bool:
+    return PIN_FILE.exists()
+
+
+def set_pin(pin: str) -> None:
+    salt = os.urandom(16)
+    digest = hashlib.scrypt(pin.encode(), salt=salt, n=16384, r=8, p=1, dklen=32)
+    PIN_FILE.write_text(json.dumps({"salt": salt.hex(), "hash": digest.hex()}))
+    try:
+        PIN_FILE.chmod(0o600)
+    except OSError:
+        pass
+    logger.warning("PIN was set/changed")
+
+
+def verify_pin(pin: str) -> bool:
+    if not pin_is_set():
+        return False
+    try:
+        data = json.loads(PIN_FILE.read_text())
+        salt = bytes.fromhex(data["salt"])
+        expected = bytes.fromhex(data["hash"])
+    except Exception:
+        logger.error("pin.json unreadable -- refusing to verify", exc_info=True)
+        return False
+    digest = hashlib.scrypt(pin.encode(), salt=salt, n=16384, r=8, p=1, dklen=32)
+    # Constant-time: a length/short-circuit difference is a timing oracle, and
+    # six digits is a small enough space that it would matter.
+    return hmac.compare_digest(digest, expected)
+
+
+def pin_locked_out() -> int:
+    """Seconds remaining in lockout, 0 if not locked out."""
+    remaining = _pin_lockout_until - _dt.datetime.now().timestamp()
+    return int(remaining) if remaining > 0 else 0
+
+
+def _pin_keyboard(token: str, filled: int) -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton(str(d), callback_data=f"pin:{token}:{d}") for d in row]
+        for row in ((1, 2, 3), (4, 5, 6), (7, 8, 9))
+    ]
+    rows.append([
+        InlineKeyboardButton("⌫", callback_data=f"pin:{token}:del"),
+        InlineKeyboardButton("0", callback_data=f"pin:{token}:0"),
+        InlineKeyboardButton("✖️", callback_data=f"pin:{token}:cancel"),
+    ])
+    return InlineKeyboardMarkup(rows)
+
+
+def _pin_masked(filled: int) -> str:
+    return "● " * filled + "○ " * (PIN_LENGTH - filled)
+
+
+def _new_pin_session(action: str, payload: dict, chat_id: int) -> str:
+    token = hashlib.sha256(os.urandom(16)).hexdigest()[:16]
+    _pin_sessions[token] = {
+        "action": action,
+        "payload": payload,
+        "digits": "",
+        "chat_id": chat_id,
+        "expires": _dt.datetime.now().timestamp() + PIN_ENTRY_TTL_SECONDS,
+    }
+    # Opportunistic cleanup: no timer, no background task.
+    now = _dt.datetime.now().timestamp()
+    for t in [t for t, s in _pin_sessions.items() if s["expires"] < now]:
+        _pin_sessions.pop(t, None)
+    return token
+
+
+# --------------------------------------------------------------------------
+# Scheduled tasks
+#
+# The agent used to create schedules by editing the crontab itself. That worked,
+# and produced a real daily report -- but the job existed nowhere else: it could
+# not be listed, could not be removed from Telegram, and nobody would notice a
+# second one appearing. An unattended job nobody can enumerate is the exact
+# shape of the problem this project exists to avoid.
+#
+# So schedules follow the same shape as LEARN: the agent PROPOSES one by
+# emitting a marker line, and this code owns everything after that -- the
+# registry, the crontab, and the human confirmation in between. The agent is
+# told not to touch cron directly, and even if it tried, anything it installed
+# outside the managed block is visible as "unmanaged" in /schedules rather than
+# silently blending in.
+#
+# Confirmation is a button, not a typed password. A tap proves a human acted; it
+# cannot be produced by text the model read in a log file or a group message,
+# and unlike a password typed into a chat it leaves no secret in Telegram's
+# history. That distinction is the whole point -- a password in a chat log is a
+# permanent credential sitting in cleartext on someone else's servers.
+# --------------------------------------------------------------------------
+
+SCHEDULES_FILE = BASE_DIR / "schedules.json"
+CRON_BEGIN = "# BEGIN iSmart-LA managed -- edited by the bot, do not hand-edit"
+CRON_END = "# END iSmart-LA managed"
+# SCHEDULE: name=daily-report | when=0 8 * * * | run=python3 x.py | write=no
+SCHEDULE_LINE_RE = re.compile(r"^\s*SCHEDULE:\s*(.+?)\s*$", re.MULTILINE)
+_CRON_FIELD_RE = re.compile(r"^[\d*/,\-]+$")
+_SAFE_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,40}$")
+# Proposals waiting on a button press: token -> schedule dict. Deliberately
+# in-memory: a proposal that outlives a restart is a proposal nobody remembers
+# agreeing to, so losing them on restart is the correct behaviour.
+_pending_schedules: dict[str, dict] = {}
+
+
+def _read_schedules() -> list[dict]:
+    if not SCHEDULES_FILE.exists():
+        return []
+    try:
+        return json.loads(SCHEDULES_FILE.read_text())
+    except Exception:
+        logger.warning("schedules.json unreadable", exc_info=True)
+        return []
+
+
+def _write_schedules(items: list[dict]) -> None:
+    SCHEDULES_FILE.write_text(json.dumps(items, indent=2))
+
+
+def _valid_cron(expr: str) -> bool:
+    fields = expr.split()
+    return len(fields) == 5 and all(_CRON_FIELD_RE.match(f) for f in fields)
+
+
+def _current_crontab() -> str:
+    proc = subprocess.run(["crontab", "-l"], capture_output=True, text=True)
+    return proc.stdout if proc.returncode == 0 else ""
+
+
+def _rebuild_crontab(items: list[dict]) -> None:
+    """Regenerate ONLY our managed block, leaving any other crontab entry the
+    operator has alone -- clobbering somebody's unrelated cron job would be a
+    far worse bug than anything this feature is meant to fix."""
+    existing = _current_crontab()
+    if CRON_BEGIN in existing and CRON_END in existing:
+        head = existing.split(CRON_BEGIN)[0].rstrip("\n")
+        tail = existing.split(CRON_END, 1)[1].lstrip("\n")
+    else:
+        head, tail = existing.rstrip("\n"), ""
+
+    lines = [CRON_BEGIN]
+    for it in items:
+        lines.append(
+            f"{it['when']} {RUN_SCHEDULED} {it['name']} "
+            f">> {BASE_DIR / 'scheduled.log'} 2>&1  # ismart:{it['name']}"
+        )
+    lines.append(CRON_END)
+    body = "\n".join(x for x in (head, "\n".join(lines), tail) if x).rstrip("\n") + "\n"
+
+    proc = subprocess.run(["crontab", "-"], input=body, capture_output=True, text=True)
+    if proc.returncode != 0:
+        raise RuntimeError(f"crontab update failed: {proc.stderr.strip()}")
+
+
+def parse_schedule_proposal(raw: str) -> Optional[dict]:
+    """Parse one SCHEDULE: line. Returns None if it's malformed -- a proposal we
+    cannot fully understand is never partially applied."""
+    fields: dict[str, str] = {}
+    for chunk in raw.split("|"):
+        if "=" not in chunk:
+            return None
+        k, _, v = chunk.partition("=")
+        fields[k.strip().lower()] = v.strip()
+    name, when, run = fields.get("name", ""), fields.get("when", ""), fields.get("run", "")
+    if not (_SAFE_NAME_RE.match(name) and _valid_cron(when) and run):
+        return None
+    if any(c in run for c in ";`$\n") or ".." in run:
+        return None
+    return {
+        "name": name,
+        "when": when,
+        "run": run,
+        "needs_write": fields.get("write", "no").lower() in ("yes", "true", "1"),
+    }
+
+
+def extract_schedules(text: str) -> tuple[str, list[dict]]:
+    """Pull SCHEDULE: lines out of a reply and strip them from what's shown."""
+    proposals = []
+    for raw in SCHEDULE_LINE_RE.findall(text):
+        parsed = parse_schedule_proposal(raw)
+        if parsed:
+            proposals.append(parsed)
+        else:
+            logger.warning("ignored malformed SCHEDULE: line: %s", raw[:120])
+    return SCHEDULE_LINE_RE.sub("", text).strip(), proposals
+
+
+def install_schedule(item: dict, created_by: int) -> None:
+    items = [s for s in _read_schedules() if s["name"] != item["name"]]
+    items.append({
+        **item,
+        "created_by": created_by,
+        "created_at": _dt.datetime.now().strftime("%Y-%m-%d %H:%M"),
+    })
+    _rebuild_crontab(items)
+    _write_schedules(items)
+    logger.warning(
+        "SCHEDULE INSTALLED name=%s when=%r write=%s by=%s",
+        item["name"], item["when"], item["needs_write"], created_by,
+    )
+
+
+def remove_schedule(name: str) -> bool:
+    items = _read_schedules()
+    kept = [s for s in items if s["name"] != name]
+    if len(kept) == len(items):
+        return False
+    _rebuild_crontab(kept)
+    _write_schedules(kept)
+    logger.warning("SCHEDULE REMOVED name=%s", name)
+    return True
+
+
+def unmanaged_cron_lines() -> list[str]:
+    """Cron entries that are NOT ours. Surfaced in /schedules rather than
+    hidden: the point of this feature is that nothing runs unattended without
+    being visible, and that has to include things we didn't install."""
+    existing = _current_crontab()
+    if CRON_BEGIN in existing and CRON_END in existing:
+        head = existing.split(CRON_BEGIN)[0]
+        tail = existing.split(CRON_END, 1)[1]
+        existing = head + tail
+    return [
+        ln.strip() for ln in existing.split("\n")
+        if ln.strip() and not ln.strip().startswith("#")
+    ]
+
+
 _SECRET_ENV_KEYS = ("TELEGRAM_BOT_TOKEN", "ANTHROPIC_API_KEY")
 
 _SECRETS = tuple(
@@ -1478,6 +1742,10 @@ Every reply ends with a "— by ..." tag. If it's ever NOT "{BACKEND_LABELS[AGY_
 /sessions — list all saved sessions
 /remember <fact> — save a fact PERMANENTLY, read in EVERY session & EVERY tier, even after many /new
 /memory — view current memory contents
+/schedules — everything that runs on a timer, and what it does (0 tokens)
+/unschedule <name> — remove a scheduled task
+/adopt — bring pre-existing cron entries under management
+/setpin — set/change the 6-digit PIN (entered on a keypad, never typed in chat)
 /mode — read-only right now, or able to make changes? (0 tokens)
 /unlock [minutes] — owner-only, DM-only: allow real changes for a limited window
 /lock — close that window early
@@ -1671,19 +1939,13 @@ async def cmd_unlock(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         except ValueError:
             await update.message.reply_text(f"Usage: /unlock [minutes, max {WRITE_MODE_MAX_MINUTES}]")
             return
-    try:
-        until = unlock_write_mode(minutes)
-    except OSError as exc:
-        logger.exception("unlock failed")
-        await update.message.reply_text(f"⚠️ Could not unlock: {exc}")
-        return
-    left = int((until - _dt.datetime.now().timestamp()) / 60) + 1
-    await update.message.reply_text(
-        f"🔓 *Write mode open for {left} minute(s).*\n\n"
-        "The agent can now create, repair and reconfigure things. It re-locks by itself "
-        "when the time is up — or use /lock to close it now.\n\n"
-        "Hard boundaries still apply and never lift.",
-        parse_mode="Markdown",
+    # Opening write access is the most consequential thing this bot can do,
+    # so it takes more than a tap from a signed-in device. The PIN is the
+    # factor that does not come along with a stolen session, and it is
+    # entered on a keypad so it never becomes a message in the chat.
+    await request_pin(
+        update, "unlock", {"minutes": minutes},
+        f"🔓 Confirm opening write mode for {minutes} minute(s).",
     )
 
 
@@ -1719,6 +1981,355 @@ async def cmd_mode(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
 
 
+async def request_pin(update: Update, action: str, payload: dict, prompt: str) -> None:
+    """Put a PIN keypad in front of a sensitive action.
+
+    The action is NOT performed here -- it is parked with the session and only
+    runs once the PIN checks out, in _pin_verified().
+    """
+    if not pin_is_set():
+        await update.effective_message.reply_text(
+            "🔢 No PIN is set yet, so sensitive actions are blocked.\n"
+            "Set one first with /setpin (owner, private DM)."
+        )
+        return
+    left = pin_locked_out()
+    if left:
+        await update.effective_message.reply_text(
+            f"⛔ Too many wrong PIN attempts. Locked for another {left // 60 + 1} minute(s)."
+        )
+        return
+    token = _new_pin_session(action, payload, update.effective_chat.id)
+    await update.effective_message.reply_text(
+        f"{prompt}\n\n🔢 Enter your {PIN_LENGTH}-digit PIN:\n{_pin_masked(0)}",
+        reply_markup=_pin_keyboard(token, 0),
+    )
+
+
+async def _redraw(query, header: str, token: str, filled: int, note: str = "") -> None:
+    try:
+        await query.edit_message_text(
+            f"{header}{note}\n{_pin_masked(filled)}",
+            reply_markup=_pin_keyboard(token, filled),
+        )
+    except BadRequest:
+        pass  # unchanged text (e.g. ⌫ on an empty entry) -- nothing to redraw
+
+
+async def cmd_pin_key(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Every keypad press lands here. Digits ride in callback_data, so they are
+    never a chat message and never enter the chat history."""
+    global _pin_lockout_until
+    query = update.callback_query
+    _, token, key = query.data.split(":", 2)
+    session = _pin_sessions.get(token)
+    if not session:
+        await query.answer("This PIN entry expired — start again.", show_alert=True)
+        return
+    # The PIN guards owner-only actions, so only the owner may drive the keypad.
+    if not _is_trusted_origin(update):
+        await query.answer("Not permitted.", show_alert=True)
+        return
+    if session["expires"] < _dt.datetime.now().timestamp():
+        _pin_sessions.pop(token, None)
+        await query.answer("Expired.", show_alert=True)
+        await query.edit_message_text("🔢 PIN entry expired.")
+        return
+
+    if key == "cancel":
+        _pin_sessions.pop(token, None)
+        await query.answer()
+        await query.edit_message_text("✖️ Cancelled.")
+        return
+    if key == "del":
+        session["digits"] = session["digits"][:-1]
+    elif key.isdigit():
+        session["digits"] += key
+    await query.answer()
+
+    header = (query.message.text or "").split("\n🔢")[0].split("\n●")[0].split("\n○")[0]
+    header = header.split("\n❌")[0].rstrip() + f"\n\n🔢 {PIN_LENGTH}-digit PIN:"
+    filled = len(session["digits"])
+    if filled < PIN_LENGTH:
+        await _redraw(query, header, token, filled)
+        return
+
+    entered = session["digits"]
+    session["digits"] = ""
+
+    # Choosing a NEW pin has nothing to verify against yet.
+    if session["action"] in ("new_pin_capture", "new_pin_confirm"):
+        await _pin_capture(update, query, session, token, entered)
+        return
+
+    if not verify_pin(entered):
+        session["attempts"] = session.get("attempts", 0) + 1
+        if session["attempts"] >= PIN_MAX_ATTEMPTS:
+            _pin_sessions.pop(token, None)
+            _pin_lockout_until = _dt.datetime.now().timestamp() + PIN_LOCKOUT_SECONDS
+            logger.error("PIN lockout triggered after %d failed attempts", PIN_MAX_ATTEMPTS)
+            await query.edit_message_text(
+                f"⛔ Wrong PIN {PIN_MAX_ATTEMPTS} times. Locked for "
+                f"{PIN_LOCKOUT_SECONDS // 60} minutes."
+            )
+            return
+        remaining = PIN_MAX_ATTEMPTS - session["attempts"]
+        logger.warning("wrong PIN (%d attempt(s) left)", remaining)
+        await _redraw(query, header, token, 0, f"\n❌ Wrong PIN — {remaining} attempt(s) left.")
+        return
+
+    _pin_sessions.pop(token, None)
+    await _pin_verified(update, query, session)
+
+
+async def _pin_capture(update: Update, query, session: dict, token: str, entered: str) -> None:
+    """Two-step entry for a new PIN: type it, then type it again. A mistyped PIN
+    that locks you out of your own production changes is a bad afternoon."""
+    if session["action"] == "new_pin_capture":
+        _pin_sessions.pop(token, None)
+        confirm_token = _new_pin_session("new_pin_confirm", {"first": entered},
+                                         update.effective_chat.id)
+        await query.edit_message_text(
+            f"🔢 Enter the same {PIN_LENGTH} digits again to confirm:\n{_pin_masked(0)}",
+            reply_markup=_pin_keyboard(confirm_token, 0),
+        )
+        return
+
+    _pin_sessions.pop(token, None)
+    if entered != session["payload"]["first"]:
+        await query.edit_message_text("❌ The two entries didn't match. Run /setpin again.")
+        return
+    set_pin(entered)
+    await query.edit_message_text(
+        "✅ PIN set. It now guards scheduled tasks and /unlock.\n"
+        "It is stored only as a salted hash, and it is never typed into the chat."
+    )
+
+
+async def _pin_verified(update: Update, query, session: dict) -> None:
+    """PIN checked out -- carry out the action that was waiting on it."""
+    action, payload = session["action"], session["payload"]
+
+    if action == "change_pin_start":
+        await _begin_new_pin(update, query)
+        return
+
+    if action == "schedule_install":
+        item = payload["item"]
+        try:
+            install_schedule(item, update.effective_user.id)
+        except Exception as exc:
+            logger.exception("schedule install failed")
+            await query.edit_message_text(f"⚠️ Could not install: {exc}")
+            return
+        await query.edit_message_text(
+            f"✅ Installed <b>{_tg_escape(item['name'])}</b> — runs "
+            f"<code>{_tg_escape(item['when'])}</code>.\n"
+            f"See /schedules, remove with /unschedule {_tg_escape(item['name'])}.",
+            parse_mode="HTML",
+        )
+        return
+
+    if action == "unlock":
+        try:
+            until = unlock_write_mode(payload["minutes"])
+        except OSError as exc:
+            logger.exception("unlock failed")
+            await query.edit_message_text(f"⚠️ Could not unlock: {exc}")
+            return
+        left = int((until - _dt.datetime.now().timestamp()) / 60) + 1
+        await query.edit_message_text(
+            f"🔓 Write mode open for {left} minute(s). It re-locks by itself; "
+            "/lock closes it sooner. Hard boundaries still apply."
+        )
+        return
+
+    logger.error("unknown PIN action: %s", action)
+    await query.edit_message_text("⚠️ Internal error: unknown action.")
+
+
+async def _begin_new_pin(update: Update, query=None) -> None:
+    token = _new_pin_session("new_pin_capture", {}, update.effective_chat.id)
+    text = (
+        f"🔢 Choose a new {PIN_LENGTH}-digit PIN.\n"
+        "Avoid birthdays and 123456 — this is the last gate in front of "
+        f"production changes.\n{_pin_masked(0)}"
+    )
+    kb = _pin_keyboard(token, 0)
+    if query is not None:
+        await query.edit_message_text(text, reply_markup=kb)
+    else:
+        await update.effective_message.reply_text(text, reply_markup=kb)
+
+
+async def cmd_setpin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Set or change the PIN. Entered on the keypad like every other PIN, so it
+    is never typed into the chat -- including the very first time."""
+    if not _is_trusted_origin(update):
+        await update.message.reply_text("🔒 Only the bot owner, in a private DM.")
+        return
+    if pin_is_set():
+        await request_pin(update, "change_pin_start", {},
+                          "🔢 Changing your PIN. First, confirm the CURRENT one.")
+        return
+    await _begin_new_pin(update)
+
+
+async def offer_schedules(update: Update, proposals: list[dict]) -> None:
+    """Ask for a human tap before anything is installed.
+
+    Nothing is written to cron here -- the proposal is only parked in memory
+    until somebody presses the button. If the bot restarts first, the proposal
+    is gone, which is right: a pending change nobody confirmed should not
+    survive to be confirmed by accident later.
+    """
+    for item in proposals:
+        token = hashlib.sha256(
+            f"{item['name']}{_dt.datetime.now().timestamp()}".encode()
+        ).hexdigest()[:16]
+        _pending_schedules[token] = item
+        warn = ""
+        if item["needs_write"]:
+            warn = (
+                "\n\n⚠️ This task asks for WRITE access, so it can change things "
+                "with nobody watching. Only approve that if it genuinely needs to."
+            )
+        await update.message.reply_text(
+            f"🗓 <b>Install this scheduled task?</b>\n\n"
+            f"<b>Name:</b> <code>{_tg_escape(item['name'])}</code>\n"
+            f"<b>When:</b> <code>{_tg_escape(item['when'])}</code>\n"
+            f"<b>Runs:</b> <code>{_tg_escape(item['run'][:300])}</code>\n"
+            f"<b>Write access:</b> {'YES' if item['needs_write'] else 'no'}"
+            f"{warn}",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("✅ Install", callback_data=f"sched_ok:{token}"),
+                InlineKeyboardButton("✖️ Cancel", callback_data=f"sched_no:{token}"),
+            ]]),
+        )
+
+
+async def cmd_schedule_decision(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    action, _, token = query.data.partition(":")
+    # Same gate as /unlock: installing an unattended job is not something a
+    # group should be able to do, even a registered one.
+    if not _is_trusted_origin(update):
+        await query.answer("Only the bot owner, in a private DM.", show_alert=True)
+        return
+    item = _pending_schedules.pop(token, None)
+    if not item:
+        await query.answer()
+        await query.edit_message_text("That proposal has expired — ask again if you still want it.")
+        return
+    if action == "sched_no":
+        await query.answer()
+        await query.edit_message_text(f"✖️ Not installed: {item['name']}")
+        return
+    # The tap alone is not the authorisation. It only says WHICH proposal; the
+    # PIN says a person -- not just a logged-in device -- actually wants it.
+    await query.answer()
+    await query.edit_message_text(
+        f"🗓 Installing <b>{_tg_escape(item['name'])}</b> — confirm with your PIN.",
+        parse_mode="HTML",
+    )
+    await request_pin(
+        update, "schedule_install", {"item": item},
+        f"🗓 Confirm installing scheduled task <b>{_tg_escape(item['name'])}</b>.",
+    )
+
+
+async def cmd_schedules(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Everything that runs on a timer. Zero tokens -- read straight from the
+    registry and the crontab, no model involved."""
+    if not _authorized(update):
+        return
+    items = _read_schedules()
+    lines: list[str] = []
+    if items:
+        lines.append(f"🗓 <b>Scheduled tasks ({len(items)})</b>\n")
+        for it in items:
+            flag = " ⚠️ <i>write access</i>" if it.get("needs_write") else ""
+            lines.append(
+                f"• <b>{_tg_escape(it['name'])}</b>{flag}\n"
+                f"  <code>{_tg_escape(it['when'])}</code> — since {it.get('created_at','?')}\n"
+                f"  <code>{_tg_escape(it['run'][:160])}</code>"
+            )
+    else:
+        lines.append("🗓 No scheduled tasks registered.")
+
+    orphans = unmanaged_cron_lines()
+    if orphans:
+        lines.append(
+            "\n⚠️ <b>Unmanaged cron entries</b> — these run on a timer but were not "
+            "installed through this bot, so they cannot be removed with /unschedule:"
+        )
+        for o in orphans[:10]:
+            lines.append(f"  <code>{_tg_escape(o[:160])}</code>")
+        lines.append("<i>Use /adopt to bring them under management.</i>")
+
+    if items:
+        lines.append("\nRemove one: /unschedule &lt;name&gt;")
+    await _reply_chunked(update, "\n".join(lines))
+
+
+async def cmd_unschedule(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _is_trusted_origin(update):
+        await update.message.reply_text("🔒 Only the bot owner, in a private DM.")
+        return
+    name = (context.args[0] if context.args else "").strip()
+    if not name:
+        await update.message.reply_text("Usage: /unschedule <name>\nSee names with /schedules")
+        return
+    if remove_schedule(name):
+        await update.message.reply_text(f"🗑 Removed scheduled task: {name}")
+    else:
+        await update.message.reply_text(f"No scheduled task named '{name}'. See /schedules")
+
+
+async def cmd_adopt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Pull pre-existing cron entries into the registry so they become visible
+    and removable. Written for a real case: the agent installed a daily report
+    before this feature existed, and it was invisible from Telegram."""
+    if not _is_trusted_origin(update):
+        await update.message.reply_text("🔒 Only the bot owner, in a private DM.")
+        return
+    orphans = unmanaged_cron_lines()
+    if not orphans:
+        await update.message.reply_text("Nothing to adopt — every cron entry is already managed.")
+        return
+    items = _read_schedules()
+    known = {s["name"] for s in items}
+    adopted: list[str] = []
+    for idx, line in enumerate(orphans, 1):
+        parts = line.split()
+        if len(parts) < 6 or not _valid_cron(" ".join(parts[:5])):
+            continue
+        name = f"adopted-{idx}"
+        while name in known:
+            idx += 1
+            name = f"adopted-{idx}"
+        known.add(name)
+        items.append({
+            "name": name,
+            "when": " ".join(parts[:5]),
+            "run": " ".join(parts[5:]).split(">>")[0].strip(),
+            "needs_write": False,
+            "created_by": update.effective_user.id,
+            "created_at": _dt.datetime.now().strftime("%Y-%m-%d %H:%M") + " (adopted)",
+        })
+        adopted.append(name)
+    if not adopted:
+        await update.message.reply_text("Found cron entries but could not parse any of them.")
+        return
+    _rebuild_crontab(items)
+    _write_schedules(items)
+    await update.message.reply_text(
+        f"✅ Adopted {len(adopted)} entry/entries: {', '.join(adopted)}\n"
+        "They now show in /schedules and can be removed with /unschedule."
+    )
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _authorized(update):
         return
@@ -1751,6 +2362,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     label = BACKEND_LABELS.get(model, model)
     reply_text = result.get("result") or "(no response)"
     reply_text, learned_facts = extract_learned(reply_text)
+    reply_text, schedule_proposals = extract_schedules(reply_text)
     clean_text, media_paths = extract_media_paths(reply_text)
 
     # Persist BEFORE delivery: if Telegram is having a bad moment, the thing the
@@ -1783,6 +2395,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             sent_hashes: set[str] = set()
             for path in media_paths:
                 await _send_media_file(update, path, sent_hashes)
+            if schedule_proposals and _is_trusted_origin(update):
+                await offer_schedules(update, schedule_proposals)
+            elif schedule_proposals:
+                logger.warning(
+                    "ignored %d SCHEDULE: proposal(s) from an untrusted origin (chat=%s)",
+                    len(schedule_proposals), chat_id,
+                )
             if newly_learned:
                 # Visible, not silent: auto-writes the user can't see are how a
                 # brief quietly drifts away from what they think it says.
@@ -1849,6 +2468,12 @@ def main() -> None:
     app.add_handler(CommandHandler("sessions", cmd_sessions))
     app.add_handler(CommandHandler("remember", cmd_remember))
     app.add_handler(CommandHandler("memory", cmd_memory))
+    app.add_handler(CommandHandler("setpin", cmd_setpin))
+    app.add_handler(CallbackQueryHandler(cmd_pin_key, pattern="^pin:"))
+    app.add_handler(CommandHandler("schedules", cmd_schedules))
+    app.add_handler(CommandHandler("unschedule", cmd_unschedule))
+    app.add_handler(CommandHandler("adopt", cmd_adopt))
+    app.add_handler(CallbackQueryHandler(cmd_schedule_decision, pattern="^sched_(ok|no):"))
     app.add_handler(CommandHandler("unlock", cmd_unlock))
     app.add_handler(CommandHandler("lock", cmd_lock))
     app.add_handler(CommandHandler("mode", cmd_mode))

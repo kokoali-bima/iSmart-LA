@@ -151,6 +151,10 @@ choose.
 | `/learned` | free | What the agent worked out about this environment by itself |
 | `/forget <n>` | free | Delete one wrong learned fact (numbers from `/learned`) |
 | `/chatid` | free, no auth needed | Reveal the current chat's ID (for group/access setup) |
+| `/schedules` | **0 tokens** | Everything that runs on a timer, and what it does |
+| `/unschedule <name>` | owner + DM only | Remove a scheduled task |
+| `/adopt` | owner + DM only | Bring pre-existing cron entries under management |
+| `/setpin` | owner + DM only | Set/change the 6-digit PIN (keypad, never typed in chat) |
 | `/mode` | **0 tokens** | Read-only right now, or able to change things? |
 | `/unlock [min]` | owner + DM only | Open a time-boxed window for real changes |
 | `/lock` | owner + DM only | Close that window early |
@@ -171,6 +175,55 @@ plus exploratory tool calls now takes one script execution and ~600 tokens to su
 This is deliberately **not** automatic -- an agent deciding on its own what's "worth
 saving" is exactly the kind of open-ended background decision this project avoids. You
 say `/graduate`, once, when you're confident the case is a genuine reusable pattern.
+
+### The PIN, and why it isn't typed
+
+Sensitive actions — installing a scheduled task, opening write mode — need a
+6-digit PIN. **The PIN is entered on an inline keypad, never typed as a message.**
+The digits ride in `callback_data`, so nothing lands in the chat history: there is
+no message to scroll back to, and none to forget to delete. That is exactly why
+this is not a typed password — a password in a chat log is a permanent credential
+sitting in cleartext on servers you don't control.
+
+A button tap alone isn't enough for the cases actually worth defending against: a
+member's phone being compromised, or someone getting into a group they shouldn't
+be in. In both, the attacker *has* the account, so a tap proves nothing. The PIN
+is the factor that doesn't come along with a stolen session.
+
+Stored as a salted scrypt hash, never the PIN itself. Five wrong tries locks it
+for 15 minutes — six digits is only a million combinations, so that lockout is
+doing real work. Set it with `/setpin` (owner, private DM; entered on the keypad
+both times, including the very first).
+
+### Scheduled tasks
+
+The agent used to create schedules by editing crontab itself. It worked — and the
+job existed nowhere else: it couldn't be listed, couldn't be removed from
+Telegram, and a second one appearing would go unnoticed. An unattended job nobody
+can enumerate is the exact shape of problem this project exists to avoid.
+
+Now the agent only *proposes*, by emitting a `SCHEDULE:` line. Everything after
+that belongs to the bot: you get a confirmation card, approve it with your PIN,
+and only then is it installed — into a **managed block** of the crontab, so any
+cron entry you wrote yourself is left completely alone.
+
+| Command | What it does |
+|---|---|
+| `/schedules` | Everything on a timer, what it runs, and whether it has write access — **0 tokens** |
+| `/unschedule <name>` | Remove one |
+| `/adopt` | Pull pre-existing cron entries into the registry so they become visible and removable |
+
+`/schedules` also lists cron entries it does *not* manage, rather than hiding
+them — the point is that nothing runs unattended without being visible, and that
+has to include things the bot didn't install.
+
+**Write access for a scheduled job** is opt-in per task (`write=yes`), stated on
+the confirmation card, and shown with a ⚠️ in `/schedules`. Every cron line calls
+`tools/run_scheduled.py <name>`, never the command directly — so the registry
+stays authoritative: a task can't change what it does or how much access it has by
+editing a crontab line, and a task removed with `/unschedule` stops running even
+if a stale cron line survives. Write access is granted for the duration of that
+one run, via a temporary `ssh` shim, and discarded afterwards.
 
 ### Write mode
 

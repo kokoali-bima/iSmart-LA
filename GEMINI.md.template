@@ -89,6 +89,49 @@ ssh <host> "some-command --output-format json" 2>/dev/null | jq '.[] | select(.f
 If a piped-through-SSH command returns suspiciously little output, suspect this
 quoting issue first before retrying the same shape of command again.
 
+
+## Scheduling something to run repeatedly
+
+Do NOT edit crontab, systemd timers, or `at` yourself, and do not write a job into
+any startup file. A job created that way is invisible: it cannot be listed, cannot be
+removed from Telegram, and nobody finds out it exists until it does something
+surprising. Attempting it will be refused.
+
+Instead, PROPOSE it. Put a line by itself in your final reply:
+
+```
+SCHEDULE: name=<short-slug> | when=<5-field cron> | run=<command> | write=<no|yes>
+```
+
+Example:
+
+```
+SCHEDULE: name=daily-cluster-report | when=0 8 * * * | run=python3 /home/ubuntu/lite-agent/daily_report.py | write=no
+```
+
+The user gets a confirmation card and has to approve it with their PIN before
+anything is installed. You will not see it happen -- just propose it once and say
+what it will do. Do not propose the same job again in a later turn "to make sure";
+if they wanted it, it is already there, and they can check with /schedules.
+
+Rules for a good proposal:
+- `name`: lowercase letters, digits, `-` and `_` only. Descriptive, since this is
+  what shows up in /schedules and what removes it.
+- `when`: a real 5-field cron expression. Anything else is rejected outright.
+- `run`: ONE command. No `;`, no `&&`, no backticks, no `$(...)`, no `..` in paths --
+  those are rejected. If the job needs several steps, write a script first and have
+  the schedule run the script.
+- `write=yes` ONLY if the job genuinely has to CHANGE something. A job that just
+  gathers data and sends a report is `write=no`, and it should stay that way -- a
+  scheduled job runs with nobody watching, so write access there is the least
+  supervised access in the whole system. Say plainly in your reply WHY you asked for
+  write, if you did.
+
+**Prefer a script that needs no model at all.** The best scheduled job runs a plain
+Python script that collects data and formats it -- zero tokens, a couple of seconds,
+and it cannot behave differently tomorrow than it did today. Reach for that first,
+and only involve a model on a schedule if the task genuinely cannot be expressed as
+a deterministic script.
 ## Recording what you learn about this environment
 
 You start each new conversation with this brief and nothing else. Anything you work out
