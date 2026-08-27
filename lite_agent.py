@@ -635,12 +635,7 @@ LEARNED_MAX_FACTS = 60
 # Which of the 4 tiers actually answered, in one glance -- if it's ever NOT
 # "mini" (the primary/cheapest tier), that's a visible signal something
 # upstream (rate limit, auth hiccup, timeout) forced an escalation.
-BACKEND_LABELS = {
-    AGY_MODEL_PRIMARY: "mini",
-    AGY_MODEL_FALLBACK: "mini pro",
-    CLAUDE_MODEL_PRIMARY: "dede iku",
-    CLAUDE_MODEL_FALLBACK: "dede nnet",
-}
+
 
 logging.basicConfig(
     level=logging.INFO,
@@ -661,6 +656,74 @@ try:  # keep the log readable only by the user the service runs as
     LOG_FILE.chmod(0o600)
 except OSError:  # pragma: no cover -- never worth failing startup over
     pass
+
+
+# --------------------------------------------------------------------------
+# Fallback chain
+#
+# Which providers are used, in what order, and what each one is called, all come
+# from one setting. The order in TIERS *is* the fallback order -- first entry is
+# tried first, and the chain moves on only when a tier fails in a way that
+# another tier could plausibly do better (see _classify_failure).
+#
+#   TIERS=agy:gemini-3.7-flash-medium:mini,claude:cc/claude-haiku-4-5-20251001:dede iku
+#          ^^^ provider  ^^^ model                  ^^^ label shown as "— by <label>"
+#
+# One list rather than four separate PRIMARY/FALLBACK variables, because the
+# useful setups are not all two-plus-two: Gemini only, Claude only, one Gemini
+# then straight to Sonnet, or three of one and one of the other. Expressing that
+# as an ordered list makes those a config change instead of a code change.
+#
+# Deployments that predate this still work: with TIERS unset, the chain is
+# rebuilt from the old AGY_/CLAUDE_MODEL_* variables in their original order.
+# --------------------------------------------------------------------------
+
+KNOWN_PROVIDERS = ("agy", "claude")
+_DEFAULT_TIERS = (
+    f"agy:{AGY_MODEL_PRIMARY}:mini,"
+    f"agy:{AGY_MODEL_FALLBACK}:mini pro,"
+    f"claude:{CLAUDE_MODEL_PRIMARY}:dede iku,"
+    f"claude:{CLAUDE_MODEL_FALLBACK}:dede nnet"
+)
+
+
+def _parse_tiers(raw: str) -> list[dict]:
+    tiers: list[dict] = []
+    for entry in raw.split(","):
+        entry = entry.strip()
+        if not entry:
+            continue
+        parts = entry.split(":", 2)
+        if len(parts) < 2:
+            logger.error("TIERS entry %r is malformed (need provider:model[:label]) -- skipped", entry)
+            continue
+        provider, model = parts[0].strip(), parts[1].strip()
+        label = parts[2].strip() if len(parts) > 2 and parts[2].strip() else model
+        if provider not in KNOWN_PROVIDERS:
+            logger.error("TIERS entry %r names unknown provider %r -- skipped", entry, provider)
+            continue
+        if not model:
+            logger.error("TIERS entry %r has no model -- skipped", entry)
+            continue
+        tiers.append({"provider": provider, "model": model, "label": label})
+    return tiers
+
+
+TIERS = _parse_tiers(os.environ.get("TIERS", "") or _DEFAULT_TIERS)
+if not TIERS:
+    # Falling back to a hardcoded chain would quietly bill a provider the
+    # operator may have deliberately removed. Refusing to start is louder and
+    # safer than guessing what they meant.
+    raise SystemExit(
+        "TIERS is set but no usable entry could be parsed -- refusing to start.\n"
+        "Expected: provider:model:label,provider:model:label\n"
+        "  providers: " + ", ".join(KNOWN_PROVIDERS)
+    )
+
+# Which of the tiers actually answered, in one glance -- if it's ever not the
+# FIRST one, something upstream (rate limit, auth hiccup, timeout) forced an
+# escalation, and that's worth noticing without digging through logs.
+BACKEND_LABELS = {t["model"]: t["label"] for t in TIERS}
 
 
 # --------------------------------------------------------------------------
@@ -1047,83 +1110,72 @@ def _normalize_agy_result(parsed: dict) -> dict:
 # --------------------------------------------------------------------------
 
 def run_combo(prompt: str, sess: dict, session_name: str) -> tuple[dict, str, list[str]]:
-    """Try each tier in order, falling through only when the current one fails
-    outright. `sess` is this named session's {"claude": {model: id}, "agy":
-    {model: id}} dict -- mutated in place with whichever tier's resume handle
-    actually got used; the caller persists it afterward.
+    """Walk the TIERS chain in order, moving on only when a tier fails in a way
+    another tier could plausibly survive.
+
+    `sess` is this named session's {"claude": {model: id}, "agy": {model: id}}
+    dict -- mutated in place with whichever tier's resume handle actually got
+    used; the caller persists it afterward.
 
     Returns (normalized_result, model_name, attempt_log). model_name is the
-    literal model that answered (key into BACKEND_LABELS for the "mini" /
-    "dede iku" style tag) -- NOT a combo alias, so it's always known exactly.
-    attempt_log is a list of short strings, one per attempt, logged verbatim
-    so a human can see exactly how much (if anything) was spent on failed
-    attempts before the turn that actually produced the answer.
+    literal model that answered -- never an alias -- so the "— by <label>" tag
+    is always exact. attempt_log records every attempt, including skipped and
+    failed ones, so a human can see what a turn really cost before it landed.
     """
     attempts: list[str] = []
-    agy_convs = sess.setdefault("agy", {})  # {model_name: conversation_id}
-    claude_sessions = sess.setdefault("claude", {})  # {model_name: session_id}
+    agy_convs = sess.setdefault("agy", {})       # {model: conversation_id}
+    claude_sessions = sess.setdefault("claude", {})  # {model: session_id}
 
-    for model in (AGY_MODEL_PRIMARY, AGY_MODEL_FALLBACK):
+    for tier in TIERS:
+        provider, model = tier["provider"], tier["model"]
         if not _tier_available(model):
-            attempts.append(f"agy:{model} SKIPPED (cooldown)")
+            attempts.append(f"{provider}:{model} SKIPPED (cooldown)")
             continue
-        conv_id = agy_convs.get(model)
-        # Each tier keeps its OWN conversation, so "is this a fresh conversation"
-        # is a per-model question -- the env brief has to go to whichever tier is
-        # starting from nothing, which may be the fallback even when the primary
-        # is mid-conversation.
-        agy_prompt = _build_agy_prompt(prompt, include_env=(conv_id is None))
         try:
-            parsed = _run_agy_once(agy_prompt, model, conv_id)
-            u = parsed.get("usage", {}) or {}
-            attempts.append(f"agy:{model} OK ({u.get('total_tokens', '?')} tok)")
-            agy_convs[model] = parsed.get("conversation_id")
+            if provider == "agy":
+                conv_id = agy_convs.get(model)
+                # Each tier keeps its OWN conversation, so "is this fresh?" is a
+                # per-tier question -- the brief has to go to whichever tier is
+                # starting from nothing, which may be a later one even while an
+                # earlier one is mid-conversation.
+                parsed = _run_agy_once(
+                    _build_agy_prompt(prompt, include_env=(conv_id is None)), model, conv_id
+                )
+                usage = parsed.get("usage", {}) or {}
+                attempts.append(f"agy:{model} OK ({usage.get('total_tokens', '?')} tok)")
+                agy_convs[model] = parsed.get("conversation_id")
+                _note_tier_success(model)
+                return _normalize_agy_result(parsed), model, attempts
+
+            result = run_claude(prompt, claude_sessions.get(model), session_name, model)
+            usage = result.get("usage", {}) or {}
+            total = sum(v for v in usage.values() if isinstance(v, int))
+            attempts.append(f"claude:{model} OK ({total} tok)")
+            claude_sessions[model] = result.get("session_id")
             _note_tier_success(model)
-            return _normalize_agy_result(parsed), model, attempts
+            return result, model, attempts
+
         except Exception as exc:
             kind = _classify_failure(exc)
-            attempts.append(f"agy:{model} FAILED/{kind} ({exc})")
-            logger.warning("agy model=%s failed (%s): %s", model, kind, exc)
-            agy_convs[model] = None  # don't try to resume a conversation that just errored
+            attempts.append(f"{provider}:{model} FAILED/{kind} ({exc})")
+            logger.warning("%s model=%s failed (%s): %s", provider, model, kind, exc)
+            # Don't try to resume a conversation that just errored.
+            (agy_convs if provider == "agy" else claude_sessions)[model] = None
             if kind == "terminal":
-                # The request itself is the problem -- the other three tiers would
+                # The request itself is the problem -- every remaining tier would
                 # spend real quota to fail in exactly the same way.
                 raise RuntimeError(
                     f"Request rejected and retrying elsewhere won't help: {exc}"
                 ) from exc
             _note_tier_failure(model)
 
-    logger.warning("Gemini tiers unavailable for session=%s, falling back to claude", session_name)
-    for model in (CLAUDE_MODEL_PRIMARY, CLAUDE_MODEL_FALLBACK):
-        if not _tier_available(model):
-            attempts.append(f"claude:{model} SKIPPED (cooldown)")
-            continue
-        try:
-            result = run_claude(prompt, claude_sessions.get(model), session_name, model)
-            u = result.get("usage", {}) or {}
-            total = sum(v for v in u.values() if isinstance(v, int))
-            attempts.append(f"claude:{model} OK ({total} tok)")
-            claude_sessions[model] = result.get("session_id")
-            _note_tier_success(model)
-            return result, model, attempts
-        except Exception as exc:
-            kind = _classify_failure(exc)
-            attempts.append(f"claude:{model} FAILED/{kind} ({exc})")
-            logger.warning("claude model=%s failed (%s): %s", model, kind, exc)
-            claude_sessions[model] = None
-            if kind == "terminal":
-                raise RuntimeError(
-                    f"Request rejected and retrying elsewhere won't help: {exc}"
-                ) from exc
-            _note_tier_failure(model)
-
-    # Everything was either tried and failed, or skipped as cooling down. If it
-    # was ALL cooldowns we haven't actually spent anything -- clear them and let
-    # the next message retry properly, rather than staying dark indefinitely.
-    if all("SKIPPED" in a for a in attempts):
+    # Everything was tried and failed, or skipped as cooling down. If it was ALL
+    # cooldowns we haven't actually spent anything, so clear them and let the
+    # next message retry properly rather than staying dark indefinitely.
+    if attempts and all("SKIPPED" in a for a in attempts):
         _tier_cooldown.clear()
-        raise RuntimeError("All tiers are cooling down after recent failures; try again shortly.")
-    raise RuntimeError(f"All 4 tiers failed: {' -> '.join(attempts)}")
+        raise RuntimeError("Every tier is cooling down after recent failures; try again shortly.")
+    raise RuntimeError(f"All {len(TIERS)} tier(s) failed: {' -> '.join(attempts)}")
 
 
 # --------------------------------------------------------------------------
@@ -1735,6 +1787,16 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
+def _tier_summary() -> str:
+    """The live chain, numbered, for /help. Built from TIERS so it can never
+    drift from what the bot will actually do."""
+    lines = []
+    for i, t in enumerate(TIERS, 1):
+        where = "primary" if i == 1 else ("last resort" if i == len(TIERS) else f"fallback #{i - 1}")
+        lines.append(f"{i}. {t['label']} \u2014 {t['model']} ({where})")
+    return "\n".join(lines)
+
+
 _HELP_CREDITS = (
     "━━━━━━━━━━━━━━━━━━━\n"
     "\U0001f680 *Designed by Koko Ali & Dede*\n"
@@ -1746,12 +1808,9 @@ HELP_TEXT_EN = f"""\U0001f4d6 *iSmart-LA — Usage Guide*
 
 *How it works*
 Every message is tried through 4 tiers, cheapest first:
-1. {BACKEND_LABELS[AGY_MODEL_PRIMARY]} — Gemini Flash (fixed-price, primary)
-2. {BACKEND_LABELS[AGY_MODEL_FALLBACK]} — Gemini Pro-low (fallback #1)
-3. {BACKEND_LABELS[CLAUDE_MODEL_PRIMARY]} — Claude Haiku (fallback #2)
-4. {BACKEND_LABELS[CLAUDE_MODEL_FALLBACK]} — Claude Sonnet (last resort)
+{_tier_summary()}
 
-Every reply ends with a "— by ..." tag. If it's ever NOT "{BACKEND_LABELS[AGY_MODEL_PRIMARY]}", that's a signal something upstream is having trouble (rate limit, auth, etc) -- useful for keeping an eye on system health at a glance.
+Every reply ends with a "— by ..." tag. If it's ever NOT "{TIERS[0]['label']}", that's a signal something upstream is having trouble (rate limit, auth, etc) -- useful for keeping an eye on system health at a glance.
 
 *Available commands*
 /status — instant status check, ZERO tokens (straight from a script, not a model)
@@ -1766,6 +1825,7 @@ Every reply ends with a "— by ..." tag. If it's ever NOT "{BACKEND_LABELS[AGY_
 /unschedule <name> — remove a scheduled task
 /adopt — bring pre-existing cron entries under management
 /setpin — set/change the 6-digit PIN (entered on a keypad, never typed in chat)
+/providers — which AI tiers are configured and which are healthy (0 tokens)
 /mode — read-only right now, or able to make changes? (0 tokens)
 /unlock [minutes] — owner-only, DM-only: allow real changes for a limited window
 /lock — close that window early
@@ -1790,12 +1850,9 @@ HELP_TEXT_ID = f"""\U0001f4d6 *iSmart-LA — Panduan Pemakaian*
 
 *Cara kerjanya*
 Setiap pesan dicoba lewat 4 tingkatan, dari yang paling murah dulu:
-1. {BACKEND_LABELS[AGY_MODEL_PRIMARY]} — Gemini Flash (harga tetap, utama)
-2. {BACKEND_LABELS[AGY_MODEL_FALLBACK]} — Gemini Pro-low (cadangan #1)
-3. {BACKEND_LABELS[CLAUDE_MODEL_PRIMARY]} — Claude Haiku (cadangan #2)
-4. {BACKEND_LABELS[CLAUDE_MODEL_FALLBACK]} — Claude Sonnet (opsi terakhir)
+{_tier_summary()}
 
-Setiap balasan diakhiri tanda "— by ...". Kalau tandanya BUKAN "{BACKEND_LABELS[AGY_MODEL_PRIMARY]}", itu sinyal ada gangguan di salah satu layanan (rate limit, auth, dll) -- gampang dipantau sekilas tanpa perlu buka log.
+Setiap balasan diakhiri tanda "— by ...". Kalau tandanya BUKAN "{TIERS[0]['label']}", itu sinyal ada gangguan di salah satu layanan (rate limit, auth, dll) -- gampang dipantau sekilas tanpa perlu buka log.
 
 *Daftar perintah*
 /status — cek status instan, NOL token (langsung dari script, bukan model)
@@ -2369,6 +2426,33 @@ async def cmd_adopt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
+async def cmd_providers(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """The live fallback chain and each tier's current health. Zero tokens --
+    read straight from config and the in-memory cooldown table."""
+    if not _authorized(update):
+        return
+    lines = [f"\U0001f9e9 <b>Fallback chain ({len(TIERS)} tier(s))</b>", ""]
+    for i, t in enumerate(TIERS, 1):
+        if _tier_available(t["model"]):
+            state = "✅ ready"
+        else:
+            until, fails = _tier_cooldown[t["model"]]
+            mins = int((until - _dt.datetime.now().timestamp()) / 60) + 1
+            state = f"⏸ cooling down ~{mins}m (after {fails} failure(s))"
+        role = "primary" if i == 1 else ("last resort" if i == len(TIERS) else f"fallback #{i - 1}")
+        lines.append(
+            f"{i}. <b>{_tg_escape(t['label'])}</b> — {role}\n"
+            f"   <code>{_tg_escape(t['provider'])}</code> / <code>{_tg_escape(t['model'])}</code>\n"
+            f"   {state}"
+        )
+    lines.append(
+        "\nReplies are tagged with whichever tier answered. Anything other than "
+        f"<b>{_tg_escape(TIERS[0]['label'])}</b> means the ones above it were unavailable."
+    )
+    lines.append("\n<i>Change the chain by editing TIERS in .env, then restart.</i>")
+    await _reply_chunked(update, "\n".join(lines))
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _authorized(update):
         return
@@ -2509,6 +2593,7 @@ def main() -> None:
     app.add_handler(CommandHandler("memory", cmd_memory))
     app.add_handler(CommandHandler("setpin", cmd_setpin))
     app.add_handler(CallbackQueryHandler(cmd_pin_key, pattern="^pin:"))
+    app.add_handler(CommandHandler("providers", cmd_providers))
     app.add_handler(CommandHandler("schedules", cmd_schedules))
     app.add_handler(CommandHandler("unschedule", cmd_unschedule))
     app.add_handler(CommandHandler("adopt", cmd_adopt))

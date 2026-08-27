@@ -14,8 +14,9 @@
 # What this script does NOT do for you (by design -- see README):
 #   - Provide access to whatever you want this agent to manage. Set up your own
 #     SSH key + ~/.ssh/config (or kubeconfig, etc) before or after running this.
-#   - Complete OAuth logins for you. It runs `agy` and (if installing 9Router
-#     fresh) tells you to open its dashboard -- both need a human to click
+#   - Complete OAuth logins for you. It walks you through the Antigravity sign-in
+#     (URL to open, code to paste back) and, if installing 9Router
+#     fresh, points you at its dashboard -- both need a human to click
 #     through a real login flow.
 # ==============================================================================
 set -euo pipefail
@@ -89,40 +90,103 @@ fi
 ok "Python dependencies installed."
 
 # ------------------------------------------------------------------------------
-say "Step 3/9 -- Claude Code CLI"
+say "Step 3/9 -- Which AI providers do you want to use?"
 # ------------------------------------------------------------------------------
-if command -v claude >/dev/null 2>&1; then
-  ok "Claude Code CLI already installed ($(claude --version 2>/dev/null || echo 'version unknown'))."
-else
-  say "Installing Claude Code CLI (native installer)..."
-  curl -fsSL https://claude.ai/install.sh | bash || warn "Automatic install failed -- install manually: https://docs.claude.com/en/docs/claude-code"
+# Both providers are fixed-price subscriptions, so "which ones" is really a
+# question about which plans you already pay for. Using both is the usual answer
+# -- it spreads routine load across two separate quotas -- but either alone works
+# fine, and the choice here is what decides everything downstream: what gets
+# installed, which logins you're asked for, and the fallback chain in .env.
+echo "  ${BOLD}1)${RESET} Gemini via Antigravity CLI  ${DIM}(needs a Google AI Pro/Ultra plan)${RESET}"
+echo "  ${BOLD}2)${RESET} Claude Code via 9Router     ${DIM}(needs a Claude Pro/Max plan)${RESET}"
+echo "  ${BOLD}3)${RESET} Both  ${DIM}(recommended -- one covers the other when it rate-limits)${RESET}"
+echo ""
+ask "Choose [1/2/3, default 3]: " PROVIDER_CHOICE
+PROVIDER_CHOICE="${PROVIDER_CHOICE:-3}"
+
+USE_AGY=no; USE_CLAUDE=no
+case "$PROVIDER_CHOICE" in
+  1) USE_AGY=yes ;;
+  2) USE_CLAUDE=yes ;;
+  *) USE_AGY=yes; USE_CLAUDE=yes ;;
+esac
+
+PRIMARY_PROVIDER=agy
+if [ "$USE_AGY" = yes ] && [ "$USE_CLAUDE" = yes ]; then
+  echo ""
+  echo "Which should be tried ${BOLD}first${RESET} on every message?"
+  echo "  ${BOLD}1)${RESET} Gemini first  ${DIM}(recommended -- keeps the Claude plan's quota in reserve,"
+  echo "     which matters if you also use Claude Code interactively on that account)${RESET}"
+  echo "  ${BOLD}2)${RESET} Claude first"
+  ask "Choose [1/2, default 1]: " ORDER_CHOICE
+  [ "${ORDER_CHOICE:-1}" = "2" ] && PRIMARY_PROVIDER=claude
+elif [ "$USE_CLAUDE" = yes ]; then
+  PRIMARY_PROVIDER=claude
 fi
 
+# The tier chain: each entry is provider:model:label, tried left to right. The
+# label is what shows up as "— by <label>" under every reply, so you can see at a
+# glance when something fell through to a more expensive tier.
+AGY_TIERS="agy:gemini-3.7-flash-medium:mini,agy:gemini-3.1-pro-low:mini pro"
+CLAUDE_TIERS="claude:cc/claude-haiku-4-5-20251001:dede iku,claude:cc/claude-sonnet-5:dede nnet"
+if [ "$USE_AGY" = yes ] && [ "$USE_CLAUDE" = yes ]; then
+  if [ "$PRIMARY_PROVIDER" = agy ]; then
+    TIERS_VALUE="${AGY_TIERS},${CLAUDE_TIERS}"
+  else
+    TIERS_VALUE="${CLAUDE_TIERS},${AGY_TIERS}"
+  fi
+elif [ "$USE_AGY" = yes ]; then
+  TIERS_VALUE="$AGY_TIERS"
+else
+  TIERS_VALUE="$CLAUDE_TIERS"
+fi
+ok "Fallback chain: ${TIERS_VALUE}"
+echo "   ${DIM}Edit TIERS in .env later to reorder, drop a tier, or change models.${RESET}"
+
 # ------------------------------------------------------------------------------
-say "Step 4/9 -- Antigravity CLI (agy) + login"
+say "Step 4/9 -- Provider setup"
 # ------------------------------------------------------------------------------
 AGY_BIN_PATH="$HOME/.local/bin/agy"
-if [ -x "$AGY_BIN_PATH" ]; then
-  ok "agy already installed ($("$AGY_BIN_PATH" --version 2>/dev/null || echo 'version unknown'))."
+
+if [ "$USE_CLAUDE" = yes ]; then
+  if command -v claude >/dev/null 2>&1; then
+    ok "Claude Code CLI already installed ($(claude --version 2>/dev/null || echo 'version unknown'))."
+  else
+    say "Installing Claude Code CLI (native installer)..."
+    curl -fsSL https://claude.ai/install.sh | bash \
+      || warn "Automatic install failed -- install manually: https://docs.claude.com/en/docs/claude-code"
+  fi
 else
-  say "Installing Antigravity CLI..."
-  curl -fsSL https://antigravity.google/cli/install.sh | bash
-  export PATH="$HOME/.local/bin:$PATH"
+  ok "Skipping Claude Code CLI (not selected)."
 fi
-export PATH="$HOME/.local/bin:$PATH"
 
-echo ""
-warn "agy needs an interactive OAuth login on a Google AI Pro / Ultra account."
-warn "This will launch a full-screen terminal UI. If you're in a plain SSH session"
-warn "without a real TTY (e.g. driven by automation), run this in tmux/screen instead."
-ask "Press Enter to launch 'agy' and complete login now, or Ctrl+C to skip and do it later... " _dummy
-"$AGY_BIN_PATH" || warn "agy exited -- if login wasn't completed, run '$AGY_BIN_PATH' again manually before starting the service."
+if [ "$USE_AGY" = yes ]; then
+  if [ -x "$AGY_BIN_PATH" ]; then
+    ok "agy already installed ($("$AGY_BIN_PATH" --version 2>/dev/null || echo 'version unknown'))."
+  else
+    say "Installing Antigravity CLI..."
+    curl -fsSL https://antigravity.google/cli/install.sh | bash
+  fi
+  export PATH="$HOME/.local/bin:$PATH"
 
-mkdir -p "$HOME/.gemini/antigravity-cli"
-AGY_SETTINGS="$HOME/.gemini/antigravity-cli/settings.json"
-say "Writing agy permissions config (allow command/read_file/write_file broadly -- same"
-say "trust level as Claude Code's unrestricted Bash tool; see README for why)."
-python3 - "$AGY_SETTINGS" <<'PYEOF'
+  echo ""
+  say "Signing in to Antigravity."
+  echo "  You'll get a URL to open, then paste back the code it gives you."
+  echo "  ${DIM}(This drives agy's own login screen for you, so it doesn't take over"
+  echo "  the terminal mid-install. Skip it and run tools/agy_login.py later.)${RESET}"
+  ask "Press Enter to sign in now, or type 's' to skip: " AGY_LOGIN_CHOICE
+  if [ "${AGY_LOGIN_CHOICE:-}" = "s" ]; then
+    warn "Skipped. Run ${CYAN}python3 $INSTALL_DIR/tools/agy_login.py${RESET} before starting the service."
+  else
+    python3 "$INSTALL_DIR/tools/agy_login.py" --agy "$AGY_BIN_PATH" \
+      || warn "Sign-in didn't complete. Re-run: python3 $INSTALL_DIR/tools/agy_login.py"
+  fi
+
+  mkdir -p "$HOME/.gemini/antigravity-cli"
+  AGY_SETTINGS="$HOME/.gemini/antigravity-cli/settings.json"
+  say "Writing agy permissions (broad allow, same trust level as Claude Code's Bash tool;"
+  say "plus a deny-list for outright destructive local commands -- see README)."
+  python3 - "$AGY_SETTINGS" <<'PYEOF'
 import json, sys
 path = sys.argv[1]
 try:
@@ -130,18 +194,34 @@ try:
         cfg = json.load(f)
 except Exception:
     cfg = {}
-cfg.setdefault("permissions", {})
-cfg["permissions"]["allow"] = sorted(set(cfg["permissions"].get("allow", [])) | {
+perms = cfg.setdefault("permissions", {})
+perms["allow"] = sorted(set(perms.get("allow", [])) | {
     "command(*)", "read_file(*)", "write_file(*)"
+})
+# Bare command names only: agy silently ignores wildcard deny patterns
+# (command(rm *) let rm through; command(rm) blocked it -- established by
+# testing, not assumed). These protect THIS host; anything reaching a managed
+# node goes out through ssh and is governed by the node-side guard instead.
+perms["deny"] = sorted(set(perms.get("deny", [])) | {
+    "command(rm)", "command(dd)", "command(mkfs)",
+    "command(shutdown)", "command(reboot)", "command(halt)", "command(poweroff)",
 })
 with open(path, "w") as f:
     json.dump(cfg, f, indent=2)
 print(f"Updated {path}")
 PYEOF
+else
+  ok "Skipping Antigravity CLI (not selected)."
+fi
 
 # ------------------------------------------------------------------------------
 say "Step 5/9 -- 9Router (Claude side gateway)"
 # ------------------------------------------------------------------------------
+if [ "$USE_CLAUDE" != yes ]; then
+  ok "Skipping 9Router -- only needed for the Claude tiers, which you did not select."
+  ANTHROPIC_BASE_URL_INPUT="http://127.0.0.1:20128"
+  ANTHROPIC_API_KEY_INPUT="unused"
+else
 ask "Do you already have a 9Router instance running that this agent should use? [y/N] " HAVE_9ROUTER
 if [[ "${HAVE_9ROUTER:-}" =~ ^[Yy]$ ]]; then
   ask "9Router base URL (e.g. http://127.0.0.1:20128): " ANTHROPIC_BASE_URL_INPUT
@@ -173,6 +253,8 @@ else
   ask "Paste the 9Router API key once you've completed the dashboard setup above: " ANTHROPIC_API_KEY_INPUT
 fi
 
+fi
+
 # ------------------------------------------------------------------------------
 say "Step 6/9 -- Telegram bot"
 # ------------------------------------------------------------------------------
@@ -199,6 +281,10 @@ CLAUDE_MODEL_FALLBACK=cc/claude-sonnet-5
 AGY_BIN=${AGY_BIN_PATH}
 AGY_MODEL_PRIMARY=gemini-3.7-flash-medium
 AGY_MODEL_FALLBACK=gemini-3.1-pro-low
+
+# The fallback chain, tried left to right: provider:model:label.
+# Reorder, drop an entry, or swap a model here -- no code change needed.
+TIERS=${TIERS_VALUE}
 EOF
 chmod 600 "$ENV_FILE"
 ok ".env written and locked down (chmod 600)."
@@ -248,7 +334,10 @@ echo "     everything above it is yours. See examples/proxmox/ for a worked refe
 echo "  2. ${BOLD}Set up access${RESET} from this machine to whatever you want the agent to"
 echo "     manage (SSH key + ~/.ssh/config, kubeconfig, etc), matching what you"
 echo "     described during the brief step."
-echo "  3. If you skipped agy login above, run: ${AGY_BIN_PATH}"
+if [ "$USE_AGY" = yes ]; then
+echo "  3. If you skipped the Antigravity sign-in above, run:"
+echo "     ${CYAN}python3 ${INSTALL_DIR}/tools/agy_login.py${RESET}"
+fi
 echo ""
 echo "Then start it:"
 echo "  ${CYAN}sudo systemctl enable --now lite-agent${RESET}"
