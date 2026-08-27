@@ -208,6 +208,23 @@ FILE_URI_RE = re.compile(r"file://(/[^\s\)\]\"'>]+)")
 # and THIS code decides where it lands -- always appended inside the LEARNED
 # zone, never anywhere else. The zone boundary is then enforced structurally
 # rather than by the model's cooperation.
+_SECRET_ENV_KEYS = ("TELEGRAM_BOT_TOKEN", "ANTHROPIC_API_KEY")
+
+_SECRETS = tuple(
+    v for v in (os.environ.get(k, "") for k in _SECRET_ENV_KEYS)
+    if len(v) >= 12  # short/blank values would match everywhere
+)
+
+def redact_secrets(text: str) -> tuple[str, bool]:
+    """-> (clean_text, was_redacted)."""
+    found = False
+    for secret in _SECRETS:
+        if secret in text:
+            text = text.replace(secret, "[REDACTED]")
+            found = True
+    return text, found
+
+
 LEARN_LINE_RE = re.compile(r"^\s*LEARN:\s*(.+?)\s*$", re.MULTILINE)
 LEARNED_ZONE_MARKER = "<!-- LEARNED_ZONE -->"
 # The LEARNED zone is re-sent at the start of every new conversation, so
@@ -230,6 +247,19 @@ logging.basicConfig(
     handlers=[logging.FileHandler(LOG_FILE), logging.StreamHandler()],
 )
 logger = logging.getLogger("lite-agent")
+# httpx logs every request URL at INFO -- and the Telegram bot token is IN the
+# URL path, so at one poll every 10s that writes the bot's own credential to
+# disk thousands of times a day (and to journald, which is readable more
+# widely). Nothing here needs a per-poll HTTP log line, so lift it to WARNING:
+# real HTTP problems still surface, the credential stops being written, and the
+# log stops being ~95% getUpdates noise.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+try:  # keep the log readable only by the user the service runs as
+    LOG_FILE.touch(exist_ok=True)
+    LOG_FILE.chmod(0o600)
+except OSError:  # pragma: no cover -- never worth failing startup over
+    pass
 
 
 # --------------------------------------------------------------------------
@@ -490,6 +520,59 @@ def _build_agy_prompt(prompt: str, include_env: bool = False) -> str:
     return "\n\n".join(parts)
 
 
+_FAILOVER_HINTS = (
+    "rate limit", "ratelimit", "429", "quota", "overloaded", "capacity",
+    "unauthenticated", "unauthorized", "401", "403", "auth", "credential",
+    "timeout", "timed out", "deadline", "unavailable", "503", "502", "500",
+    "connection", "network",
+)
+
+_TERMINAL_HINTS = (
+    "context length", "context window", "too long", "maximum context",
+    "token limit", "prompt is too", "safety", "blocked by", "content policy",
+    "recitation",
+)
+
+TIER_COOLDOWNS = (60, 300, 900)  # 1m, 5m, then 15m as the cap
+
+_tier_cooldown: dict[str, tuple[float, int]] = {}  # model -> (until_ts, consecutive_failures)
+
+def _classify_failure(exc: Exception) -> str:
+    """-> "failover" (try next tier) or "terminal" (stop, it'll fail everywhere)."""
+    msg = str(exc).lower()
+    for hint in _TERMINAL_HINTS:
+        if hint in msg:
+            return "terminal"
+    for hint in _FAILOVER_HINTS:
+        if hint in msg:
+            return "failover"
+    # Unknown failures get the benefit of the doubt and are treated as
+    # provider-specific -- the previous behaviour, kept so a novel error
+    # message doesn't silently stop the fallback chain working.
+    return "failover"
+
+def _tier_available(model: str) -> bool:
+    entry = _tier_cooldown.get(model)
+    if not entry:
+        return True
+    until, _ = entry
+    if _dt.datetime.now().timestamp() >= until:
+        return True
+    return False
+
+def _note_tier_failure(model: str) -> None:
+    _, fails = _tier_cooldown.get(model, (0.0, 0))
+    fails += 1
+    delay = TIER_COOLDOWNS[min(fails - 1, len(TIER_COOLDOWNS) - 1)]
+    _tier_cooldown[model] = (_dt.datetime.now().timestamp() + delay, fails)
+    logger.warning("tier %s on cooldown for %ds (consecutive failures: %d)", model, delay, fails)
+
+def _note_tier_success(model: str) -> None:
+    if model in _tier_cooldown:
+        logger.info("tier %s recovered", model)
+        _tier_cooldown.pop(model, None)
+
+
 def _run_agy_once(prompt: str, model: str, conversation_id: Optional[str]) -> dict:
     cmd = [
         AGY_BIN, "-p", prompt,
@@ -572,37 +655,65 @@ def run_combo(prompt: str, sess: dict, session_name: str) -> tuple[dict, str, li
     claude_sessions = sess.setdefault("claude", {})  # {model_name: session_id}
 
     for model in (AGY_MODEL_PRIMARY, AGY_MODEL_FALLBACK):
+        if not _tier_available(model):
+            attempts.append(f"agy:{model} SKIPPED (cooldown)")
+            continue
         conv_id = agy_convs.get(model)
         # Each tier keeps its OWN conversation, so "is this a fresh conversation"
         # is a per-model question -- the env brief has to go to whichever tier is
-        # starting from nothing, which may be the fallback even while the primary
-        # is already mid-conversation.
+        # starting from nothing, which may be the fallback even when the primary
+        # is mid-conversation.
         agy_prompt = _build_agy_prompt(prompt, include_env=(conv_id is None))
         try:
             parsed = _run_agy_once(agy_prompt, model, conv_id)
             u = parsed.get("usage", {}) or {}
             attempts.append(f"agy:{model} OK ({u.get('total_tokens', '?')} tok)")
             agy_convs[model] = parsed.get("conversation_id")
+            _note_tier_success(model)
             return _normalize_agy_result(parsed), model, attempts
         except Exception as exc:
-            attempts.append(f"agy:{model} FAILED ({exc})")
-            logger.warning("agy model=%s failed: %s", model, exc)
+            kind = _classify_failure(exc)
+            attempts.append(f"agy:{model} FAILED/{kind} ({exc})")
+            logger.warning("agy model=%s failed (%s): %s", model, kind, exc)
             agy_convs[model] = None  # don't try to resume a conversation that just errored
+            if kind == "terminal":
+                # The request itself is the problem -- the other three tiers would
+                # spend real quota to fail in exactly the same way.
+                raise RuntimeError(
+                    f"Request rejected and retrying elsewhere won't help: {exc}"
+                ) from exc
+            _note_tier_failure(model)
 
-    logger.warning("both Gemini tiers failed for session=%s, falling back to claude", session_name)
+    logger.warning("Gemini tiers unavailable for session=%s, falling back to claude", session_name)
     for model in (CLAUDE_MODEL_PRIMARY, CLAUDE_MODEL_FALLBACK):
+        if not _tier_available(model):
+            attempts.append(f"claude:{model} SKIPPED (cooldown)")
+            continue
         try:
             result = run_claude(prompt, claude_sessions.get(model), session_name, model)
             u = result.get("usage", {}) or {}
             total = sum(v for v in u.values() if isinstance(v, int))
             attempts.append(f"claude:{model} OK ({total} tok)")
             claude_sessions[model] = result.get("session_id")
+            _note_tier_success(model)
             return result, model, attempts
         except Exception as exc:
-            attempts.append(f"claude:{model} FAILED ({exc})")
-            logger.warning("claude model=%s failed: %s", model, exc)
+            kind = _classify_failure(exc)
+            attempts.append(f"claude:{model} FAILED/{kind} ({exc})")
+            logger.warning("claude model=%s failed (%s): %s", model, kind, exc)
             claude_sessions[model] = None
+            if kind == "terminal":
+                raise RuntimeError(
+                    f"Request rejected and retrying elsewhere won't help: {exc}"
+                ) from exc
+            _note_tier_failure(model)
 
+    # Everything was either tried and failed, or skipped as cooling down. If it
+    # was ALL cooldowns we haven't actually spent anything -- clear them and let
+    # the next message retry properly, rather than staying dark indefinitely.
+    if all("SKIPPED" in a for a in attempts):
+        _tier_cooldown.clear()
+        raise RuntimeError("All tiers are cooling down after recent failures; try again shortly.")
     raise RuntimeError(f"All 4 tiers failed: {' -> '.join(attempts)}")
 
 
@@ -796,6 +907,9 @@ async def _reply_chunked(update: Update, text: str, tag_html: str = "") -> None:
     """Send a (possibly long) model reply, formatted. `tag_html` is appended to
     the LAST chunk only and is passed through as trusted HTML -- it's our own
     backend label, not model output."""
+    text, redacted = redact_secrets(text)
+    if redacted:
+        logger.warning("outbound message contained a known secret -- redacted before sending")
     chunks = _chunk_lines(text, 3500)
     for idx, chunk in enumerate(chunks):
         body = _md_to_telegram_html(chunk)
@@ -890,6 +1004,23 @@ async def _send_media_file(update: Update, path: str, sent_hashes: set[str]) -> 
     if digest is not None and digest in sent_hashes:
         logger.info("skipped duplicate media file (same content already sent): %s", p)
         return
+    # Same gate as for text, applied to attachments: a report or script that
+    # happens to embed a credential must not leave the box. Refuse rather than
+    # silently strip -- rewriting someone's file on the way out would be worse
+    # than telling them why it wasn't sent.
+    if _SECRETS and size <= 8 * 1024 * 1024:
+        try:
+            blob = p.read_bytes().decode("utf-8", errors="ignore")
+        except OSError:
+            blob = ""
+        if any(s in blob for s in _SECRETS):
+            logger.error("REFUSED to send %s -- it contains a credential", p)
+            await update.message.reply_text(
+                f"🔒 *{p.name}* was not sent: it contains a credential "
+                f"(token/API key). Strip that out first if it really needs sending.",
+                parse_mode="Markdown",
+            )
+            return
     try:
         with p.open("rb") as f:
             await update.message.reply_document(
@@ -1098,6 +1229,24 @@ async def cmd_chatid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             "to an admin to be added to `ALLOWED_USER_IDS`."
         )
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
+def _is_trusted_origin(update: Update) -> bool:
+    """A private DM from a named ALLOWED_USER_IDS account.
+
+    This is the line between "may I answer this?" (_authorized, which includes
+    every member of a registered group) and "may this change durable state?".
+    Group membership is the weaker claim: the sender is whoever happens to be
+    in the group, and their message text is input this deployment does not
+    control. Answering it is fine; letting it write to the environment brief
+    is not.
+    """
+    chat = update.effective_chat
+    user = update.effective_user
+    return bool(
+        chat and chat.type == "private"
+        and user and user.id in ALLOWED_USER_IDS
+    )
 
 
 def _is_admin(update: Update) -> bool:
@@ -1347,309 +1496,6 @@ async def cmd_forget(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     )
 
 
-async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Cluster status with ZERO model tokens: runs the snapshot collector directly
-    and prints its already-digested output. This is the 'graduated skill' path --
-    a question we've already solved is answered by a script, not by re-deriving it
-    with an LLM every time."""
-    if not _authorized(update):
-        return
-    if not SNAPSHOT_SCRIPT.exists():
-        await update.message.reply_text(f"⚠️ Collector belum terpasang: {SNAPSHOT_SCRIPT}")
-        return
-    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
-    force = bool(context.args and context.args[0].lower() in ("force", "fresh", "-f"))
-    cmd = ["python3", str(SNAPSHOT_SCRIPT)] + (["--force"] if force else [])
-    try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
-    except subprocess.TimeoutExpired:
-        await update.message.reply_text("⚠️ Collector timeout (>120s).")
-        return
-    if proc.returncode != 0:
-        await update.message.reply_text(f"⚠️ Collector gagal: {proc.stderr[-500:]}")
-        return
-    logger.info("status command served (0 model tokens, force=%s)", force)
-    await _reply_chunked(update, f"```\n{proc.stdout.strip()}\n```")
-
-
-async def cmd_tools(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """List graduated skills. Zero model tokens -- just reads the registry."""
-    if not _authorized(update):
-        return
-    if not LIST_TOOLS_SCRIPT.exists():
-        await update.message.reply_text(f"⚠️ Belum terpasang: {LIST_TOOLS_SCRIPT}")
-        return
-    proc = subprocess.run(
-        ["python3", str(LIST_TOOLS_SCRIPT)], capture_output=True, text=True, timeout=30
-    )
-    out = proc.stdout.strip() or proc.stderr.strip() or "(kosong)"
-    await _reply_chunked(update, f"```\n{out}\n```")
-
-
-async def cmd_graduate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Turn the case just solved in this session into a reusable script.
-
-    Explicitly user-triggered, one bounded call, fixed instruction -- deliberately
-    NOT a background job that decides on its own what is worth saving."""
-    if not _authorized(update):
-        return
-    name = "-".join(context.args).strip().lower() if context.args else ""
-    if not name or not re.fullmatch(r"[a-z0-9][a-z0-9_-]*", name):
-        await update.message.reply_text(
-            "Usage: /graduate <script-name>\n"
-            "Example: /graduate backup-coverage\n"
-            "(lowercase letters, digits, - and _ only)"
-        )
-        return
-
-    chat_id = str(update.effective_chat.id)
-    sessions = load_sessions()
-    state = get_chat_state(sessions, chat_id)
-    active = state["active"]
-    claude_session_id = state["sessions"].get(active, {}).get("claude", {}).get(CLAUDE_MODEL_PRIMARY)
-    if not claude_session_id:
-        await update.message.reply_text(
-            "Belum ada percakapan Claude (dede iku) di sesi ini buat di-graduate (kalau turn "
-            "terakhir dijawab Gemini/mini, /graduate belum bisa lihat history-nya -- "
-            "keterbatasan saat ini, tiap backend punya history sendiri). Coba tanya ulang "
-            "sampai dijawab Claude dulu, atau selesaikan kasusnya, baru /graduate."
-        )
-        return
-
-    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
-    try:
-        result = run_claude(GRADUATE_INSTRUCTION.format(name=name), claude_session_id, active, CLAUDE_MODEL_PRIMARY)
-    except Exception as exc:
-        logger.exception("graduate failed")
-        await update.message.reply_text(f"⚠️ Error: {exc}")
-        return
-
-    new_session_id = result.get("session_id")
-    if new_session_id:
-        sessions = load_sessions()
-        state = get_chat_state(sessions, chat_id)
-        state["sessions"][active]["claude"][CLAUDE_MODEL_PRIMARY] = new_session_id
-        save_sessions(sessions)
-
-    usage = result.get("usage", {})
-    logger.info(
-        "graduate done: name=%s in=%s out=%s cache_read=%s",
-        name, usage.get("input_tokens"), usage.get("output_tokens"),
-        usage.get("cache_read_input_tokens"),
-    )
-    await _reply_chunked(update, result.get("result") or "(tidak ada respons)")
-
-
-async def cmd_chatid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Deliberately NOT gated by _authorized() -- its only job is to reveal IDs
-    needed for setup (registering a group in ALLOWED_GROUP_IDS, or a person in
-    ALLOWED_USER_IDS). It reveals no infra data and takes no action, so it's
-    safe to leave open even to people not yet authorized for anything else."""
-    chat = update.effective_chat
-    user = update.effective_user
-    kind = {"private": "DM pribadi", "group": "Grup", "supergroup": "Supergrup", "channel": "Channel"}.get(
-        chat.type, chat.type
-    )
-    lines = [
-        f"\U0001f4cd Chat ID ({kind}): `{chat.id}`",
-    ]
-    if user:
-        lines.append(f"\U0001f464 User ID kamu: `{user.id}`")
-    if chat.type != "private":
-        lines.append(
-            "\nBuat buka akses bot ini ke SEMUA anggota grup ini, minta admin ketik "
-            "`/registergroup` di grup ini (atau kirim Chat ID di atas ke admin)."
-        )
-    else:
-        lines.append(
-            "\nBuat minta akses personal (bukan lewat grup), kirim User ID di atas "
-            "ke admin buat ditambahkan ke `ALLOWED_USER_IDS`."
-        )
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
-
-
-def _is_admin(update: Update) -> bool:
-    """Stricter than _authorized(): TRUE only for someone in the named
-    ALLOWED_USER_IDS list, never via group-wide access. Granting a NEW group
-    access is deliberately not something being authorized-via-an-existing-
-    group is enough to do -- otherwise trust could cascade to groups the
-    original admin never intended (member of group A adds group B, etc.)."""
-    user = update.effective_user
-    return bool(user and user.id in ALLOWED_USER_IDS)
-
-
-async def cmd_registergroup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Admin-only, self-service group authorization -- no SSH/restart needed.
-    Mutates ALLOWED_GROUP_IDS in place (takes effect immediately for this
-    running process) and persists to allowed_groups.json (survives restart)."""
-    if not _is_admin(update):
-        # Deliberately don't reveal *why* -- same denial shape whether the
-        # command doesn't exist or the user isn't allowed to use it.
-        return
-    chat = update.effective_chat
-    if chat.type == "private":
-        await update.message.reply_text(
-            "Command ini buat grup, bukan DM pribadi -- jalankan di dalam grup yang mau dibuka aksesnya."
-        )
-        return
-    if chat.id in ALLOWED_GROUP_IDS:
-        await update.message.reply_text(f"Grup ini (`{chat.id}`) sudah terdaftar sebelumnya.", parse_mode="Markdown")
-        return
-    ALLOWED_GROUP_IDS.add(chat.id)
-    _save_allowed_groups_file(ALLOWED_GROUP_IDS)
-    logger.info("group registered by admin: chat_id=%s title=%s", chat.id, chat.title)
-    await update.message.reply_text(
-        f"✅ Grup *{chat.title or chat.id}* terdaftar. Semua anggota sekarang bisa pakai bot ini.",
-        parse_mode="Markdown",
-    )
-
-
-async def cmd_unregistergroup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Admin-only. Revokes a group's whole-group access; per-person entries in
-    ALLOWED_USER_IDS (if any of that group's members were also individually
-    whitelisted) are untouched."""
-    if not _is_admin(update):
-        return
-    chat = update.effective_chat
-    if chat.id not in ALLOWED_GROUP_IDS:
-        await update.message.reply_text("Grup ini belum/tidak terdaftar.")
-        return
-    ALLOWED_GROUP_IDS.discard(chat.id)
-    _save_allowed_groups_file(ALLOWED_GROUP_IDS)
-    logger.info("group unregistered by admin: chat_id=%s title=%s", chat.id, chat.title)
-    await update.message.reply_text(f"Akses grup *{chat.title or chat.id}* dicabut.", parse_mode="Markdown")
-
-
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not _authorized(update):
-        await update.message.reply_text("Maaf, kamu belum diotorisasi buat pakai bot ini.")
-        return
-    await update.message.reply_text(
-        "\U0001f44b Lite Agent siap. Kirim pesan apa aja buat mulai (cek status VM, "
-        "investigasi, bikin laporan, dll).\n\n"
-        "Ketik /help buat panduan lengkap + daftar semua command.\n\n"
-        "\U0001f680 Designed by Koko Ali & Dede · Developed by Infrasoft.cloud & BSCloud.id Team\n"
-        "Happy smart working! ✨"
-    )
-
-
-_HELP_CREDITS = (
-    "━━━━━━━━━━━━━━━━━━━\n"
-    "\U0001f680 *Designed by Koko Ali & Dede*\n"
-    "\U0001f4bb *Developed by Infrasoft.cloud & BSCloud.id Team*\n\n"
-    "Happy smart working! ✨\U0001f929\U0001f60e"
-)
-
-HELP_TEXT_ID = f"""\U0001f4d6 *Lite Agent — Panduan Pakai*
-
-*Cara kerja singkat*
-Tiap pesan dicoba lewat 4 tingkatan model, dari yang paling murah dulu:
-1. {BACKEND_LABELS[AGY_MODEL_PRIMARY]} — Gemini Flash (fixed-price, utama)
-2. {BACKEND_LABELS[AGY_MODEL_FALLBACK]} — Gemini Pro-low (fallback ke-1)
-3. {BACKEND_LABELS[CLAUDE_MODEL_PRIMARY]} — Claude Haiku (fallback ke-2)
-4. {BACKEND_LABELS[CLAUDE_MODEL_FALLBACK]} — Claude Sonnet (fallback terakhir)
-
-Tiap jawaban diakhiri tanda "— by ...". Kalau yang jawab BUKAN "{BACKEND_LABELS[AGY_MODEL_PRIMARY]}", itu tanda ada yang lagi bermasalah di tingkat sebelumnya (rate limit, auth, dll) — bisa dipakai buat mantau kesehatan sistem.
-
-*Command tersedia*
-/status — kondisi cluster instan, NOL token (langsung dari script, bukan model)
-/tools — daftar skill yang sudah jadi script, NOL token
-/graduate <nama> — ubah kasus yang BARU SAJA selesai jadi script reusable (nol biaya kalau dipakai ulang lewat /status-style tools)
-/new — mulai ulang sesi AKTIF dari nol (riwayat percakapan direset, MEMORY.md tetap ada)
-/session <nama> — buat/pindah ke sesi bernama, buat pisahin kasus berbeda
-/sessions — lihat semua sesi tersimpan
-/remember <fakta> — simpan fakta PERMANEN, ikut kebaca di SEMUA sesi & SEMUA model, walau sudah /new berkali-kali
-/memory — lihat isi memory saat ini
-/learned — lihat apa saja yang agent pelajari SENDIRI soal lingkungan ini
-/forget <nomor> — hapus satu catatan hasil belajar yang keliru (nomornya dari /learned)
-/help — panduan ini (pilih EN atau ID)
-
-*Biar tetap irit, 3 kebiasaan penting*
-1. *`/new` tiap ganti topik.* Riwayat percakapan yang nyambung itu MAHAL — makin panjang, makin mahal tiap turn berikutnya (bisa 10-20x lipat kalau dibiarkan menumpuk). Infra hari ini beres → mau nanya hal lain (berita, dll)? `/new` dulu.
-2. *Jangan `/new` di ANTARA "bikin laporan" dan "kirim ke saya".* Sesi fresh nggak ingat laporan mana yang baru dibuat — kalau langsung tanya "kirim filenya" di sesi baru, dia bakal nyari SEMUA laporan lama yang ada dan nawarin semuanya.
-3. *Fakta penting → `/remember`, bukan andalkan riwayat chat.* Kasus yang sudah kelar/diputuskan, taruh di `/remember` biar nggak ditanyain ulang atau terulang — ini SATU-SATUNYA hal yang bertahan lintas `/new`.
-
-*Pakai di Grup Telegram*
-Kalau grup ini sudah didaftarkan admin (lihat status pakai `/chatid`), SEMUA anggota grup otomatis bisa kasih command ke bot — nggak perlu izin satu-satu.
-1. Kalau bot cuma respons *command* (`/status` dst), bukan chat biasa — mention bot-nya (`@namabot ...`) atau reply pesan bot biar tetap kebaca (ini pengaturan default Telegram, bukan batasan kita).
-2. Sesi (`/new`, `/session`) di grup ini *terpisah* dari DM pribadi masing-masing anggota — aman nggak nyampur. Tapi `/remember` itu *GLOBAL* buat SEMUA chat termasuk grup ini — kalau ada yang `/remember` sesuatu, semua orang di sini (dan di chat lain bot ini) bisa lihat lewat `/memory`.
-3. Grup ini belum otomatis punya akses? Admin tinggal ketik `/registergroup` di grup ini — langsung aktif, nggak perlu restart apapun. (`/unregistergroup` buat cabut lagi.)
-
-{_HELP_CREDITS}"""
-
-HELP_TEXT_EN = f"""\U0001f4d6 *Lite Agent — Usage Guide*
-
-*How it works*
-Every message is tried through 4 tiers, cheapest first:
-1. {BACKEND_LABELS[AGY_MODEL_PRIMARY]} — Gemini Flash (fixed-price, primary)
-2. {BACKEND_LABELS[AGY_MODEL_FALLBACK]} — Gemini Pro-low (fallback #1)
-3. {BACKEND_LABELS[CLAUDE_MODEL_PRIMARY]} — Claude Haiku (fallback #2)
-4. {BACKEND_LABELS[CLAUDE_MODEL_FALLBACK]} — Claude Sonnet (last resort)
-
-Every reply ends with a "— by ..." tag. If it's ever NOT "{BACKEND_LABELS[AGY_MODEL_PRIMARY]}", that's a signal something upstream is having trouble (rate limit, auth, etc) -- useful for keeping an eye on system health at a glance.
-
-*Available commands*
-/status — instant status check, ZERO tokens (straight from a script, not a model)
-/tools — list of skills already turned into scripts, ZERO tokens
-/graduate <name> — turn the case you JUST solved into a reusable script (free to reuse afterward)
-/new — restart the ACTIVE session from scratch (conversation history reset, MEMORY.md untouched)
-/session <name> — create/switch to a named session, for keeping different cases separate
-/sessions — list all saved sessions
-/remember <fact> — save a fact PERMANENTLY, read in EVERY session & EVERY tier, even after many /new
-/memory — view current memory contents
-/learned — see what the agent figured out about this environment BY ITSELF
-/forget <number> — delete one wrong learned fact (numbers come from /learned)
-/learned — see what the agent figured out about this environment BY ITSELF
-/forget <number> — delete one wrong learned fact (numbers come from /learned)
-/help — this guide (choose EN or ID)
-
-*3 habits that keep it cheap*
-1. *`/new` every time the topic changes.* A continuing conversation history is EXPENSIVE -- the longer it gets, the more expensive every next turn (can be 10-20x if left to pile up). Infra case closed → want to ask something unrelated? `/new` first.
-2. *Don't `/new` BETWEEN "generate a report" and "send it to me".* A fresh session has no memory of which report was just made -- ask "send the file" in a new session and it'll go looking through every old report that exists and offer all of them.
-3. *Important facts → `/remember`, not chat history.* Cases that are closed/decided go into `/remember` so they don't get re-asked or re-investigated -- this is the ONLY thing that survives across `/new`.
-
-*Using it in a Telegram Group*
-If this group has been registered by an admin (check with `/chatid`), EVERY member can give the bot commands automatically -- no per-person whitelist needed.
-1. If the bot only responds to *commands* (`/status` etc), not plain messages -- mention it (`@botname ...`) or reply to one of its messages to make sure it's seen (that's Telegram's own default setting, not a limitation on our end).
-2. Sessions (`/new`, `/session`) in this group are *separate* from each member's private DM -- safely isolated. But `/remember` is *GLOBAL* across every chat including this group -- if someone remembers a fact here, everyone here (and in every other chat with this bot) can see it via `/memory`.
-3. This group doesn't have access yet? An admin just needs to type `/registergroup` here -- takes effect immediately, no restart needed. (`/unregistergroup` to revoke it again.)
-
-{_HELP_CREDITS}"""
-
-_HELP_LANG_KEYBOARD = InlineKeyboardMarkup(
-    [[
-        InlineKeyboardButton("\U0001f1ee\U0001f1e9 Indonesia", callback_data="help_id"),
-        InlineKeyboardButton("\U0001f1ec\U0001f1e7 English", callback_data="help_en"),
-    ]]
-)
-
-_HELP_LANG_PROMPT = "Pilih bahasa / Choose a language:"
-
-
-async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not _authorized(update):
-        return
-    arg = (context.args[0].lower() if context.args else "").strip()
-    if arg in ("id", "indonesia", "indonesian"):
-        await update.message.reply_text(HELP_TEXT_ID, parse_mode="Markdown")
-        return
-    if arg in ("en", "english"):
-        await update.message.reply_text(HELP_TEXT_EN, parse_mode="Markdown")
-        return
-    await update.message.reply_text(_HELP_LANG_PROMPT, reply_markup=_HELP_LANG_KEYBOARD)
-
-
-async def cmd_help_lang_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Callback for the /help language-picker buttons."""
-    query = update.callback_query
-    if not _authorized(update):
-        await query.answer()
-        return
-    text = HELP_TEXT_ID if query.data == "help_id" else HELP_TEXT_EN
-    await query.answer()
-    await query.edit_message_text(text, parse_mode="Markdown")
-
-
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _authorized(update):
         return
@@ -1686,6 +1532,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     # Persist BEFORE delivery: if Telegram is having a bad moment, the thing the
     # agent worked out about this environment shouldn't be lost with the message.
+    #
+    # But only from a trusted origin. A turn driven by a group member is a turn
+    # driven by input we don't control, and a "fact" learned from it outlives
+    # the conversation -- it gets re-read at the start of every future one. That
+    # turns a single bad message into permanent context poisoning. Reading and
+    # answering from a group is fine; writing to long-term memory from one is
+    # not, so the learned zone only accepts facts from a trusted DM.
+    if learned_facts and not _is_trusted_origin(update):
+        logger.warning(
+            "ignored %d LEARN: line(s) from an untrusted origin (chat=%s)",
+            len(learned_facts), chat_id,
+        )
+        learned_facts = []
     newly_learned = append_learned(learned_facts) if learned_facts else []
 
     # The model has ALREADY produced (and been quota-billed for) a real answer at
