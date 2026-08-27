@@ -33,22 +33,19 @@ Telegram message
       |
       +-- 1. agy (Antigravity CLI) -- Gemini Flash        "mini"       (fixed-price, Google AI Pro/Ultra)
       +-- 2. agy (Antigravity CLI) -- Gemini Pro-low       "mini pro"   (fixed-price, Google AI Pro/Ultra)
-      +-- 3. claude (Claude Code CLI) via 9Router -- Haiku "dede iku"   (fixed-price, Claude Pro/Max)
-      +-- 4. claude (Claude Code CLI) via 9Router -- Sonnet "dede nnet" (fixed-price, Claude Pro/Max)
+      +-- 3. claude (Claude Code CLI) -- Haiku             "dede iku"   (fixed-price, Claude Pro/Max)
+      +-- 4. claude (Claude Code CLI) -- Sonnet            "dede nnet"  (fixed-price, Claude Pro/Max)
 ```
 
 **Both sides are fixed-price subscriptions, not pay-per-token API billing.** Gemini runs
-on a Google AI Pro/Ultra plan via agy (native, first-party CLI -- not an OAuth
-credential borrowed through a third-party relay). Claude runs on a Claude Pro (or
-higher) plan via 9Router's own Claude Code OAuth connection. Gemini is tried first not
-to dodge per-token cost (there isn't any here), but to spread routine load across a
-**separate** subscription and keep the Claude plan's own usage quota in reserve for
-when it's genuinely needed -- useful because that Claude quota is often shared with a
-human's own interactive Claude Code usage on the same account.
+on a Google AI Pro/Ultra plan via agy; Claude runs on a Claude Pro/Max plan via Claude
+Code's own sign-in. Both are first-party CLIs signing in to their own accounts -- no
+gateway, no relay, no borrowed credentials. Gemini is tried first not to dodge per-token
+cost (there isn't any here), but to spread routine load across a **separate**
+subscription and keep the Claude plan's quota in reserve for when it's genuinely
+needed -- useful because that quota is often shared with a human's own interactive
+Claude Code usage on the same account.
 
-- **Claude Code** runs through **9Router** (a local multi-provider LLM gateway) as the
-  fallback for when Gemini can't handle something. 9Router is a separate project this
-  repo does not include -- see [9Router setup](#9router-setup) below.
 - Every reply ends with a small tag (`— by mini`, `— by dede nnet`, etc.) showing which
   tier actually answered, so escalations away from the cheap default are visible at a
   glance without digging through logs.
@@ -82,12 +79,17 @@ cd lite-agent
 ./install.sh
 ```
 
-The installer is interactive and walks through: system dependencies, Python venv,
-Claude Code CLI, Antigravity CLI (agy) + its OAuth login, 9Router (use an existing
-instance, or install one fresh), your Telegram bot token + admin user ID, the
-environment brief, and a systemd service. Full detail: [`install.sh`](./install.sh)
-is heavily commented -- read it before running if you want to know exactly what it
-does first.
+The installer's job is small on purpose: system dependencies, a Python venv, both
+CLIs, your Telegram bot token, the environment brief, and a systemd service. That's
+it — enough to get the bot answering.
+
+**Everything else happens in Telegram.** Send `/start` and a setup card walks through
+what's left: signing in to Gemini, signing in to Claude, and setting the PIN. Each
+sign-in is a URL to open and a code to paste back; you can stop halfway and come back.
+`/start` again any time to see what's still outstanding or change something.
+
+That split is deliberate. Anything needing a browser or a decision belongs where the
+operator already is, not in a terminal session they have to keep open.
 
 **Not just for Proxmox.** Nothing in the core assumes Proxmox, or infrastructure at
 all. [`examples/proxmox/`](./examples/proxmox/) is one worked example, not a required
@@ -125,17 +127,24 @@ where it lands: always inside the learned zone, never anywhere else. The boundar
 enforced by code, not by the model's cooperation. Bootstrap follows the same rule --
 your hard boundaries are copied in verbatim, never paraphrased by a model.
 
-### 9Router setup
+### Using a gateway instead (optional)
 
-[9Router](https://github.com/decolua/9router) is a separate open-source project (not
-included here) that iSmart-LA uses as the gateway for the Claude Code fallback tiers --
-it exposes a native Anthropic-compatible endpoint backed by a Claude Code OAuth login.
-The installer can install a fresh instance for you (asks a yes/no question up front),
-or you can point iSmart-LA at an existing instance if you already run one (e.g. shared
-across multiple iSmart-LA deployments). Either way, **the actual OAuth login to Claude
-happens in 9Router's own web dashboard** -- no installer can automate a browser login
-on your behalf, so this one manual step is unavoidable regardless of which path you
-choose.
+Claude Code signs in to your subscription directly, so **no gateway is needed** — this
+project used to route through [9Router](https://github.com/decolua/9router) and no
+longer does. Dropping it removed Node.js, npm, pm2, a second service to keep alive, and
+a separate dashboard login.
+
+The path is still there if you want it. Set **both** `ANTHROPIC_BASE_URL` and
+`ANTHROPIC_API_KEY` and traffic goes through that gateway instead. Two things to know:
+
+- Model ids may need the gateway's own provider prefix (9Router wants `cc/`; a bare id
+  404s there). Adjust `TIERS` accordingly.
+- When those two are unset they're actively **removed** from the CLI's environment, not
+  just skipped — an inherited value from your shell would otherwise silently override
+  the CLI's own sign-in and send traffic somewhere you didn't intend.
+
+A gateway is also the shortest route to models neither CLI speaks natively (a local
+Ollama, say), since something has to translate between protocols.
 
 ## Commands
 
