@@ -4032,7 +4032,8 @@ async def _run_turn(update: Update, context: ContextTypes.DEFAULT_TYPE, text: st
     # request -- the guard already decided; we are only reacting to it.
     if (_is_trusted_origin(update) and _keys_configured()
             and not write_mode_expires_at()
-            and blocked_by_readonly(result.get("result") or "", attempts)):
+            and (needs_write
+                 or blocked_by_readonly(result.get("result") or "", attempts))):
         await offer_unlock(
             update,
             needs_write or "make a change it was blocked from making",
