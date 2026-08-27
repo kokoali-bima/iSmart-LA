@@ -2893,7 +2893,7 @@ async def _pin_verified(update: Update, query, session: dict) -> None:
         return
 
     if action == "unlock_and_resume":
-        await _do_unlock_and_resume(update, query)
+        await _do_unlock_and_resume(update, context, query)
         return
 
     if action == "rmboundary":
@@ -3621,8 +3621,9 @@ async def offer_unlock(update: Update, reason: str, original_prompt: str,
     rows.append([InlineKeyboardButton("🔓 Unlock without a snapshot", callback_data="nw:nosnap")])
     rows.append([InlineKeyboardButton("✖️ Leave it locked", callback_data="nw:cancel")])
 
-    note = ("\n\n<i>I'll re-send your original request afterwards, so the agent picks up "
-            "where it stopped. That's a second turn — worth knowing for quota.</i>")
+    note = ("\n\n<i>Afterwards I'll tell the agent to continue — it keeps the same "
+            "conversation, so it doesn't re-investigate, just carries on. That is a "
+            "second turn, but a short one.</i>")
     if not vmid:
         note = ("\n\n<i>I couldn't tell which VM this is about, so there's no snapshot "
                 "offer. Snapshot it yourself first if it matters.</i>") + note
@@ -3662,7 +3663,8 @@ async def cmd_needwrite_button(update: Update, context: ContextTypes.DEFAULT_TYP
                       "🔓 Confirm opening write mode.")
 
 
-async def _do_unlock_and_resume(update: Update, query) -> None:
+async def _do_unlock_and_resume(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                                query) -> None:
     """PIN cleared: snapshot if asked, open write mode, then re-run the request."""
     chat_id = update.effective_chat.id
     pending = _pending_write.pop(chat_id, None)
@@ -3698,9 +3700,21 @@ async def _do_unlock_and_resume(update: Update, query) -> None:
         await query.message.reply_text(f"⚠️ Couldn't unlock: {exc}")
         return
     left = int((until - _dt.datetime.now().timestamp()) / 60) + 1
+
+    # Continue the SAME conversation rather than re-asking. The agent already
+    # holds the whole investigation from the blocked turn, so it needs a nudge,
+    # not the question again -- which would cost the prompt twice and invite it
+    # to repeat an explanation it has already given.
+    reason = (pending.get("reason") or "").strip()
+    if reason and reason != "make a change it was blocked from making":
+        follow_up = f"Write access is open now. Go ahead with: {reason}"
+    else:
+        # No NEEDS_WRITE line to quote, so fall back to the original request.
+        follow_up = pending["prompt"]
+
     await query.message.reply_text(
-        f"🔓 Write mode open for {left} min. Re-sending your request…")
-    await _run_turn(update, query.message, pending["prompt"])
+        f"🔓 Write mode open for {left} min. Telling the agent to continue…")
+    await _run_turn(update, context, follow_up)
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
