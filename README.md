@@ -156,6 +156,9 @@ choose.
 | `/unschedule <name>` | owner + DM only | Remove a scheduled task |
 | `/adopt` | owner + DM only | Bring pre-existing cron entries under management |
 | `/setpin` | owner, DM **or group** | Set/change the 6-digit PIN (keypad, never typed in chat) |
+| `/servers` | **0 tokens** | Machines the agent may reach |
+| `/addserver` | owner/admin + PIN | Register a new machine, step by step |
+| `/removeserver <name>` | owner/admin | Unregister one |
 | `/providers` | **0 tokens** | Which AI tiers are configured, and which are healthy |
 | `/mode` | **0 tokens** | Read-only right now, or able to change things? |
 | `/unlock [min]` | owner + DM only | Open a time-boxed window for real changes |
@@ -248,6 +251,32 @@ stays authoritative: a task can't change what it does or how much access it has 
 editing a crontab line, and a task removed with `/unschedule` stops running even
 if a stale cron line survives. Write access is granted for the duration of that
 one run, via a temporary `ssh` shim, and discarded afterwards.
+
+### Adding a server
+
+`/addserver` walks through it in chat: kind (hypervisor / single machine /
+other), flavour if it's a hypervisor, then a name, address, SSH user and port.
+
+**No private key ever passes through Telegram.** The bot generates the keypair
+on the host and shows you only the **public** half, with the one-line command to
+install it on the target. A private key sent as a chat message would be a
+permanent credential to production sitting in cleartext on servers you don't
+control — strictly worse than the password this project already declined, since
+a leaked key opens every node until somebody notices. It also means less typing:
+address, user, port. Nothing secret.
+
+Then it tests the connection, and for Proxmox offers a read-only cluster scan
+(which nodes exist, how many guests) — no write mode needed. Discovered nodes go
+into `~/.ssh/config` and into the agent's learned zone, so it can reach them from
+the next message on.
+
+`/servers` lists what's registered (0 tokens). `/removeserver <name>` unregisters
+one. Both `/addserver` and `/removeserver` are owner-or-group-admin, and
+`/addserver` asks for the PIN first — it grants access to a machine.
+
+Only a marked block of `~/.ssh/config` is ever rewritten; anything you put there
+by hand is copied through untouched (tested explicitly — clobbering somebody's
+own SSH config would be a worse bug than the one this fixes).
 
 ### Write mode
 

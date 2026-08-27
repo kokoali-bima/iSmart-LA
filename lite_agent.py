@@ -651,6 +651,160 @@ def redact_secrets(text: str) -> tuple[str, bool]:
 # asked for here.
 # --------------------------------------------------------------------------
 
+# --------------------------------------------------------------------------
+# Server inventory (/addserver, /servers, /removeserver)
+#
+# Adding a machine used to mean SSH-ing to this box and hand-editing ~/.ssh/config
+# plus the brief. Now it is a conversation, because that is where the operator
+# already is.
+#
+# NO PRIVATE KEY EVER PASSES THROUGH TELEGRAM. The bot generates the keypair here
+# and shows only the PUBLIC half, which you paste into the target's
+# authorized_keys. A private key sent as a chat message would be a permanent
+# credential to production sitting in cleartext on servers we don't control --
+# strictly worse than the password we already decided against, because a leaked
+# key opens every node until someone notices and revokes it.
+#
+# It also means fewer things to type: host, user, port. Nothing secret.
+# --------------------------------------------------------------------------
+
+SERVERS_FILE = BASE_DIR / "servers.json"
+SSH_CONFIG_FILE = Path.home() / ".ssh" / "config"
+SSH_CONFIG_BEGIN = "# BEGIN iSmart-LA managed -- edited by the bot, do not hand-edit"
+SSH_CONFIG_END = "# END iSmart-LA managed"
+SERVER_WIZARD_TTL = 900
+_server_wizard: dict[int, dict] = {}
+
+SERVER_KINDS = {
+    "hypervisor": "Hypervisor / cluster",
+    "vm": "Single VM or server",
+    "other": "Something else",
+}
+HYPERVISOR_FLAVOURS = {
+    "proxmox": "Proxmox VE",
+    "other_hv": "Other hypervisor",
+}
+_HOST_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._-]*$")
+_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,30}$")
+
+
+def _read_servers() -> list[dict]:
+    if not SERVERS_FILE.exists():
+        return []
+    try:
+        return json.loads(SERVERS_FILE.read_text())
+    except Exception:
+        logger.warning("servers.json unreadable", exc_info=True)
+        return []
+
+
+def _write_servers(items: list[dict]) -> None:
+    SERVERS_FILE.write_text(json.dumps(items, indent=2))
+
+
+def agent_keypair() -> tuple[Path, Path]:
+    """The key the agent presents to managed hosts.
+
+    Reuses the read-only key from write mode when that is set up, so a host
+    added here is reachable under the same lock/unlock rules as everything else
+    rather than quietly getting its own always-on access.
+    """
+    if SSH_RO_KEY.exists():
+        return SSH_RO_KEY, SSH_RO_KEY.with_suffix(".pub")
+    key = Path.home() / ".ssh" / "ismart_agent"
+    if not key.exists():
+        key.parent.mkdir(mode=0o700, exist_ok=True)
+        subprocess.run(
+            ["ssh-keygen", "-t", "ed25519", "-f", str(key), "-N", "", "-C", "ismart-la-agent"],
+            capture_output=True, text=True, check=True,
+        )
+        logger.warning("generated a new agent SSH keypair at %s", key)
+    return key, key.with_suffix(".pub")
+
+
+def _rebuild_ssh_config(items: list[dict]) -> None:
+    """Regenerate ONLY our managed block. Anything else in ~/.ssh/config is the
+    operator's and is copied through untouched."""
+    existing = SSH_CONFIG_FILE.read_text() if SSH_CONFIG_FILE.exists() else ""
+    if SSH_CONFIG_BEGIN in existing and SSH_CONFIG_END in existing:
+        head = existing.split(SSH_CONFIG_BEGIN)[0].rstrip("\n")
+        tail = existing.split(SSH_CONFIG_END, 1)[1].lstrip("\n")
+    else:
+        head, tail = existing.rstrip("\n"), ""
+
+    key = SSH_ACTIVE_KEY if SSH_ACTIVE_KEY.exists() else agent_keypair()[0]
+    block = [SSH_CONFIG_BEGIN]
+    for it in items:
+        for host in [it["host"], *it.get("cluster_hosts", [])]:
+            block += [
+                f"Host {host}",
+                f"    User {it['user']}",
+                f"    Port {it.get('port', 22)}",
+                f"    IdentityFile {key}",
+                "    StrictHostKeyChecking no",
+                "    ConnectTimeout 10",
+            ]
+    block.append(SSH_CONFIG_END)
+
+    SSH_CONFIG_FILE.parent.mkdir(mode=0o700, exist_ok=True)
+    SSH_CONFIG_FILE.write_text(
+        "\n".join(x for x in (head, "\n".join(block), tail) if x).rstrip("\n") + "\n"
+    )
+    SSH_CONFIG_FILE.chmod(0o600)
+
+
+def test_server_ssh(host: str, user: str, port: int, timeout: int = 20) -> tuple[bool, str]:
+    key, _ = agent_keypair()
+    proc = subprocess.run(
+        ["ssh", "-i", str(key), "-p", str(port),
+         "-o", "StrictHostKeyChecking=no", "-o", "BatchMode=yes",
+         "-o", f"ConnectTimeout={timeout}", f"{user}@{host}",
+         "echo ISMART_OK && uname -sr"],
+        capture_output=True, text=True, timeout=timeout + 10,
+    )
+    if "ISMART_OK" in proc.stdout:
+        detail = proc.stdout.replace("ISMART_OK", "").strip()
+        return True, detail or "connected"
+    return False, (proc.stderr or proc.stdout or "no response").strip()[-400:]
+
+
+def discover_proxmox(host: str, user: str, port: int) -> tuple[bool, str, list[str]]:
+    """Ask a Proxmox node what else is in its cluster, and how many guests.
+
+    Read-only (`pvesh get`), so it is safe to run without unlocking write mode.
+    """
+    key, _ = agent_keypair()
+
+    def run(cmd: str) -> str:
+        return subprocess.run(
+            ["ssh", "-i", str(key), "-p", str(port), "-o", "StrictHostKeyChecking=no",
+             "-o", "BatchMode=yes", "-o", "ConnectTimeout=15", f"{user}@{host}", cmd],
+            capture_output=True, text=True, timeout=90,
+        ).stdout
+
+    try:
+        nodes_raw = run("pvesh get /nodes --output-format json 2>/dev/null")
+        nodes = json.loads(nodes_raw) if nodes_raw.strip().startswith("[") else []
+        guests_raw = run("pvesh get /cluster/resources --type vm --output-format json 2>/dev/null")
+        guests = json.loads(guests_raw) if guests_raw.strip().startswith("[") else []
+    except Exception as exc:
+        return False, f"discovery failed: {exc}", []
+
+    if not nodes:
+        return False, "no Proxmox nodes reported -- is pvesh available for this user?", []
+
+    names = [n.get("node", "?") for n in nodes]
+    running = sum(1 for g in guests if g.get("status") == "running")
+    lines = [f"Found {len(names)} node(s): {', '.join(names)}",
+             f"Guests: {len(guests)} total, {running} running"]
+    for n in nodes:
+        lines.append(
+            f"  • {n.get('node')}: {n.get('status', '?')}"
+            f", {round(n.get('maxmem', 0) / 1024**3)}GB RAM"
+        )
+    return True, "\n".join(lines), names
+
+
 WIZARD_STATE_FILE = BASE_DIR / "setup_state.json"
 # chat_id -> {"step": ..., "login": LoginHandle, "expires": ts}
 _wizard: dict[int, dict] = {}
@@ -2129,6 +2283,9 @@ Every reply ends with a "— by ..." tag. If it's ever NOT "{TIERS[0]['label']}"
 /unschedule <name> — remove a scheduled task
 /adopt — bring pre-existing cron entries under management
 /setpin — set/change the 6-digit PIN (entered on a keypad, never typed in chat)
+/servers — machines the agent may reach (0 tokens)
+/addserver — register a new machine, step by step
+/removeserver <name> — unregister one
 /providers — which AI tiers are configured and which are healthy (0 tokens)
 /mode — read-only right now, or able to make changes? (0 tokens)
 /unlock [minutes] — owner-only, DM-only: allow real changes for a limited window
@@ -2501,6 +2658,10 @@ async def _pin_verified(update: Update, query, session: dict) -> None:
         await _begin_new_pin(update, query)
         return
 
+    if action == "addserver":
+        await _begin_addserver(update, query)
+        return
+
     if action == "schedule_install":
         item = payload["item"]
         try:
@@ -2757,10 +2918,337 @@ async def cmd_providers(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     await _reply_chunked(update, "\n".join(lines))
 
 
+async def cmd_addserver(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Register a machine the agent may reach. PIN first -- this grants access."""
+    if not _may_run_setup(update):
+        return
+    if not _is_owner(update) and not await _is_group_admin(update, context):
+        await update.message.reply_text("🔒 Bot owner or a group admin only.")
+        return
+    if pin_is_set():
+        await request_pin(update, "addserver", {}, "➕ Adding a server.")
+    else:
+        # Nothing to verify against yet. Say so plainly instead of pretending
+        # a gate exists -- and nudge, because this is exactly what it protects.
+        await update.message.reply_text(
+            "⚠️ No PIN is set, so this isn't protected yet. Set one with /setpin "
+            "when you're done — it's what stops a stolen Telegram session from "
+            "adding a server nobody noticed."
+        )
+        await _begin_addserver(update)
+
+
+async def _begin_addserver(update: Update, query=None) -> None:
+    _server_wizard[update.effective_chat.id] = {
+        "step": "kind", "data": {},
+        "expires": _dt.datetime.now().timestamp() + SERVER_WIZARD_TTL,
+    }
+    kb = InlineKeyboardMarkup(
+        [[InlineKeyboardButton(label, callback_data=f"srv:kind:{key}")]
+         for key, label in SERVER_KINDS.items()]
+        + [[InlineKeyboardButton("✖️ Cancel", callback_data="srv:cancel:")]]
+    )
+    text = "➕ <b>Add a server</b>\n\nWhat kind of machine is it?"
+    if query is not None:
+        await query.edit_message_text(text, parse_mode="HTML", reply_markup=kb)
+    else:
+        await update.effective_message.reply_text(text, parse_mode="HTML", reply_markup=kb)
+
+
+async def cmd_server_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    _, action, value = query.data.split(":", 2)
+    chat_id = update.effective_chat.id
+    if not _may_run_setup(update):
+        await query.answer("Not permitted.", show_alert=True)
+        return
+    await query.answer()
+
+    if action == "cancel":
+        _server_wizard.pop(chat_id, None)
+        await query.edit_message_text("✖️ Cancelled. Nothing was saved.")
+        return
+
+    state = _server_wizard.get(chat_id)
+    if not state:
+        await query.edit_message_text("That form expired. Run /addserver again.")
+        return
+    data = state["data"]
+
+    if action == "kind":
+        data["kind"] = value
+        if value == "hypervisor":
+            state["step"] = "flavour"
+            await query.edit_message_text(
+                "➕ <b>Add a server</b>\n\nWhich hypervisor?", parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup(
+                    [[InlineKeyboardButton(l, callback_data=f"srv:flavour:{k}")]
+                     for k, l in HYPERVISOR_FLAVOURS.items()]
+                    + [[InlineKeyboardButton("✖️ Cancel", callback_data="srv:cancel:")]]),
+            )
+            return
+        data["flavour"] = value
+        state["step"] = "name"
+        await query.edit_message_text(_srv_prompt("name"), parse_mode="HTML")
+        return
+
+    if action == "flavour":
+        data["flavour"] = value
+        state["step"] = "name"
+        await query.edit_message_text(_srv_prompt("name"), parse_mode="HTML")
+        return
+
+    if action == "cluster":
+        data["cluster_wide"] = (value == "yes")
+        state["step"] = "discover"
+        if data.get("flavour") != "proxmox":
+            await _finish_addserver(update, query)
+            return
+        await query.edit_message_text(
+            "🔍 Scan the cluster now?\n\nRead-only — it just asks which nodes exist "
+            "and how many guests are running. No changes, and it doesn't need write mode.",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("Yes, scan", callback_data="srv:discover:yes"),
+                InlineKeyboardButton("Skip", callback_data="srv:discover:no"),
+            ]]),
+        )
+        return
+
+    if action == "discover":
+        if value == "no":
+            await _finish_addserver(update, query)
+            return
+        await query.edit_message_text("🔍 Scanning… this can take a moment.")
+        loop = asyncio.get_running_loop()
+        ok, detail, nodes = await loop.run_in_executor(
+            None, discover_proxmox, data["host"], data["user"], data["port"])
+        if ok:
+            data["cluster_hosts"] = [n for n in nodes if n != data["host"]]
+            data["discovery"] = detail
+        await _finish_addserver(update, query, discovery=(detail if ok else f"scan failed: {detail}"))
+        return
+
+    if action == "test":
+        await query.edit_message_text("🔌 Testing the connection…")
+        loop = asyncio.get_running_loop()
+        ok, detail = await loop.run_in_executor(
+            None, test_server_ssh, data["host"], data["user"], data["port"])
+        if not ok:
+            await query.edit_message_text(
+                f"❌ Couldn't connect:\n<pre>{_tg_escape(detail)}</pre>\n\n"
+                "Usually the public key isn't in place yet, or the user/port is off.",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("🔁 Test again", callback_data="srv:test:"),
+                    InlineKeyboardButton("✖️ Cancel", callback_data="srv:cancel:"),
+                ]]))
+            return
+        data["probe"] = detail
+        if data.get("flavour") == "proxmox":
+            state["step"] = "cluster"
+            await query.edit_message_text(
+                f"✅ Connected. <code>{_tg_escape(detail)}</code>\n\n"
+                "Does this same key reach <b>every node</b> in the cluster?",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("Yes", callback_data="srv:cluster:yes"),
+                    InlineKeyboardButton("No, just this one", callback_data="srv:cluster:no"),
+                ]]))
+            return
+        await _finish_addserver(update, query)
+        return
+
+
+def _srv_prompt(step: str) -> str:
+    return {
+        "name": "➕ <b>Name</b>\n\nA short label for this machine — lowercase, digits, "
+                "<code>-</code> or <code>_</code>.\n\ne.g. <code>pm-cluster</code>\n\n"
+                "Send it as a message. /cancel to stop.",
+        "host": "➕ <b>Address</b>\n\nIP or hostname.\n\n<i>Prefer the raw IP unless you've "
+                "checked what DNS returns — wildcard records pointing at a proxy are common, "
+                "and then you'd be talking to the proxy instead of the machine.</i>",
+        "user": "➕ <b>SSH user</b>\n\ne.g. <code>root</code> or <code>ubuntu</code>",
+        "port": "➕ <b>SSH port</b>\n\nSend <code>22</code> for the default.",
+    }[step]
+
+
+async def _handle_server_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Text steps of /addserver. Returns True if the message was consumed."""
+    chat_id = update.effective_chat.id
+    state = _server_wizard.get(chat_id)
+    if not state or state["step"] not in ("name", "host", "user", "port"):
+        return False
+    if state["expires"] < _dt.datetime.now().timestamp():
+        _server_wizard.pop(chat_id, None)
+        await update.message.reply_text("⌛ That form expired. Run /addserver again.")
+        return True
+
+    text = (update.message.text or "").strip()
+    if text.lower() in ("/cancel", "cancel", "batal"):
+        _server_wizard.pop(chat_id, None)
+        await update.message.reply_text("✖️ Cancelled. Nothing was saved.")
+        return True
+
+    step, data = state["step"], state["data"]
+    if step == "name":
+        if not _NAME_RE.match(text):
+            await update.message.reply_text("Lowercase letters, digits, - and _ only. Try again.")
+            return True
+        if any(s["name"] == text for s in _read_servers()):
+            await update.message.reply_text(f"'{text}' already exists. Pick another name.")
+            return True
+        data["name"] = text
+        state["step"] = "host"
+        await update.message.reply_text(_srv_prompt("host"), parse_mode="HTML")
+        return True
+
+    if step == "host":
+        if not _HOST_RE.match(text):
+            await update.message.reply_text("That doesn't look like an IP or hostname. Try again.")
+            return True
+        data["host"] = text
+        state["step"] = "user"
+        await update.message.reply_text(_srv_prompt("user"), parse_mode="HTML")
+        return True
+
+    if step == "user":
+        if not re.match(r"^[a-z_][a-z0-9_-]{0,31}$", text):
+            await update.message.reply_text("That doesn't look like a username. Try again.")
+            return True
+        data["user"] = text
+        state["step"] = "port"
+        await update.message.reply_text(_srv_prompt("port"), parse_mode="HTML")
+        return True
+
+    # port -> show the public key and wait for them to install it
+    if not text.isdigit() or not (1 <= int(text) <= 65535):
+        await update.message.reply_text("Port must be a number between 1 and 65535.")
+        return True
+    data["port"] = int(text)
+    state["step"] = "authorize"
+
+    loop = asyncio.get_running_loop()
+    try:
+        _, pub = await loop.run_in_executor(None, agent_keypair)
+        pubkey = pub.read_text().strip()
+    except Exception as exc:
+        logger.exception("could not prepare the agent keypair")
+        _server_wizard.pop(chat_id, None)
+        await update.message.reply_text(f"⚠️ Couldn't prepare an SSH key: {exc}")
+        return True
+
+    await update.message.reply_text(
+        f"🔑 <b>Authorise the agent on {_tg_escape(data['host'])}</b>\n\n"
+        "Run this <b>on that machine</b>, as "
+        f"<code>{_tg_escape(data['user'])}</code>:\n\n"
+        f"<pre>mkdir -p ~/.ssh &amp;&amp; echo '{_tg_escape(pubkey)}' &gt;&gt; "
+        "~/.ssh/authorized_keys &amp;&amp; chmod 600 ~/.ssh/authorized_keys</pre>\n\n"
+        "<i>That's the PUBLIC half. I generated the pair here and the private half "
+        "never leaves this box — which is why I don't ask you to paste a key into "
+        "chat.</i>\n\nThen tap Test.",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("🔌 Test connection", callback_data="srv:test:"),
+            InlineKeyboardButton("✖️ Cancel", callback_data="srv:cancel:"),
+        ]]),
+    )
+    return True
+
+
+async def _finish_addserver(update: Update, query, discovery: str = "") -> None:
+    chat_id = update.effective_chat.id
+    state = _server_wizard.pop(chat_id, None)
+    if not state:
+        return
+    data = state["data"]
+    items = [s for s in _read_servers() if s["name"] != data["name"]]
+    items.append({
+        **data,
+        "added_by": update.effective_user.id,
+        "added_at": _dt.datetime.now().strftime("%Y-%m-%d %H:%M"),
+    })
+    try:
+        _rebuild_ssh_config(items)
+    except Exception as exc:
+        logger.exception("ssh config update failed")
+        await query.edit_message_text(f"⚠️ Saved nothing — couldn't update ~/.ssh/config: {exc}")
+        return
+    _write_servers(items)
+    logger.warning("SERVER ADDED name=%s host=%s by=%s",
+                   data["name"], data["host"], update.effective_user.id)
+
+    # Record it where the agent will actually read it next conversation.
+    fact = (f"Server '{data['name']}' ({SERVER_KINDS.get(data.get('kind'), '?')}"
+            f"{'/' + data['flavour'] if data.get('flavour') else ''}) is reachable at "
+            f"{data['host']} as {data['user']} on port {data['port']}.")
+    append_learned([fact])
+    if data.get("cluster_hosts"):
+        append_learned([f"Cluster nodes alongside {data['name']}: "
+                        f"{', '.join(data['cluster_hosts'][:20])}."])
+
+    msg = (f"✅ <b>{_tg_escape(data['name'])} added.</b>\n\n"
+           f"<code>{_tg_escape(data['user'])}@{_tg_escape(data['host'])}"
+           f":{data['port']}</code>\n")
+    if discovery:
+        msg += f"\n<pre>{_tg_escape(discovery)}</pre>\n"
+    msg += ("\nIt's in <code>~/.ssh/config</code> and recorded in the agent's brief, "
+            "so it can reach it from the next message onward.\n\n/servers to review.")
+    await query.edit_message_text(msg, parse_mode="HTML")
+
+
+async def cmd_servers(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Everything the agent has been told it may reach. Zero tokens."""
+    if not _authorized(update):
+        return
+    items = _read_servers()
+    if not items:
+        return await update.message.reply_text(
+            "🖥 No servers registered.\n\nAdd one with /addserver.")
+    lines = [f"🖥 <b>Registered servers ({len(items)})</b>", ""]
+    for it in items:
+        kind = SERVER_KINDS.get(it.get("kind"), "?")
+        if it.get("flavour") and it["flavour"] != it.get("kind"):
+            kind += f" / {HYPERVISOR_FLAVOURS.get(it['flavour'], it['flavour'])}"
+        lines.append(
+            f"• <b>{_tg_escape(it['name'])}</b> — {_tg_escape(kind)}\n"
+            f"  <code>{_tg_escape(it['user'])}@{_tg_escape(it['host'])}:{it.get('port', 22)}</code>"
+            + (f"\n  cluster: {len(it['cluster_hosts']) + 1} nodes" if it.get("cluster_hosts") else "")
+            + f"\n  added {it.get('added_at', '?')}"
+        )
+    lines.append("\nRemove one: /removeserver &lt;name&gt;")
+    await _reply_chunked(update, "\n".join(lines))
+
+
+async def cmd_removeserver(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _may_run_setup(update):
+        return
+    if not _is_owner(update) and not await _is_group_admin(update, context):
+        await update.message.reply_text("🔒 Bot owner or a group admin only.")
+        return
+    name = (context.args[0] if context.args else "").strip()
+    if not name:
+        return await update.message.reply_text(
+            "Usage: /removeserver <name>\nSee names with /servers")
+    items = _read_servers()
+    kept = [s for s in items if s["name"] != name]
+    if len(kept) == len(items):
+        return await update.message.reply_text(f"No server named '{name}'. See /servers")
+    _rebuild_ssh_config(kept)
+    _write_servers(kept)
+    logger.warning("SERVER REMOVED name=%s by=%s", name, update.effective_user.id)
+    await update.message.reply_text(
+        f"🗑 Removed <b>{_tg_escape(name)}</b> from ~/.ssh/config.\n\n"
+        "<i>The agent may still mention it from what it learned earlier — "
+        "check /learned and /forget if that matters.</i>",
+        parse_mode="HTML")
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _authorized(update):
         return
     if await _handle_wizard_input(update, context):
+        return
+    if await _handle_server_input(update, context):
         return
     chat_id = str(update.effective_chat.id)
     text = update.message.text or ""
@@ -2901,6 +3389,10 @@ def main() -> None:
     app.add_handler(CommandHandler("memory", cmd_memory))
     app.add_handler(CommandHandler("setpin", cmd_setpin))
     app.add_handler(CallbackQueryHandler(cmd_pin_key, pattern="^pin:"))
+    app.add_handler(CommandHandler("addserver", cmd_addserver))
+    app.add_handler(CommandHandler("servers", cmd_servers))
+    app.add_handler(CommandHandler("removeserver", cmd_removeserver))
+    app.add_handler(CallbackQueryHandler(cmd_server_button, pattern="^srv:"))
     app.add_handler(CommandHandler("providers", cmd_providers))
     app.add_handler(CommandHandler("schedules", cmd_schedules))
     app.add_handler(CommandHandler("unschedule", cmd_unschedule))
