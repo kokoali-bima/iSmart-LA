@@ -57,6 +57,9 @@ from typing import Optional
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.error import BadRequest
+
+sys.path.insert(0, str(Path(__file__).resolve().parent / "tools"))
+from cli_login import LoginHandle, tmux_available  # noqa: E402
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -133,16 +136,23 @@ ALLOWED_GROUP_IDS: set[int] = (
     | _load_allowed_groups_file()
 )
 
-ANTHROPIC_BASE_URL = os.environ.get("ANTHROPIC_BASE_URL", "http://127.0.0.1:20128")
-ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
+# Claude Code signs in to a Claude Pro/Max subscription itself (`claude auth
+# login`), so no gateway is needed. Setting BOTH of these routes it through an
+# Anthropic-compatible gateway instead -- 9Router, LiteLLM, whatever -- which is
+# how this project used to work and still can. Leave them unset for the simple
+# path.
+ANTHROPIC_BASE_URL = os.environ.get("ANTHROPIC_BASE_URL", "")
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+USE_GATEWAY = bool(ANTHROPIC_BASE_URL and ANTHROPIC_API_KEY)
 # Explicit literal models, not a 9Router combo alias (e.g. "combo-bayar") --
 # a combo hides which underlying model actually answered from us (9Router's
 # own JSON always reports the alias, not the resolved sub-model), which would
 # break the per-backend "who answered" tag below. Two tiers, mirroring agy's.
-# The "cc/" prefix is 9Router's provider tag for the Claude Code OAuth
-# connection -- confirmed required directly (a bare model id 404s).
-CLAUDE_MODEL_PRIMARY = os.environ.get("CLAUDE_MODEL_PRIMARY", "cc/claude-haiku-4-5-20251001")
-CLAUDE_MODEL_FALLBACK = os.environ.get("CLAUDE_MODEL_FALLBACK", "cc/claude-sonnet-5")
+# Plain Anthropic model ids, used as-is by Claude Code's own login. Behind a
+# gateway these may need that gateway's provider prefix instead (9Router, for
+# instance, wants "cc/" -- a bare id 404s there).
+CLAUDE_MODEL_PRIMARY = os.environ.get("CLAUDE_MODEL_PRIMARY", "claude-haiku-4-5-20251001")
+CLAUDE_MODEL_FALLBACK = os.environ.get("CLAUDE_MODEL_FALLBACK", "claude-sonnet-5")
 
 CLAUDE_BIN = os.environ.get("CLAUDE_BIN", "claude")
 ALLOWED_TOOLS = os.environ.get("ALLOWED_TOOLS", "Bash,WebSearch,WebFetch")
@@ -626,6 +636,92 @@ def redact_secrets(text: str) -> tuple[str, bool]:
     return text, found
 
 
+# --------------------------------------------------------------------------
+# /start setup wizard
+#
+# The installer's job stops at "the bot answers on Telegram". Everything that
+# needs a human decision or a browser -- signing in to each AI provider, setting
+# the PIN -- happens here instead, because Telegram is where the operator
+# already is and a browser is where OAuth has to end up anyway.
+#
+# Both providers sign in the same way (URL out, code back), so both are driven
+# through the same tmux helper. The code you paste is short-lived and single-use,
+# which is why it is acceptable for it to pass through a chat message at all --
+# unlike a password or a private key, which is why neither of those is ever
+# asked for here.
+# --------------------------------------------------------------------------
+
+WIZARD_STATE_FILE = BASE_DIR / "setup_state.json"
+# chat_id -> {"step": ..., "login": LoginHandle, "expires": ts}
+_wizard: dict[int, dict] = {}
+WIZARD_TTL_SECONDS = 900
+
+
+def _setup_state() -> dict:
+    if WIZARD_STATE_FILE.exists():
+        try:
+            return json.loads(WIZARD_STATE_FILE.read_text())
+        except Exception:
+            logger.warning("setup_state.json unreadable, treating as empty", exc_info=True)
+    return {}
+
+
+def _mark_setup(key: str, by: Optional[int] = None) -> None:
+    st = _setup_state()
+    st[key] = {"done_at": _dt.datetime.now().strftime("%Y-%m-%d %H:%M"), "by": by}
+    WIZARD_STATE_FILE.write_text(json.dumps(st, indent=2))
+
+
+def agy_signed_in() -> bool:
+    """Best-effort: agy keeps its OAuth material under ~/.gemini. Checking the
+    filesystem rather than running agy keeps /start free -- probing by making a
+    real call would cost tokens every time someone opens the menu."""
+    creds = Path.home() / ".gemini" / "antigravity-cli"
+    return creds.exists() and any(creds.rglob("*token*")) or "agy" in _setup_state()
+
+
+def claude_signed_in() -> bool:
+    if USE_GATEWAY:
+        return True  # a gateway carries its own credentials
+    try:
+        proc = subprocess.run([CLAUDE_BIN, "auth", "status", "--output-format", "json"],
+                              capture_output=True, text=True, timeout=20)
+        return '"loggedIn": true' in proc.stdout or '"loggedIn":true' in proc.stdout
+    except Exception:
+        return "claude" in _setup_state()
+
+
+def setup_summary() -> list[tuple[str, bool, str]]:
+    """(label, done, hint) for each thing /start can set up."""
+    return [
+        ("Gemini (Antigravity)", agy_signed_in(), "the primary tiers -- mini / mini pro"),
+        ("Claude Code", claude_signed_in(),
+         "gateway configured" if USE_GATEWAY else "the fallback tiers -- dede iku / dede nnet"),
+        ("Security PIN", pin_is_set(), "guards changes to production and scheduled tasks"),
+    ]
+
+
+def _wizard_keyboard(state: dict) -> InlineKeyboardMarkup:
+    rows = []
+    for key, (label, done, _) in zip(("agy", "claude", "pin"), setup_summary()):
+        mark = "✅" if done else "⬜"
+        verb = "Change" if done else "Set up"
+        rows.append([InlineKeyboardButton(f"{mark} {verb} {label}", callback_data=f"setup:{key}")])
+    rows.append([InlineKeyboardButton("✖️ Close", callback_data="setup:close")])
+    return InlineKeyboardMarkup(rows)
+
+
+def _wizard_text() -> str:
+    lines = ["\U0001f6e0 <b>iSmart-LA setup</b>", ""]
+    for label, done, hint in setup_summary():
+        lines.append(f"{'✅' if done else '⬜'} <b>{label}</b>\n   <i>{hint}</i>")
+    if all(done for _, done, _ in setup_summary()):
+        lines.append("\nEverything is set up. Just talk to me normally.")
+    else:
+        lines.append("\nTap anything above to set it up. You can stop and come back later.")
+    return "\n".join(lines)
+
+
 LEARN_LINE_RE = re.compile(r"^\s*LEARN:\s*(.+?)\s*$", re.MULTILINE)
 LEARNED_ZONE_MARKER = "<!-- LEARNED_ZONE -->"
 # The LEARNED zone is re-sent at the start of every new conversation, so
@@ -666,7 +762,7 @@ except OSError:  # pragma: no cover -- never worth failing startup over
 # tried first, and the chain moves on only when a tier fails in a way that
 # another tier could plausibly do better (see _classify_failure).
 #
-#   TIERS=agy:gemini-3.7-flash-medium:mini,claude:cc/claude-haiku-4-5-20251001:dede iku
+#   TIERS=agy:gemini-3.7-flash-medium:mini,claude:claude-haiku-4-5-20251001:dede iku
 #          ^^^ provider  ^^^ model                  ^^^ label shown as "— by <label>"
 #
 # One list rather than four separate PRIMARY/FALLBACK variables, because the
@@ -896,8 +992,14 @@ def append_memory(fact: str) -> None:
 
 def _run_claude_once(prompt: str, session_id: Optional[str], session_name: str, model: str) -> dict:
     env = os.environ.copy()
-    env["ANTHROPIC_BASE_URL"] = ANTHROPIC_BASE_URL
-    env["ANTHROPIC_API_KEY"] = ANTHROPIC_API_KEY
+    if USE_GATEWAY:
+        env["ANTHROPIC_BASE_URL"] = ANTHROPIC_BASE_URL
+        env["ANTHROPIC_API_KEY"] = ANTHROPIC_API_KEY
+    else:
+        # Inherited values would silently override the CLI's own subscription
+        # login and send traffic somewhere the operator didn't ask for.
+        env.pop("ANTHROPIC_BASE_URL", None)
+        env.pop("ANTHROPIC_API_KEY", None)
     env["ANTHROPIC_MODEL"] = model
 
     cmd = [
@@ -1774,17 +1876,215 @@ async def cmd_unregistergroup(update: Update, context: ContextTypes.DEFAULT_TYPE
     await update.message.reply_text(f"Access revoked for group *{chat.title or chat.id}*.", parse_mode="Markdown")
 
 
+def _may_run_setup(update: Update) -> bool:
+    """Owner anywhere, or a group admin inside a registered group.
+
+    Setup decides which AI account answers on this bot's behalf, so it is not
+    open to every group member -- but requiring the owner personally would mean
+    a team can't fix a broken login while they're away, which is the moment it
+    matters most.
+    """
+    if _is_owner(update):
+        return True
+    chat = update.effective_chat
+    return bool(chat and chat.type != "private" and chat.id in ALLOWED_GROUP_IDS)
+
+
+async def _is_group_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    chat, user = update.effective_chat, update.effective_user
+    if not chat or not user or chat.type == "private":
+        return False
+    try:
+        member = await context.bot.get_chat_member(chat.id, user.id)
+        return member.status in ("creator", "administrator")
+    except Exception:
+        logger.warning("could not check admin status in chat=%s", chat.id, exc_info=True)
+        return False
+
+
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """The setup wizard, and the first thing anyone runs."""
     if not _authorized(update):
         await update.message.reply_text("Sorry, you're not authorized to use this bot.")
         return
-    await update.message.reply_text(
-        "\U0001f44b Lite Agent is ready. Send anything to get started (status checks, "
-        "investigations, reports, etc).\n\n"
-        "Type /help for the full guide + command list.\n\n"
-        "\U0001f680 Designed by Koko Ali & Dede · Developed by Infrasoft.cloud & BSCloud.id Team\n"
-        "Happy smart working! ✨"
+    if not _may_run_setup(update):
+        await update.message.reply_text(
+            "\U0001f44b I'm ready. Send anything to get started — status checks, "
+            "investigations, reports.\n\nType /help for the full guide."
+        )
+        return
+    if not _is_owner(update) and not await _is_group_admin(update, context):
+        await update.message.reply_text(
+            "\U0001f44b I'm ready. Send anything to get started.\n\n"
+            "Type /help for the guide. (Setup is limited to the bot owner and this "
+            "group's admins.)"
+        )
+        return
+
+    done = [d for _, d, _ in setup_summary()]
+    if all(done) and not _is_owner(update):
+        await update.message.reply_text(
+            "✅ This bot is already set up by the owner.\n\nChange anything?",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("Yes, change setup", callback_data="setup:menu"),
+                InlineKeyboardButton("No, leave it", callback_data="setup:close"),
+            ]]),
+        )
+        return
+    await update.message.reply_text(_wizard_text(), parse_mode="HTML",
+                                    reply_markup=_wizard_keyboard({}))
+
+
+async def cmd_setup_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    _, _, what = query.data.partition(":")
+    if not _may_run_setup(update):
+        await query.answer("Not permitted.", show_alert=True)
+        return
+    if not _is_owner(update) and not await _is_group_admin(update, context):
+        await query.answer("Group admins only.", show_alert=True)
+        return
+    await query.answer()
+
+    if what == "close":
+        await query.edit_message_text("Setup closed. Run /start any time.")
+        return
+    if what == "menu":
+        await query.edit_message_text(_wizard_text(), parse_mode="HTML",
+                                      reply_markup=_wizard_keyboard({}))
+        return
+    if what == "pin":
+        await _begin_new_pin(update, query) if not pin_is_set() else await request_pin(
+            update, "change_pin_start", {},
+            "🔢 Changing the PIN. First, confirm the CURRENT one.")
+        return
+    if what in ("agy", "claude"):
+        await _begin_cli_login(update, query, what)
+        return
+
+
+async def _begin_cli_login(update: Update, query, provider: str) -> None:
+    """Kick off a provider's OAuth and show the URL."""
+    if not tmux_available():
+        await query.edit_message_text(
+            "⚠️ tmux isn't installed, and it's needed to drive the sign-in screen.\n"
+            "Install it (<code>apt install tmux</code>) and try again.",
+            parse_mode="HTML")
+        return
+
+    if provider == "agy":
+        cmd, human = [AGY_BIN], "Antigravity (Gemini)"
+    else:
+        cmd, human = [CLAUDE_BIN, "auth", "login"], "Claude Code"
+
+    handle = LoginHandle(session=f"ismart-login-{provider}", command=cmd)
+    await query.edit_message_text(f"⏳ Starting {human} sign-in…")
+    try:
+        handle.start()
+        url = await asyncio.get_running_loop().run_in_executor(None, handle.wait_for_url, 45)
+    except Exception as exc:
+        logger.exception("login start failed for %s", provider)
+        await query.edit_message_text(f"⚠️ Couldn't start the sign-in: {exc}")
+        return
+
+    if url is None:
+        screen = handle.pane()
+        handle.kill()
+        if LoginHandle.already_done(screen):
+            _mark_setup(provider, update.effective_user.id)
+            await query.edit_message_text(f"✅ {human} is already signed in.")
+            return
+        await query.edit_message_text(
+            f"⚠️ Couldn't find a sign-in URL for {human}. Last output:\n\n"
+            f"<pre>{_tg_escape(screen[-600:])}</pre>", parse_mode="HTML")
+        return
+
+    _wizard[update.effective_chat.id] = {
+        "step": f"await_code_{provider}",
+        "handle": handle,
+        "human": human,
+        "expires": _dt.datetime.now().timestamp() + WIZARD_TTL_SECONDS,
+    }
+    await query.edit_message_text(
+        f"🔗 <b>Sign in to {human}</b>\n\n"
+        "1. Open this on any device:\n"
+        f"{_tg_escape(url)}\n\n"
+        "2. Approve it, copy the code you get back.\n"
+        "3. <b>Send that code here as your next message.</b>\n\n"
+        "<i>The code is single-use and expires quickly, which is why it's safe to "
+        "paste in chat — unlike a password or an SSH key, which I'll never ask for.</i>\n\n"
+        "Send /cancel to stop.",
+        parse_mode="HTML", disable_web_page_preview=True,
     )
+
+
+async def _handle_wizard_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """If this chat is mid-wizard, treat the message as the OAuth code.
+    Returns True when the message was consumed and must not reach the model."""
+    chat_id = update.effective_chat.id
+    state = _wizard.get(chat_id)
+    if not state:
+        return False
+    if state["expires"] < _dt.datetime.now().timestamp():
+        _wizard.pop(chat_id, None)
+        state["handle"].kill()
+        await update.message.reply_text("⌛ That sign-in expired. Run /start to try again.")
+        return True
+
+    text = (update.message.text or "").strip()
+    if text.lower() in ("/cancel", "cancel", "batal"):
+        _wizard.pop(chat_id, None)
+        state["handle"].kill()
+        await update.message.reply_text("✖️ Sign-in cancelled.")
+        return True
+
+    handle, human = state["handle"], state["human"]
+    _wizard.pop(chat_id, None)
+    await update.message.reply_text(f"⏳ Sending the code to {human}…")
+
+    # The code was a chat message and is a credential, however short-lived --
+    # take it out of the history now rather than leaving it sitting there.
+    try:
+        await update.message.delete()
+    except Exception:
+        logger.info("could not delete the code message (needs admin rights in groups)")
+
+    loop = asyncio.get_running_loop()
+    try:
+        await loop.run_in_executor(None, handle.send_code, text)
+        ok, screen = await loop.run_in_executor(None, handle.wait_for_result, 120)
+    except Exception as exc:
+        logger.exception("login completion failed")
+        handle.kill()
+        await update.message.reply_text(f"⚠️ Sign-in failed: {exc}")
+        return True
+    handle.kill()
+
+    if ok:
+        provider = "agy" if "Antigravity" in human else "claude"
+        _mark_setup(provider, update.effective_user.id)
+        logger.warning("%s sign-in completed by user=%s", human, update.effective_user.id)
+        await update.message.reply_text(
+            f"✅ <b>{human} signed in.</b>\n\nRun /start to see what's left.",
+            parse_mode="HTML")
+    else:
+        await update.message.reply_text(
+            f"⚠️ {human} didn't accept that code. It may have expired — codes are "
+            f"short-lived, so grabbing a fresh one usually fixes it.\n\n"
+            f"<pre>{_tg_escape(screen[-500:])}</pre>\n\nRun /start to retry.",
+            parse_mode="HTML")
+    return True
+
+
+async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _authorized(update):
+        return
+    state = _wizard.pop(update.effective_chat.id, None)
+    if state:
+        state["handle"].kill()
+        await update.message.reply_text("✖️ Cancelled.")
+    else:
+        await update.message.reply_text("Nothing to cancel.")
 
 
 def _tier_summary() -> str:
@@ -2456,6 +2756,8 @@ async def cmd_providers(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _authorized(update):
         return
+    if await _handle_wizard_input(update, context):
+        return
     chat_id = str(update.effective_chat.id)
     text = update.message.text or ""
     if not text.strip():
@@ -2578,6 +2880,8 @@ def main() -> None:
 
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("cancel", cmd_cancel))
+    app.add_handler(CallbackQueryHandler(cmd_setup_button, pattern="^setup:"))
     app.add_handler(CommandHandler("chatid", cmd_chatid))
     app.add_handler(CommandHandler("registergroup", cmd_registergroup))
     app.add_handler(CommandHandler("unregistergroup", cmd_unregistergroup))
