@@ -165,6 +165,11 @@ Ollama, say), since something has to translate between protocols.
 | `/unschedule <name>` | owner + DM only | Remove a scheduled task |
 | `/adopt` | owner + DM only | Bring pre-existing cron entries under management |
 | `/setpin` | owner, DM **or group** | Set/change the 6-digit PIN (keypad, never typed in chat) |
+| `/boundaries` | **0 tokens** | What the agent must never do |
+| `/addboundary <rule>` | owner/admin | Add a hard boundary |
+| `/rmboundary <n>` | owner/admin + PIN | Remove one |
+| `/snapshots` | **0 tokens** | Snapshots taken before changes |
+| `/cancel` | free | Abort a multi-step form (/start, /addserver) |
 | `/servers` | **0 tokens** | Machines the agent may reach |
 | `/addserver` | owner/admin + PIN | Register a new machine, step by step |
 | `/removeserver <name>` | owner/admin | Unregister one |

@@ -2558,6 +2558,7 @@ Every reply ends with a "— by ..." tag. If it's ever NOT "{TIERS[0]['label']}"
 /lock — close that window early
 /learned — see what the agent figured out about this environment BY ITSELF
 /forget <number> — delete one wrong learned fact (numbers come from /learned)
+/cancel — abort a multi-step form (/start, /addserver)
 /help — this guide (choose EN or ID)
 
 *3 habits that keep it cheap*
@@ -2590,6 +2591,7 @@ Setiap balasan diakhiri tanda "— by ...". Kalau tandanya BUKAN "{TIERS[0]['lab
 /sessions — lihat semua sesi yang tersimpan
 /remember <fakta> — simpan fakta PERMANEN, dibaca di SETIAP sesi & SETIAP tingkatan, meski sudah berkali-kali /new
 /memory — lihat isi memori saat ini
+/cancel — batalkan form bertahap yang sedang jalan (/start, /addserver)
 /help — panduan ini (pilih EN atau ID)
 
 *3 kebiasaan supaya tetap irit*
