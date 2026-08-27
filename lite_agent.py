@@ -684,10 +684,14 @@ def claude_signed_in() -> bool:
     if USE_GATEWAY:
         return True  # a gateway carries its own credentials
     try:
-        proc = subprocess.run([CLAUDE_BIN, "auth", "status", "--output-format", "json"],
+        # `claude auth status` prints JSON on its own -- passing --output-format
+        # makes it exit with "unknown option", which previously read as a
+        # missing login even when one was fine.
+        proc = subprocess.run([CLAUDE_BIN, "auth", "status"],
                               capture_output=True, text=True, timeout=20)
-        return '"loggedIn": true' in proc.stdout or '"loggedIn":true' in proc.stdout
+        return bool(json.loads(proc.stdout).get("loggedIn"))
     except Exception:
+        logger.debug("could not read claude auth status", exc_info=True)
         return "claude" in _setup_state()
 
 
