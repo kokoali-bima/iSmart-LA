@@ -519,7 +519,7 @@ def _current_crontab() -> str:
     return proc.stdout if proc.returncode == 0 else ""
 
 
-def _rebuild_crontab(items: list[dict]) -> None:
+def _rebuild_crontab(items: list[dict], strip_lines: set[str] | None = None) -> None:
     """Regenerate ONLY our managed block, leaving any other crontab entry the
     operator has alone -- clobbering somebody's unrelated cron job would be a
     far worse bug than anything this feature is meant to fix."""
@@ -529,6 +529,12 @@ def _rebuild_crontab(items: list[dict]) -> None:
         tail = existing.split(CRON_END, 1)[1].lstrip("\n")
     else:
         head, tail = existing.rstrip("\n"), ""
+
+    if strip_lines:
+        # A line being adopted INTO management must not also survive outside
+        # it -- otherwise it runs twice, once raw and once managed.
+        head = "\n".join(ln for ln in head.split("\n") if ln.strip() not in strip_lines)
+        tail = "\n".join(ln for ln in tail.split("\n") if ln.strip() not in strip_lines)
 
     lines = [CRON_BEGIN]
     for it in items:
@@ -1380,7 +1386,8 @@ def append_memory(fact: str) -> None:
 # Claude Code invocation
 # --------------------------------------------------------------------------
 
-def _run_claude_once(prompt: str, session_id: Optional[str], session_name: str, model: str) -> dict:
+def _run_claude_once(prompt: str, session_id: Optional[str], session_name: str, model: str,
+                     timeout: Optional[int] = None) -> dict:
     env = os.environ.copy()
     if USE_GATEWAY:
         env["ANTHROPIC_BASE_URL"] = ANTHROPIC_BASE_URL
@@ -1416,7 +1423,7 @@ def _run_claude_once(prompt: str, session_id: Optional[str], session_name: str, 
     )
     proc = subprocess.run(
         cmd, cwd=str(BASE_DIR), env=env,
-        capture_output=True, text=True, timeout=CLAUDE_TIMEOUT,
+        capture_output=True, text=True, timeout=timeout or CLAUDE_TIMEOUT,
     )
     if proc.returncode != 0:
         raise RuntimeError(f"Claude Code exited {proc.returncode}: {proc.stderr[-800:]}")
@@ -1427,15 +1434,16 @@ def _run_claude_once(prompt: str, session_id: Optional[str], session_name: str, 
         raise RuntimeError(f"Claude Code returned non-JSON output: {proc.stdout[-800:]}")
 
 
-def run_claude(prompt: str, session_id: Optional[str], session_name: str, model: str) -> dict:
+def run_claude(prompt: str, session_id: Optional[str], session_name: str, model: str,
+              timeout: Optional[int] = None) -> dict:
     """Run one Claude Code turn on an explicit model. Falls back to a fresh
     session if --resume fails (e.g. the referenced session expired)."""
     try:
-        return _run_claude_once(prompt, session_id, session_name, model)
+        return _run_claude_once(prompt, session_id, session_name, model, timeout)
     except RuntimeError as exc:
         if session_id:
             logger.warning("resume with session=%s failed (%s), retrying fresh", session_id, exc)
-            return _run_claude_once(prompt, None, session_name, model)
+            return _run_claude_once(prompt, None, session_name, model, timeout)
         raise
 
 
@@ -1537,12 +1545,13 @@ def _note_tier_success(model: str) -> None:
         _tier_cooldown.pop(model, None)
 
 
-def _run_agy_once(prompt: str, model: str, conversation_id: Optional[str]) -> dict:
+def _run_agy_once(prompt: str, model: str, conversation_id: Optional[str],
+                  timeout: Optional[int] = None, print_timeout: Optional[str] = None) -> dict:
     cmd = [
         AGY_BIN, "-p", prompt,
         "--model", model,
         "--output-format", "json",
-        "--print-timeout", AGY_PRINT_TIMEOUT,
+        "--print-timeout", print_timeout or AGY_PRINT_TIMEOUT,
     ]
     if conversation_id:
         cmd += ["--conversation", conversation_id]
@@ -1552,7 +1561,7 @@ def _run_agy_once(prompt: str, model: str, conversation_id: Optional[str]) -> di
         model, conversation_id, len(prompt),
     )
     proc = subprocess.run(
-        cmd, cwd=str(AGY_WORKDIR), capture_output=True, text=True, timeout=AGY_TIMEOUT,
+        cmd, cwd=str(AGY_WORKDIR), capture_output=True, text=True, timeout=timeout or AGY_TIMEOUT,
     )
 
     # Parse stdout regardless of returncode -- a denied/failed run can still
@@ -2552,6 +2561,7 @@ Every reply ends with a "— by ..." tag. If it's ever NOT "{TIERS[0]['label']}"
 /servers — machines the agent may reach (0 tokens)
 /addserver — register a new machine, step by step
 /removeserver <name> — unregister one
+/agentstatus — live check: is each AI tier actually up right now?
 /providers — which AI tiers are configured and which are healthy (0 tokens)
 /mode — read-only right now, or able to make changes? (0 tokens)
 /unlock [minutes] — owner-only, DM-only: allow real changes for a limited window
@@ -3140,6 +3150,7 @@ async def cmd_adopt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     items = _read_schedules()
     known = {s["name"] for s in items}
     adopted: list[str] = []
+    adopted_raw_lines: set[str] = set()
     for idx, line in enumerate(orphans, 1):
         parts = line.split()
         if len(parts) < 6 or not _valid_cron(" ".join(parts[:5])):
@@ -3158,10 +3169,13 @@ async def cmd_adopt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "created_at": _dt.datetime.now().strftime("%Y-%m-%d %H:%M") + " (adopted)",
         })
         adopted.append(name)
+        adopted_raw_lines.add(line.strip())
     if not adopted:
         await update.message.reply_text("Found cron entries but could not parse any of them.")
         return
-    _rebuild_crontab(items)
+    # strip_lines removes the ORIGINAL raw line now that it lives in the
+    # managed block under a new name -- without this it would run twice.
+    _rebuild_crontab(items, strip_lines=adopted_raw_lines)
     _write_schedules(items)
     await update.message.reply_text(
         f"✅ Adopted {len(adopted)} entry/entries: {', '.join(adopted)}\n"
@@ -3755,6 +3769,117 @@ async def _do_unlock_and_resume(update: Update, context: ContextTypes.DEFAULT_TY
     await _run_turn(update, context, follow_up)
 
 
+# --------------------------------------------------------------------------
+# /agentstatus -- a real liveness probe, not a guess from login state
+#
+# /providers already shows the configured chain and each tier's cooldown state,
+# but that is PASSIVE -- it only knows a tier is down if a real user turn
+# recently failed against it. A tier that has not been used since the last
+# outage would still show "ready" even if it is down right now.
+#
+# So this sends an actual tiny probe to every tier, in parallel, and reports
+# what came back. Deliberately minimal: no environment brief, no memory, no
+# conversation history -- just enough to prove the credential and the endpoint
+# both work. Both backends are fixed-price subscriptions, so this costs a
+# sliver of quota, not money, and updates the SAME cooldown table /providers
+# reads, so a real failure found here also protects the next real turn from
+# wasting a full attempt on a tier that just proved to be down.
+# --------------------------------------------------------------------------
+
+AGENTSTATUS_PROBE_PROMPT = "Reply with exactly one word: OK"
+AGENTSTATUS_PROBE_TIMEOUT = 30          # subprocess hard timeout, per tier
+AGENTSTATUS_PROBE_PRINT_TIMEOUT = "20s"  # agy's own --print-timeout
+AGENTSTATUS_CACHE_SECONDS = 20          # guards against an accidental double-tap
+_agentstatus_cache: dict = {"at": 0.0, "results": []}
+
+
+async def _probe_one_tier(tier: dict) -> dict:
+    provider, model, label = tier["provider"], tier["model"], tier["label"]
+    loop = asyncio.get_running_loop()
+    start = _dt.datetime.now().timestamp()
+    try:
+        if provider == "agy":
+            await loop.run_in_executor(
+                None, _run_agy_once, AGENTSTATUS_PROBE_PROMPT, model, None,
+                AGENTSTATUS_PROBE_TIMEOUT, AGENTSTATUS_PROBE_PRINT_TIMEOUT,
+            )
+        else:
+            await loop.run_in_executor(
+                None, run_claude, AGENTSTATUS_PROBE_PROMPT, None,
+                "agentstatus-probe", model, AGENTSTATUS_PROBE_TIMEOUT,
+            )
+        elapsed = _dt.datetime.now().timestamp() - start
+        _note_tier_success(model)
+        return {"provider": provider, "model": model, "label": label,
+                "ok": True, "elapsed": elapsed}
+    except Exception as exc:
+        elapsed = _dt.datetime.now().timestamp() - start
+        kind = _classify_failure(exc)
+        _note_tier_failure(model)
+        return {"provider": provider, "model": model, "label": label, "ok": False,
+                "elapsed": elapsed, "error": str(exc)[:220], "kind": kind}
+
+
+async def check_all_tiers() -> list[dict]:
+    return list(await asyncio.gather(*(_probe_one_tier(t) for t in TIERS)))
+
+
+def _format_agentstatus(results: list[dict], cached_age: Optional[float]) -> str:
+    up = sum(1 for r in results if r["ok"])
+    lines = [f"🩺 <b>Agent status</b> — {up}/{len(results)} online", ""]
+    for r in results:
+        if r["ok"]:
+            lines.append(
+                f"🟢 <b>{_tg_escape(r['label'])}</b> — online "
+                f"({r['elapsed']:.1f}s)\n"
+                f"   <code>{_tg_escape(r['provider'])}</code> / <code>{_tg_escape(r['model'])}</code>"
+            )
+        else:
+            lines.append(
+                f"🔴 <b>{_tg_escape(r['label'])}</b> — DOWN / ERROR\n"
+                f"   <code>{_tg_escape(r['provider'])}</code> / <code>{_tg_escape(r['model'])}</code>\n"
+                f"   <i>{_tg_escape(r['error'])}</i>"
+            )
+    if cached_age is not None:
+        lines.append(f"\n<i>Cached, checked {int(cached_age)}s ago. /agentstatus force for a fresh check.</i>")
+    else:
+        lines.append(
+            "\n<i>Each check is a tiny real request to every tier -- a sliver of "
+            "quota, not a wasted turn. Results also feed /providers' cooldown state.</i>"
+        )
+    return "\n".join(lines)
+
+
+async def cmd_agentstatus(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Real liveness check of every configured tier, in parallel."""
+    if not _authorized(update):
+        return
+    force = bool(context.args) and context.args[0].lower() in ("force", "refresh")
+    now = _dt.datetime.now().timestamp()
+    cache_age = now - _agentstatus_cache["at"]
+    if not force and _agentstatus_cache["results"] and cache_age < AGENTSTATUS_CACHE_SECONDS:
+        await _reply_chunked(update, _format_agentstatus(_agentstatus_cache["results"], cache_age),
+                             already_html=True)
+        return
+
+    msg = await update.message.reply_text(
+        f"🩺 Checking {len(TIERS)} tier(s)…")
+    try:
+        results = await asyncio.wait_for(check_all_tiers(), timeout=AGENTSTATUS_PROBE_TIMEOUT + 15)
+    except asyncio.TimeoutError:
+        await msg.edit_text("⚠️ The check itself timed out. Try /agentstatus again.")
+        return
+    _agentstatus_cache["at"] = now
+    _agentstatus_cache["results"] = results
+
+    text = _format_agentstatus(results, None)
+    try:
+        await msg.delete()
+    except Exception:
+        pass
+    await _reply_chunked(update, text, already_html=True)
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _authorized(update):
         return
@@ -3957,6 +4082,7 @@ def main() -> None:
     app.add_handler(CommandHandler("removeserver", cmd_removeserver))
     app.add_handler(CallbackQueryHandler(cmd_server_button, pattern="^srv:"))
     app.add_handler(CallbackQueryHandler(cmd_needwrite_button, pattern="^nw:"))
+    app.add_handler(CommandHandler("agentstatus", cmd_agentstatus))
     app.add_handler(CommandHandler("providers", cmd_providers))
     app.add_handler(CommandHandler("schedules", cmd_schedules))
     app.add_handler(CommandHandler("unschedule", cmd_unschedule))

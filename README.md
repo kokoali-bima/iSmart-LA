@@ -173,6 +173,7 @@ Ollama, say), since something has to translate between protocols.
 | `/servers` | **0 tokens** | Machines the agent may reach |
 | `/addserver` | owner/admin + PIN | Register a new machine, step by step |
 | `/removeserver <name>` | owner/admin | Unregister one |
+| `/agentstatus` | tiny probe each | Live check: is each tier actually up right now? |
 | `/providers` | **0 tokens** | Which AI tiers are configured, and which are healthy |
 | `/mode` | **0 tokens** | Read-only right now, or able to change things? |
 | `/unlock [min]` | owner + DM only | Open a time-boxed window for real changes |
@@ -431,3 +432,15 @@ systemd/
 💻 **Developed by Infrasoft.cloud & BSCloud.id Team**
 
 Happy smart working! ✨
+
+### /agentstatus vs /providers
+
+`/providers` is passive: it shows the cooldown table built from real usage, so a
+tier that has not been touched since the last outage still reads "ready" even if
+it is down right now. `/agentstatus` is active -- it sends a tiny real probe to
+every configured tier, in parallel, right now, with no environment brief and no
+memory attached (cheap and fast on purpose). 🟢 online, 🔴 down with the actual
+error. Results feed the same cooldown table `/providers` reads, so a real outage
+found this way also protects the next real turn from wasting a full attempt on a
+tier that just proved to be down. A 20-second cache guards against an accidental
+double-tap; `/agentstatus force` bypasses it.
