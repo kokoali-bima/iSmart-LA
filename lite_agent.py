@@ -1864,16 +1864,24 @@ def _msg(update: Update):
     return update.callback_query.message if update.callback_query else None
 
 
-async def _reply_chunked(update: Update, text: str, tag_html: str = "") -> None:
-    """Send a (possibly long) model reply, formatted. `tag_html` is appended to
-    the LAST chunk only and is passed through as trusted HTML -- it's our own
-    backend label, not model output."""
+async def _reply_chunked(update: Update, text: str, tag_html: str = "",
+                         already_html: bool = False) -> None:
+    """Send a (possibly long) reply.
+
+    `tag_html` is appended to the LAST chunk only and passed through as trusted
+    HTML -- it is our own backend label, not model output.
+
+    `already_html` marks text WE built, which is already valid Telegram HTML and
+    must not be escaped. Model output (the default) is Markdown from an
+    untrusted source and always goes through the converter. Two explicit paths
+    rather than sniffing the string: a model reply that happens to mention
+    <b> should still show those characters, not turn bold."""
     text, redacted = redact_secrets(text)
     if redacted:
         logger.warning("outbound message contained a known secret -- redacted before sending")
     chunks = _chunk_lines(text, 3500)
     for idx, chunk in enumerate(chunks):
-        body = _md_to_telegram_html(chunk)
+        body = chunk if already_html else _md_to_telegram_html(chunk)
         if idx == len(chunks) - 1 and tag_html:
             body = f"{body}\n\n{tag_html}"
         plain = chunk
@@ -3099,7 +3107,7 @@ async def cmd_schedules(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     if items:
         lines.append("\nRemove one: /unschedule &lt;name&gt;")
-    await _reply_chunked(update, "\n".join(lines))
+    await _reply_chunked(update, "\n".join(lines), already_html=True)
 
 
 async def cmd_unschedule(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3183,7 +3191,7 @@ async def cmd_providers(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         f"<b>{_tg_escape(TIERS[0]['label'])}</b> means the ones above it were unavailable."
     )
     lines.append("\n<i>Change the chain by editing TIERS in .env, then restart.</i>")
-    await _reply_chunked(update, "\n".join(lines))
+    await _reply_chunked(update, "\n".join(lines), already_html=True)
 
 
 async def cmd_addserver(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3518,7 +3526,7 @@ async def cmd_servers(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             + f"\n  added {it.get('added_at', '?')}"
         )
     lines.append("\nRemove one: /removeserver &lt;name&gt;")
-    await _reply_chunked(update, "\n".join(lines))
+    await _reply_chunked(update, "\n".join(lines), already_html=True)
 
 
 async def cmd_removeserver(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3562,7 +3570,7 @@ async def cmd_boundaries(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     lines = [f"🚧 <b>Hard boundaries ({len(items)})</b>", ""]
     lines += [f"{i}. {_tg_escape(x)}" for i, x in enumerate(items, 1)]
     lines.append("\n<i>Add: /addboundary &lt;rule&gt;   Remove: /rmboundary &lt;number&gt;</i>")
-    await _reply_chunked(update, "\n".join(lines))
+    await _reply_chunked(update, "\n".join(lines), already_html=True)
 
 
 async def cmd_addboundary(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3631,7 +3639,7 @@ async def cmd_snapshots(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     lines.append(
         "\n<i>Delete one on the cluster with: qm delsnapshot &lt;vmid&gt; &lt;name&gt;</i>\n"
         "<i>Snapshots hold disk space, so they are worth clearing once a change has proven good.</i>")
-    await _reply_chunked(update, "\n".join(lines))
+    await _reply_chunked(update, "\n".join(lines), already_html=True)
 
 
 async def offer_unlock(update: Update, reason: str, original_prompt: str,
