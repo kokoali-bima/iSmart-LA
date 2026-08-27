@@ -97,3 +97,42 @@ ssh <host> "some-command | jq '...\"bar\"...'" 2>/dev/null
 ```
 If a piped-through-SSH command returns suspiciously little output, suspect this
 quoting issue first before retrying the same shape of command again.
+
+## Recording what you learn about this environment
+
+You start each new conversation with this brief and nothing else. Anything you work out
+by probing is lost when the conversation ends -- unless you record it.
+
+When you discover something durable and reusable about THIS environment, add a line by
+itself in your final reply:
+
+```
+LEARN: <one specific, self-contained fact>
+```
+
+That line is stripped from what the user sees and appended to the Learned section
+below, so every future conversation starts already knowing it.
+
+**Record:** which tools are and aren't installed plus their exact working invocation;
+corrected topology; where a service really keeps its config/logs; a command form that
+works here versus one that silently fails; naming conventions; the shape of a report
+someone asks for repeatedly.
+
+**Do not record:** anything transient (current load, today's counts), anything specific
+to a single request, guesses you have not verified, or any secret or credential. If you
+would have to re-check it to trust it tomorrow, it is not a fact.
+
+One fact per line, under ~400 characters, phrased to still make sense read cold months
+later. Emit no LEARN: line at all when you learned nothing durable -- that is the normal
+case for a routine question.
+
+You cannot edit this brief, and writing to it with shell commands is out of bounds: the
+boundaries above are deliberately outside your control. LEARN: is the supported path,
+and it only ever appends below the marker.
+
+<!-- LEARNED_ZONE -->
+## Learned about this environment
+
+Facts the agent discovered and recorded itself. Safe to edit or delete by hand --
+nothing above the marker line is ever touched automatically.
+
