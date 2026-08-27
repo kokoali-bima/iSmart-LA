@@ -1,7 +1,15 @@
 #!/usr/bin/env python3
+# ------------------------------------------------------------------------------
+# iSmart-LA -- Copyright (c) 2026 Infrasoft.cloud & BSCloud.id Team.
+# See LICENSE. Any deployment or redistribution of this software must retain
+# the "Designed by Koko Ali & Dede - Developed by Infrasoft.cloud & BSCloud.id
+# Team" credit as it appears in /start and /help below -- do not remove it.
+# ------------------------------------------------------------------------------
 """
 iSmart-LA (Lite Agent) -- a lightweight Telegram bridge to Claude Code and
-Antigravity CLI, with 9Router as the Claude-side gateway.
+Antigravity CLI. Both CLIs sign in to their own fixed-price subscriptions
+directly (no gateway required); see README "Using a gateway instead" for the
+optional path if one is ever needed.
 
 Instead of reimplementing agent logic, this script shells out to two
 first-party CLIs that already do the hard part (tool execution, reasoning,
@@ -33,8 +41,8 @@ Design principles:
     Gemini Pro-low ("mini pro") -> Claude Haiku ("dede iku") -> Claude Sonnet
     ("dede nnet"). BOTH sides are fixed-price subscriptions, not pay-per-
     token API billing: Gemini via the Antigravity CLI (agy) on a Google AI
-    Pro/Ultra plan, Claude via 9Router's Claude Code OAuth connection on a
-    Claude Pro (or higher) plan. Gemini is tried first anyway -- not to dodge
+    Pro/Ultra plan, Claude via Claude Code's own OAuth sign-in on a Claude
+    Pro (or higher) plan. Gemini is tried first anyway -- not to dodge
     per-token cost, but to spread routine load across a SEPARATE subscription
     and keep the Claude plan's own usage quota in reserve for when it's
     genuinely needed.
@@ -389,7 +397,7 @@ _pin_sessions: dict[str, dict] = {}
 # stay private-DM-only -- a group is exactly where input this deployment does
 # not vet arrives, so it is not the place to authorise production changes.
 PIN_ACTIONS_ALLOWED_IN_GROUP = frozenset({
-    "new_pin_capture", "new_pin_confirm", "change_pin_start",
+    "new_pin_capture", "new_pin_confirm", "change_pin_start", "schedule_install",
 })
 _pin_lockout_until: float = 0.0
 
@@ -2347,6 +2355,18 @@ def _may_run_setup(update: Update) -> bool:
     return bool(chat and chat.type != "private" and chat.id in ALLOWED_GROUP_IDS)
 
 
+async def _may_manage_schedules(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Owner anywhere, or an admin of a REGISTERED group -- the same trust
+    level already granted to /addserver. A PIN still confirms the actual
+    install/removal, so this only decides who may reach that PIN prompt."""
+    if _is_owner(update):
+        return True
+    chat = update.effective_chat
+    if not (chat and chat.type != "private" and chat.id in ALLOWED_GROUP_IDS):
+        return False
+    return await _is_group_admin(update, context)
+
+
 async def _is_group_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     chat, user = update.effective_chat, update.effective_user
     if not chat or not user or chat.type == "private":
@@ -2554,6 +2574,8 @@ def _tier_summary() -> str:
     return "\n".join(lines)
 
 
+# Required by LICENSE -- do not remove or alter without written permission
+# from the copyright holder (see LICENSE at the repo root).
 _HELP_CREDITS = (
     "━━━━━━━━━━━━━━━━━━━\n"
     "\U0001f680 *Designed by Koko Ali & Dede*\n"
@@ -2869,8 +2891,14 @@ async def cmd_pin_key(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if not session:
         await query.answer("This PIN entry expired — start again.", show_alert=True)
         return
-    # Only the owner may drive the keypad, wherever they are...
-    if not _is_owner(update):
+    # Who may drive the keypad depends on the action: most stay owner-only,
+    # but a registered group's own admin may complete a schedule they were
+    # just shown -- the same trust level /addserver already grants them.
+    if session["action"] == "schedule_install":
+        may_touch = await _may_manage_schedules(update, context)
+    else:
+        may_touch = _is_owner(update)
+    if not may_touch:
         await query.answer("Not permitted.", show_alert=True)
         return
     # ...but the action decides whether this is an acceptable PLACE to do it.
@@ -3089,10 +3117,8 @@ async def offer_schedules(update: Update, proposals: list[dict]) -> None:
 async def cmd_schedule_decision(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     action, _, token = query.data.partition(":")
-    # Same gate as /unlock: installing an unattended job is not something a
-    # group should be able to do, even a registered one.
-    if not _is_trusted_origin(update):
-        await query.answer("Only the bot owner, in a private DM.", show_alert=True)
+    if not await _may_manage_schedules(update, context):
+        await query.answer("Bot owner, or a registered group's own admin.", show_alert=True)
         return
     item = _pending_schedules.pop(token, None)
     if not item:
@@ -3151,8 +3177,8 @@ async def cmd_schedules(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 async def cmd_unschedule(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not _is_trusted_origin(update):
-        await update.message.reply_text("🔒 Only the bot owner, in a private DM.")
+    if not await _may_manage_schedules(update, context):
+        await update.message.reply_text("🔒 Bot owner, or a registered group's own admin.")
         return
     name = (context.args[0] if context.args else "").strip()
     if not name:
@@ -3996,11 +4022,11 @@ async def _run_turn(update: Update, context: ContextTypes.DEFAULT_TYPE, text: st
             sent_hashes: set[str] = set()
             for path in media_paths:
                 await _send_media_file(update, path, sent_hashes)
-            if schedule_proposals and _is_trusted_origin(update):
+            if schedule_proposals and await _may_manage_schedules(update, context):
                 await offer_schedules(update, schedule_proposals)
             elif schedule_proposals:
                 logger.warning(
-                    "ignored %d SCHEDULE: proposal(s) from an untrusted origin (chat=%s)",
+                    "ignored %d SCHEDULE: proposal(s) from an origin not allowed to manage schedules (chat=%s)",
                     len(schedule_proposals), chat_id,
                 )
             if newly_learned:

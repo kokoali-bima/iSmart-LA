@@ -1,5 +1,36 @@
 # Changelog
 
+## v0.2b.1 -- group admins can manage schedules, credit hardened, stale header fixed
+
+**A registered group's own admin can now install and remove scheduled tasks**, not
+just the bot owner. Scheduling already carried the same two safety nets `/addserver`
+relies on -- the proposal is always shown first, and a PIN confirms a human is
+actually approving it -- so there was no reason to trust it less. The real blocker
+was one level deeper than it looked: the PIN keypad's own "who may drive this"
+check was hardcoded to the literal owner for every action, regardless of what the
+per-action allow-list said about *where* it could be confirmed. A non-owner group
+admin could never complete any PIN flow at all, even ones nominally open to a group.
+`/unlock` stays owner-and-DM-only on purpose -- it opens write access to whatever the
+agent decides to touch next, which needs the strictest gate available.
+
+**Credit line hardened against accidental removal.** Not technically unremovable --
+anyone with full source access can always delete a string in code they control --
+but now redundant across `LICENSE`, a "do not remove" header at the top of
+`lite_agent.py`, and a marker comment directly above the credits string itself, so
+stripping it requires a deliberate act across several files rather than one
+unnoticed edit.
+
+**Fixed:** production's own module docstring was still the original pre-rename
+text ("Lite Agent... routed through 9Router") -- never resynced through the agy
+integration, the rename to iSmart-LA, or dropping 9Router entirely, even though
+every functional change had been kept in sync. Replaced with the current, accurate
+header; verified byte-for-byte parity between production and the repo afterward.
+
+11/11 tests pass for the group-scheduling permission matrix (owner anywhere,
+registered-group admin, unregistered-group admin, group member, DM stranger --
+each checked against both the proposal gate and the keypad gate).
+
+
 ## v0.2b.0 -- a real security boundary, self-service onboarding, no more 9Router
 
 The biggest change since initial packaging. Driven by dropping a dependency that

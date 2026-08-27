@@ -1,4 +1,4 @@
-Copyright (c) 2026 BSCloud.id
+Copyright (c) 2026 Infrasoft.cloud & BSCloud.id Team
 
 All rights reserved.
 
@@ -6,3 +6,9 @@ This software and associated documentation are proprietary and confidential.
 Unauthorized copying, distribution, modification, or use of this software,
 in whole or in part, via any medium, is strictly prohibited without the
 prior written permission of the copyright holder.
+
+Attribution requirement: any deployment or redistribution of this software,
+in whole or in part, must retain the "Designed by Koko Ali & Dede · Developed
+by Infrasoft.cloud & BSCloud.id Team" credit as it appears in the software's
+own /start and /help output, and in this file's copyright line above. Removing
+or altering that attribution is a condition violation, not a cosmetic change.

@@ -4,7 +4,7 @@ A lightweight Telegram bridge to **Claude Code** and **Antigravity CLI (agy)**, 
 infrastructure monitoring and investigation -- built to be dramatically cheaper to run
 than a full agent framework, while staying just as capable for real operational work.
 
-> **Status: v0.2b.0 -- early/beta.** Built and battle-tested against a real production
+> **Status: v0.2b.1 -- early/beta.** Built and battle-tested against a real production
 > Proxmox VE cluster over several days of iteration, including a live-fire test of the
 > unlock/PIN/snapshot flow against real infrastructure. Works well; still has known
 > rough edges (see [Known limitations](#known-limitations)).
@@ -222,14 +222,17 @@ them:
 |---|---|---|
 | `/setpin` — set or change the PIN | ✅ | ✅ |
 | `/unlock` — open write mode | ✅ | ❌ |
-| Installing a scheduled task | ✅ | ❌ |
+| Installing / removing a scheduled task | ✅ | ✅ (registered group's own admin) |
 
 `/setpin` works in a group because nothing secret is exposed there: the digits
 travel in `callback_data`, so the group sees a keypad and a row of dots, never
-the PIN. The other two stay DM-only — a group is precisely where input this
-deployment doesn't vet arrives, so it isn't the place to authorise a production
-change. Only the owner can drive the keypad anywhere; a tap from anyone else is
-refused.
+the PIN. `/unlock` stays DM-only — it opens write access for *any* change, to
+whatever the agent decides to touch next, so it needs the strictest gate.
+Scheduling is different: the proposal is always shown first (nothing installs
+silently), so it gets the same trust level `/addserver` already has — the bot
+owner anywhere, or an admin of a **registered** group, confirmed by that
+group's own Telegram admin status. Anyone else's tap is refused, regardless of
+which action they're trying to confirm.
 
 **Changing an existing PIN always requires the current one first.** That is what
 makes the group case safe: a stolen Telegram session can't quietly replace the
