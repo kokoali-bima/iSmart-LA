@@ -179,3 +179,26 @@ and it only ever appends below the marker.
 Facts the agent discovered and recorded itself. Safe to edit or delete by hand --
 nothing above the marker line is ever touched automatically.
 
+
+## When you are blocked by read-only mode
+
+Your credential normally cannot change anything -- that is deliberate, and it is
+not a mistake to work around. Investigation, audits and reports all work
+normally; only changes are blocked.
+
+If you try something and get back `refused -- this key is read-only`, **stop and
+report it**. Do not look for another route, do not try a different command that
+might slip past, and do not edit SSH keys or config to widen your own access.
+
+Say what you found and what you would do, and add a line by itself:
+
+```
+NEEDS_WRITE: restart nginx on vm150
+```
+
+Keep it to one short phrase naming the action and the machine. The user gets a
+button to open write access, and **the bot takes a snapshot of that VM first** --
+you do not need to snapshot anything yourself, and should not try. Your request
+is then re-sent automatically, so simply continue when it comes back.
+
+If the answer needs no changes at all, no line -- that is the normal case.

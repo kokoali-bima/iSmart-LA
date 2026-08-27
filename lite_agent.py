@@ -918,6 +918,116 @@ def discover_proxmox(host: str, user: str, port: int) -> tuple[bool, str, list[s
     return True, "\n".join(lines), names
 
 
+# --------------------------------------------------------------------------
+# "The agent hit the read-only wall" -> offer to unlock, snapshot, and resume
+#
+# Guessing from the wording of a request whether it needs write access does not
+# work. "check why vm150 is throwing 503" is read-only right up until the answer
+# turns out to be "restart nginx", and no keyword list separates those. Asking a
+# model to classify first would add cost and latency to every message and still
+# be wrong sometimes, in both directions.
+#
+# So nothing is guessed. The node-side guard already decides read-vs-write
+# exactly, because it is the thing doing the refusing. We just notice that it
+# refused, and offer the next step.
+#
+# Detection is two-layered on purpose:
+#   1. the guard's own refusal text, which appears in the agent's tool output
+#      and cannot be suppressed by the model
+#   2. a NEEDS_WRITE: line the agent is asked to emit, which gives a clean
+#      description and the VM id
+# Layer 1 is the one that cannot be dodged; layer 2 makes the message readable.
+# --------------------------------------------------------------------------
+
+NEEDS_WRITE_RE = re.compile(r"^\s*NEEDS_WRITE:\s*(.+?)\s*$", re.MULTILINE)
+GUARD_REFUSAL = "refused -- this key is read-only"
+_VMID_RE = re.compile(r"\b(?:vm[\s-]?|vmid[\s:=-]*)(\d{2,6})\b", re.I)
+# chat_id -> {"prompt", "reason", "vmid", "expires"}
+_pending_write: dict[int, dict] = {}
+PENDING_WRITE_TTL = 900
+
+
+def extract_needs_write(text: str) -> tuple[str, Optional[str]]:
+    """Pull a NEEDS_WRITE: line out and strip it from what the user sees."""
+    hits = NEEDS_WRITE_RE.findall(text)
+    return NEEDS_WRITE_RE.sub("", text).strip(), (hits[0] if hits else None)
+
+
+def blocked_by_readonly(result_text: str, attempts: list[str]) -> bool:
+    return GUARD_REFUSAL in result_text or any(GUARD_REFUSAL in a for a in attempts)
+
+
+def guess_vmid(*texts: str) -> Optional[str]:
+    """Best-effort VM id, for pre-filling the snapshot offer. Only ever used to
+    suggest -- never to act on without the operator seeing it."""
+    for t in texts:
+        if not t:
+            continue
+        m = _VMID_RE.search(t)
+        if m:
+            return m.group(1)
+    return None
+
+
+def find_vm_node(vmid: str) -> Optional[str]:
+    """Which node hosts this VM. A read, so it works while still locked."""
+    for srv in _read_servers():
+        hosts = [srv["host"], *srv.get("cluster_hosts", [])]
+        for host in hosts[:1]:
+            try:
+                out = subprocess.run(
+                    ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", host,
+                     "pvesh get /cluster/resources --type vm --output-format json 2>/dev/null"],
+                    capture_output=True, text=True, timeout=45).stdout
+                for v in json.loads(out):
+                    if str(v.get("vmid")) == str(vmid):
+                        return v.get("node")
+            except Exception:
+                logger.debug("vm node lookup failed via %s", host, exc_info=True)
+    return None
+
+
+def take_snapshot(vmid: str, node: str, reason: str) -> tuple[bool, str]:
+    """Snapshot a VM, using the WRITE key directly.
+
+    This is the bot acting, not the agent -- which is the whole point. The agent
+    cannot be relied on to snapshot before changing something, because this
+    process never sees its individual commands. Here we do it ourselves, before
+    handing over write access at all, so by the time the agent can change
+    anything the rollback point already exists.
+    """
+    name = f"ismart-{_dt.datetime.now():%m%d-%H%M}"
+    desc = f"iSmart-LA before: {reason[:120]}"
+    for host in _snapshot_hosts(node):
+        try:
+            proc = subprocess.run(
+                ["ssh", "-i", str(SSH_RW_KEY), "-o", "BatchMode=yes",
+                 "-o", "ConnectTimeout=15", host,
+                 f"qm snapshot {int(vmid)} {name} --description {json.dumps(desc)}"],
+                capture_output=True, text=True, timeout=180)
+        except Exception as exc:
+            logger.exception("snapshot call failed")
+            return False, str(exc)[:300]
+        err = (proc.stderr or "").strip()
+        if proc.returncode == 0:
+            register_snapshot({"vmid": vmid, "node": node or host,
+                               "snapname": name, "reason": reason[:200]})
+            return True, name
+        logger.warning("snapshot on %s failed: %s", host, err[-200:])
+    return False, err[-300:] if err else "no reachable node"
+
+
+def _snapshot_hosts(node: Optional[str]) -> list[str]:
+    """Nodes to try. qm only works on the node actually hosting the VM, so the
+    named one goes first and the rest are a fallback for a stale lookup."""
+    hosts: list[str] = []
+    for srv in _read_servers():
+        hosts += [srv["host"], *srv.get("cluster_hosts", [])]
+    if node:
+        hosts = [h for h in hosts if h == node] + [h for h in hosts if h != node]
+    return hosts or ([node] if node else [])
+
+
 WIZARD_STATE_FILE = BASE_DIR / "setup_state.json"
 # chat_id -> {"step": ..., "login": LoginHandle, "expires": ts}
 _wizard: dict[int, dict] = {}
@@ -1737,6 +1847,14 @@ def _chunk_lines(text: str, limit: int) -> list[str]:
     return chunks or [""]
 
 
+def _msg(update: Update):
+    """The message to reply to, whether this turn came from the user typing or
+    from them tapping a button (a callback update has no .message)."""
+    if update.message is not None:
+        return update.message
+    return update.callback_query.message if update.callback_query else None
+
+
 async def _reply_chunked(update: Update, text: str, tag_html: str = "") -> None:
     """Send a (possibly long) model reply, formatted. `tag_html` is appended to
     the LAST chunk only and is passed through as trusted HTML -- it's our own
@@ -1750,7 +1868,7 @@ async def _reply_chunked(update: Update, text: str, tag_html: str = "") -> None:
         if idx == len(chunks) - 1 and tag_html:
             body = f"{body}\n\n{tag_html}"
         try:
-            await update.message.reply_text(body, parse_mode="HTML")
+            await _msg(update).reply_text(body, parse_mode="HTML")
         except BadRequest as exc:
             # A malformed-entity rejection must never cost the user the whole
             # answer -- fall back to sending it unformatted rather than losing it.
@@ -1758,7 +1876,7 @@ async def _reply_chunked(update: Update, text: str, tag_html: str = "") -> None:
             plain = chunk
             if idx == len(chunks) - 1 and tag_html:
                 plain = f"{plain}\n\n{re.sub(r'<[^>]+>', '', tag_html)}"
-            await update.message.reply_text(plain)
+            await _msg(update).reply_text(plain)
 
 
 
@@ -1825,11 +1943,11 @@ async def _send_media_file(update: Update, path: str, sent_hashes: set[str]) -> 
         p = BASE_DIR / p
     if not p.exists() or not p.is_file():
         logger.warning("MEDIA path not found: %s", path)
-        await update.message.reply_text(f"⚠️ File not found, couldn't send it: {path}")
+        await _msg(update).reply_text(f"⚠️ File not found, couldn't send it: {path}")
         return
     size = p.stat().st_size
     if size > TELEGRAM_MAX_FILE_BYTES:
-        await update.message.reply_text(
+        await _msg(update).reply_text(
             f"⚠️ File {p.name} ({size / 1024 / 1024:.1f}MB) exceeds Telegram's bot "
             f"upload limit (50MB), can't send it."
         )
@@ -1849,7 +1967,7 @@ async def _send_media_file(update: Update, path: str, sent_hashes: set[str]) -> 
             blob = ""
         if any(s in blob for s in _SECRETS):
             logger.error("REFUSED to send %s -- it contains a credential", p)
-            await update.message.reply_text(
+            await _msg(update).reply_text(
                 f"🔒 *{p.name}* was not sent: it contains a credential "
                 f"(token/API key). Strip that out first if it really needs sending.",
                 parse_mode="Markdown",
@@ -1857,7 +1975,7 @@ async def _send_media_file(update: Update, path: str, sent_hashes: set[str]) -> 
             return
     try:
         with p.open("rb") as f:
-            await update.message.reply_document(
+            await _msg(update).reply_document(
                 document=f,
                 filename=p.name,
                 read_timeout=MEDIA_UPLOAD_TIMEOUT,
@@ -1869,7 +1987,7 @@ async def _send_media_file(update: Update, path: str, sent_hashes: set[str]) -> 
             sent_hashes.add(digest)
     except Exception:
         logger.exception("failed to send media file %s", path)
-        await update.message.reply_text(f"⚠️ Failed to send {p.name}: upload error.")
+        await _msg(update).reply_text(f"⚠️ Failed to send {p.name}: upload error.")
 
 
 async def cmd_new(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2774,6 +2892,10 @@ async def _pin_verified(update: Update, query, session: dict) -> None:
         await _begin_new_pin(update, query)
         return
 
+    if action == "unlock_and_resume":
+        await _do_unlock_and_resume(update, query)
+        return
+
     if action == "rmboundary":
         rule = payload["rule"]
         write_boundaries([x for x in read_boundaries() if x != rule])
@@ -2877,7 +2999,7 @@ async def offer_schedules(update: Update, proposals: list[dict]) -> None:
                 "\n\n⚠️ This task asks for WRITE access, so it can change things "
                 "with nobody watching. Only approve that if it genuinely needs to."
             )
-        await update.message.reply_text(
+        await _msg(update).reply_text(
             f"🗓 <b>Install this scheduled task?</b>\n\n"
             f"<b>Name:</b> <code>{_tg_escape(item['name'])}</code>\n"
             f"<b>When:</b> <code>{_tg_escape(item['when'])}</code>\n"
@@ -3484,6 +3606,103 @@ async def cmd_snapshots(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     await _reply_chunked(update, "\n".join(lines))
 
 
+async def offer_unlock(update: Update, reason: str, original_prompt: str,
+                       vmid: Optional[str]) -> None:
+    """Shown when the agent was refused by the read-only guard."""
+    chat_id = update.effective_chat.id
+    _pending_write[chat_id] = {
+        "prompt": original_prompt, "reason": reason, "vmid": vmid,
+        "expires": _dt.datetime.now().timestamp() + PENDING_WRITE_TTL,
+    }
+    rows = []
+    if vmid:
+        rows.append([InlineKeyboardButton(
+            f"📸 Snapshot VM {vmid}, then unlock", callback_data="nw:snap")])
+    rows.append([InlineKeyboardButton("🔓 Unlock without a snapshot", callback_data="nw:nosnap")])
+    rows.append([InlineKeyboardButton("✖️ Leave it locked", callback_data="nw:cancel")])
+
+    note = ("\n\n<i>I'll re-send your original request afterwards, so the agent picks up "
+            "where it stopped. That's a second turn — worth knowing for quota.</i>")
+    if not vmid:
+        note = ("\n\n<i>I couldn't tell which VM this is about, so there's no snapshot "
+                "offer. Snapshot it yourself first if it matters.</i>") + note
+    await update.message.reply_text(
+        f"🔒 <b>The agent needs write access.</b>\n\n"
+        f"It wants to: <b>{_tg_escape(reason[:300])}</b>\n\n"
+        f"Right now its credential physically can't change anything.{note}",
+        parse_mode="HTML", reply_markup=InlineKeyboardMarkup(rows))
+
+
+async def cmd_needwrite_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    choice = query.data.split(":", 1)[1]
+    chat_id = update.effective_chat.id
+    if not _is_trusted_origin(update):
+        await query.answer("Only the bot owner, in a private DM.", show_alert=True)
+        return
+    pending = _pending_write.get(chat_id)
+    if not pending or pending["expires"] < _dt.datetime.now().timestamp():
+        _pending_write.pop(chat_id, None)
+        await query.answer()
+        await query.edit_message_text("That request expired. Just ask again.")
+        return
+    await query.answer()
+
+    if choice == "cancel":
+        _pending_write.pop(chat_id, None)
+        await query.edit_message_text("🔒 Left locked. Nothing was changed.")
+        return
+
+    pending["snapshot"] = (choice == "snap")
+    await query.edit_message_text(
+        "📸 Snapshot then unlock — confirm with your PIN." if pending["snapshot"]
+        else "🔓 Unlock — confirm with your PIN.")
+    await request_pin(update, "unlock_and_resume",
+                      {"minutes": WRITE_MODE_DEFAULT_MINUTES},
+                      "🔓 Confirm opening write mode.")
+
+
+async def _do_unlock_and_resume(update: Update, query) -> None:
+    """PIN cleared: snapshot if asked, open write mode, then re-run the request."""
+    chat_id = update.effective_chat.id
+    pending = _pending_write.pop(chat_id, None)
+    if not pending:
+        await query.edit_message_text("That request expired. Just ask again.")
+        return
+    loop = asyncio.get_running_loop()
+
+    if pending.get("snapshot") and pending.get("vmid"):
+        vmid = pending["vmid"]
+        await query.edit_message_text(f"📸 Snapshotting VM {vmid}…")
+        node = await loop.run_in_executor(None, find_vm_node, vmid)
+        ok, detail = await loop.run_in_executor(
+            None, take_snapshot, vmid, node, pending["reason"])
+        if not ok:
+            # A failed snapshot is a reason to stop, not a detail to note in
+            # passing: proceeding would be making the change without the
+            # rollback point that was explicitly asked for.
+            await query.edit_message_text(
+                f"❌ Snapshot failed, so I've left write mode <b>closed</b>:\n"
+                f"<pre>{_tg_escape(detail)}</pre>\n\n"
+                "Storage full, or too many snapshots already? Worth checking before "
+                "changing anything. Ask again to retry, or use /unlock to proceed "
+                "without one.", parse_mode="HTML")
+            return
+        await query.edit_message_text(f"📸 Snapshot <code>{_tg_escape(detail)}</code> taken.",
+                                      parse_mode="HTML")
+
+    try:
+        until = unlock_write_mode(WRITE_MODE_DEFAULT_MINUTES)
+    except OSError as exc:
+        logger.exception("unlock failed")
+        await query.message.reply_text(f"⚠️ Couldn't unlock: {exc}")
+        return
+    left = int((until - _dt.datetime.now().timestamp()) / 60) + 1
+    await query.message.reply_text(
+        f"🔓 Write mode open for {left} min. Re-sending your request…")
+    await _run_turn(update, query.message, pending["prompt"])
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _authorized(update):
         return
@@ -3491,10 +3710,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
     if await _handle_server_input(update, context):
         return
-    chat_id = str(update.effective_chat.id)
     text = update.message.text or ""
     if not text.strip():
         return
+    await _run_turn(update, context, text)
+
+
+async def _run_turn(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
+    """One agent turn, start to finish.
+
+    Separate from handle_message because a turn can also be started by the
+    resume-after-unlock flow, which has no incoming message of its own.
+    """
+    chat_id = str(update.effective_chat.id)
 
     sessions = load_sessions()
     state = get_chat_state(sessions, chat_id)
@@ -3522,6 +3750,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     reply_text, learned_facts = extract_learned(reply_text)
     reply_text, schedule_proposals = extract_schedules(reply_text)
     reply_text, snapshots_taken = extract_snapshots(reply_text)
+    reply_text, needs_write = extract_needs_write(reply_text)
     for snap in snapshots_taken:
         register_snapshot(snap)
     clean_text, media_paths = extract_media_paths(reply_text)
@@ -3588,6 +3817,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 except Exception:
                     logger.exception("even the failure notice couldn't be delivered (chat=%s)", chat_id)
 
+    # Refused by the node guard? Offer to unlock (snapshotting first if the
+    # operator wants) and re-run. Nothing is guessed from the wording of the
+    # request -- the guard already decided; we are only reacting to it.
+    if (_is_trusted_origin(update) and _keys_configured()
+            and not write_mode_expires_at()
+            and blocked_by_readonly(result.get("result") or "", attempts)):
+        await offer_unlock(
+            update,
+            needs_write or "make a change it was blocked from making",
+            text,
+            guess_vmid(needs_write or "", text, result.get("result") or ""),
+        )
+
     usage = result.get("usage", {})
     cost = result.get("total_cost_usd")
     logger.info(
@@ -3641,6 +3883,7 @@ def main() -> None:
     app.add_handler(CommandHandler("servers", cmd_servers))
     app.add_handler(CommandHandler("removeserver", cmd_removeserver))
     app.add_handler(CallbackQueryHandler(cmd_server_button, pattern="^srv:"))
+    app.add_handler(CallbackQueryHandler(cmd_needwrite_button, pattern="^nw:"))
     app.add_handler(CommandHandler("providers", cmd_providers))
     app.add_handler(CommandHandler("schedules", cmd_schedules))
     app.add_handler(CommandHandler("unschedule", cmd_unschedule))
