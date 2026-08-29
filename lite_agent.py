@@ -170,7 +170,7 @@ CLAUDE_TIMEOUT = int(os.environ.get("CLAUDE_TIMEOUT_SECONDS", "600"))
 # Google AI Pro subscription. Tried FIRST -- both this and the Claude tiers
 # below are fixed-price subscriptions (not pay-per-token API billing), so this
 # ordering is about keeping the SEPARATE Claude Pro/Max quota in reserve, not
-# about dodging per-token spend. Claude via 9Router is the fallback. Two
+# about dodging per-token spend. Claude is the fallback. Two
 # Gemini tiers are tried in order before giving up on Gemini entirely: a
 # Haiku-equivalent (fast/cheap)
 # then a Sonnet-equivalent (more capable). The highest-effort Pro tier is
