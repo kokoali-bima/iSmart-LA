@@ -4,7 +4,7 @@ A lightweight Telegram bridge to **Claude Code** and **Antigravity CLI (agy)**, 
 infrastructure monitoring and investigation -- built to be dramatically cheaper to run
 than a full agent framework, while staying just as capable for real operational work.
 
-> **Status: v0.2b.5 -- early/beta.** Built and battle-tested against a real production
+> **Status: v0.2b.6 -- early/beta.** Built and battle-tested against a real production
 > Proxmox VE cluster over several days of iteration, including a live-fire test of the
 > unlock/PIN/snapshot flow against real infrastructure. Works well; still has known
 > rough edges (see [Known limitations](#known-limitations)).
@@ -201,6 +201,7 @@ Ollama, say), since something has to translate between protocols.
 | `/providers` | **0 tokens** | Which AI tiers are configured, and which are healthy |
 | `/usemodel [name]` | owner/admin | Force a specific tier for this chat (Opus, Gemini Pro-high, ...); `auto` for the default chain |
 | `/gdrive` | owner/admin, **0 tokens** | Pick (or show) which connected Drive account this room uploads to |
+| `/lang` (or `/language`) | owner/admin, **0 tokens** | Set/show this chat's language for the bot's own fixed replies (`en`/`id`) |
 | `/mode` | **0 tokens** | Read-only right now, or able to change things? |
 | `/unlock [min]` | owner/admin | Open a time-boxed window for real changes (capped at 10 min from a group) |
 | `/lock` | owner/admin | Close that window early |
@@ -367,11 +368,16 @@ rclone lsd gdrive: | grep "iSmart-LA Data" || rclone mkdir "gdrive:iSmart-LA Dat
 ```
 
 Once at least one account is connected, `/gdrive` in any chat shows a picker —
-tap one to make it that chat's default. **A chat must explicitly pick one before
-anything can upload there** — deliberately no silent fallback to "whichever account
-connected first," since that's exactly the kind of mistake that sends a file to the
-wrong place unnoticed. Adding a further account is still the host-side step above;
-`/gdrive` only lets a chat choose among accounts that already exist.
+tap one to make it that chat's default. **With exactly one account connected,
+every chat uses it automatically** — no ambiguity to ask about, so there's nothing
+to pick. The moment a *second* account is connected, any chat that hasn't
+explicitly chosen yet must pick one via `/gdrive` before uploading — deliberately
+no silent fallback to "whichever account connected first" once there's a real
+choice, since that's exactly the kind of default that sends a file to the wrong
+place unnoticed. A chat that was already auto-using the sole account keeps working
+unchanged; only chats that never uploaded anything are asked to choose. Adding a
+further account is still the host-side step above; `/gdrive` only lets a chat
+choose among accounts that already exist.
 
 From then on, mention "gdrive" or "Google Drive" in a normal message and where you
 want it, and the agent handles the rest:
@@ -400,6 +406,28 @@ needs no Google Cloud project of your own) is being retired sometime in 2026 and
 can occasionally hit a shared rate limit under global load (rclone retries with
 backoff automatically). If it stops working, the fix is creating your own
 `client_id` — see rclone's docs linked above.
+
+### Per-chat language (`/lang`)
+
+The bot's own fixed text — `/usemodel`, `/gdrive`, `/mode`, `/providers`,
+`/agentstatus`, `/status`, `/unlock`, `/lock` so far — can reply in English or
+Indonesian, picked per chat with `/lang en` or `/lang id` (`/language` works too,
+identically — `/lang` is just shorter to type). `/lang` alone shows what's
+currently set. New chats get asked once, the first time `/start` shows its setup
+card; existing deployments fall back to `DEFAULT_LANGUAGE` (`id` unless set
+otherwise in `.env`) until a chat picks explicitly.
+
+This is separate from two other things it's easy to conflate: **the agent's own
+answers** already mirror whatever language you write your prompt in, being an LLM
+— nothing to configure there. **`/help`** has always had its own EN/ID choice
+(`/help en`, `/help id`, or the button), picked per-message rather than stored per
+chat, and is untouched by `/lang`.
+
+Not every command is migrated yet — the rest still reply in whatever language
+their source currently has (mostly Indonesian in this deployment). Extending
+`/lang` to a given command follows the same small pattern throughout the source:
+`lang = _chat_lang(update)`, then wrap each reply string in `_t(lang, "English",
+"Indonesian")`.
 
 ### Write mode
 

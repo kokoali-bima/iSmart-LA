@@ -104,6 +104,73 @@ RCLONE_CONF = Path.home() / ".config" / "rclone" / "rclone.conf"
 # /gdrive before anything uploads, so a file never lands in an account
 # nobody meant to use for that room.
 GDRIVE_ROOM_ACCOUNTS_FILE = BASE_DIR / "gdrive_room_accounts.json"
+
+# --------------------------------------------------------------------------
+# Per-chat language for the bot's OWN fixed text (command replies) -- separate
+# from /help's own EN/ID choice (picked per-message) and separate from the
+# agent's actual answers, which already mirror whatever language the prompt
+# was written in on their own, being an LLM. This only covers the handful of
+# commands whose text is hardcoded Python, not model output.
+# --------------------------------------------------------------------------
+LANGUAGE_FILE = BASE_DIR / "chat_language.json"  # {chat_id: "en"|"id"}
+DEFAULT_LANGUAGE = os.environ.get("DEFAULT_LANGUAGE", "id")
+
+
+def _read_chat_languages() -> dict:
+    if not LANGUAGE_FILE.exists():
+        return {}
+    try:
+        return json.loads(LANGUAGE_FILE.read_text())
+    except Exception:
+        logger.warning("chat_language.json unreadable", exc_info=True)
+        return {}
+
+
+def _write_chat_languages(items: dict) -> None:
+    LANGUAGE_FILE.write_text(json.dumps(items, indent=2))
+
+
+def _chat_lang(update: Update) -> str:
+    """This chat's language for command replies. Falls back to
+    DEFAULT_LANGUAGE until set via /lang or /start's first-run prompt."""
+    chat = update.effective_chat
+    if chat is None:
+        return DEFAULT_LANGUAGE
+    return _read_chat_languages().get(str(chat.id), DEFAULT_LANGUAGE)
+
+
+def _t(lang: str, en: str, id_: str) -> str:
+    return id_ if lang == "id" else en
+
+
+async def cmd_lang(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Set (or show) this chat's language for the bot's own fixed replies.
+    The agent's actual answers already mirror whatever language you write in
+    -- this only covers commands like /usemodel, /gdrive, /mode. /help has its
+    own separate EN/ID choice, picked per-message, untouched by this."""
+    if not await _may_authorize_group_action(update, context):
+        return
+    chat_id = str(update.effective_chat.id)
+    prefs = _read_chat_languages()
+    current = prefs.get(chat_id, DEFAULT_LANGUAGE)
+    if not context.args:
+        await update.message.reply_text(_t(current,
+            f"\U0001f310 This chat's command language: <b>{current.upper()}</b>\n\n"
+            "<code>/lang en</code> or <code>/lang id</code> to change.",
+            f"\U0001f310 Bahasa command chat ini: <b>{current.upper()}</b>\n\n"
+            "<code>/lang en</code> atau <code>/lang id</code> untuk ganti.",
+        ), parse_mode="HTML")
+        return
+    choice = context.args[0].lower()
+    if choice not in ("en", "id"):
+        await update.message.reply_text(_t(current, "Usage: /lang en|id", "Pakai: /lang en|id"))
+        return
+    prefs[chat_id] = choice
+    _write_chat_languages(prefs)
+    await update.message.reply_text(_t(choice,
+        "\U0001f310 This chat now replies to commands in English.",
+        "\U0001f310 Chat ini sekarang balas command pakai Bahasa Indonesia.",
+    ))
 LIST_TOOLS_SCRIPT = BASE_DIR / "tools" / "list_tools.py"
 
 # /graduate turns the case you *just* solved into a reusable parameterized
@@ -2178,6 +2245,19 @@ def _write_gdrive_room_accounts(items: dict) -> None:
     GDRIVE_ROOM_ACCOUNTS_FILE.write_text(json.dumps(items, indent=2))
 
 
+def _gdrive_effective_default(chat_id: str, accounts: list[str]) -> Optional[str]:
+    """This room's explicitly chosen account, or -- if it has never chosen and
+    there is only ONE account connected -- that one, since there is no real
+    ambiguity to ask about. Returns None only when a genuine choice is needed
+    (two or more accounts exist and this room hasn't picked)."""
+    explicit = _read_gdrive_room_accounts().get(chat_id)
+    if explicit and explicit in accounts:
+        return explicit
+    if len(accounts) == 1:
+        return accounts[0]
+    return None
+
+
 def _sanitize_drive_folder_name(name: str) -> str:
     """A Telegram group title, made safe as a single path segment -- no
     slashes to accidentally escape into a different folder, no leading/
@@ -2230,13 +2310,17 @@ def _gdrive_upload(remote: str, local_path: str, drive_rel_path: str) -> tuple[b
 
 
 async def _send_to_gdrive(update: Update, context: ContextTypes.DEFAULT_TYPE, req: dict) -> None:
+    lang = _chat_lang(update)
     local_path = req["file"]
     p = Path(local_path)
     if not p.is_absolute():
         p = BASE_DIR / p
     if not p.exists() or not p.is_file():
         logger.warning("GDRIVE source not found: %s", local_path)
-        await _msg(update).reply_text(f"\u26a0\ufe0f File not found, couldn't upload to Drive: {local_path}")
+        await _msg(update).reply_text(_t(lang,
+            f"\u26a0\ufe0f File not found, couldn't upload to Drive: {local_path}",
+            f"\u26a0\ufe0f File tidak ditemukan, gagal upload ke Drive: {local_path}",
+        ))
         return
     size = p.stat().st_size
     # Same gate as MEDIA: delivery -- leaving the box via Drive deserves the
@@ -2248,32 +2332,41 @@ async def _send_to_gdrive(update: Update, context: ContextTypes.DEFAULT_TYPE, re
             blob = ""
         if any(sec in blob for sec in _SECRETS):
             logger.error("REFUSED to upload %s to Drive -- it contains a credential", p)
-            await _msg(update).reply_text(
+            await _msg(update).reply_text(_t(lang,
                 f"\U0001f512 *{p.name}* was not uploaded to Drive: it contains a credential "
                 f"(token/API key). Strip that out first if it really needs sending.",
-                parse_mode="Markdown",
-            )
+                f"\U0001f512 *{p.name}* tidak diupload ke Drive: berisi kredensial "
+                f"(token/API key). Hilangkan dulu kalau memang perlu dikirim.",
+            ), parse_mode="Markdown")
             return
     accounts = _list_gdrive_accounts()
     if not accounts:
-        await _msg(update).reply_text(
-            "\u26a0\ufe0f Google Drive isn't connected yet -- see README (\"Google Drive\") to set it up."
-        )
+        await _msg(update).reply_text(_t(lang,
+            "\u26a0\ufe0f Google Drive isn't connected yet -- see README (\"Google Drive\") to set it up.",
+            "\u26a0\ufe0f Google Drive belum terhubung -- lihat README (\"Google Drive\") untuk setup.",
+        ))
         return
     chat_id = str(update.effective_chat.id)
-    remote = _read_gdrive_room_accounts().get(chat_id)
-    if not remote or remote not in accounts:
-        await _msg(update).reply_text(
-            "\U0001f4c1 This room hasn't picked a Drive account yet -- run /gdrive to choose one."
-        )
+    remote = _gdrive_effective_default(chat_id, accounts)
+    if not remote:
+        await _msg(update).reply_text(_t(lang,
+            "\U0001f4c1 This room hasn't picked a Drive account yet -- run /gdrive to choose one.",
+            "\U0001f4c1 Room ini belum pilih akun Drive -- jalankan /gdrive untuk pilih.",
+        ))
         return
     rel_path = await _gdrive_effective_path(update, context, req["to"])
     loop = asyncio.get_running_loop()
     ok, detail = await loop.run_in_executor(None, _gdrive_upload, remote, str(p), rel_path)
     if ok:
-        await _msg(update).reply_text(f"\U0001f4c1 Uploaded to Drive ({remote}): {rel_path}\n{detail}")
+        await _msg(update).reply_text(_t(lang,
+            f"\U0001f4c1 Uploaded to Drive ({remote}): {rel_path}\n{detail}",
+            f"\U0001f4c1 Terupload ke Drive ({remote}): {rel_path}\n{detail}",
+        ))
     else:
-        await _msg(update).reply_text(f"\u26a0\ufe0f Drive upload failed for {rel_path}: {detail}")
+        await _msg(update).reply_text(_t(lang,
+            f"\u26a0\ufe0f Drive upload failed for {rel_path}: {detail}",
+            f"\u26a0\ufe0f Upload ke Drive gagal untuk {rel_path}: {detail}",
+        ))
 
 
 
@@ -2355,8 +2448,12 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     not by re-deriving it with an LLM every time."""
     if not _authorized(update):
         return
+    lang = _chat_lang(update)
     if not SNAPSHOT_SCRIPT.exists():
-        await update.message.reply_text(f"⚠️ Collector not installed: {SNAPSHOT_SCRIPT}")
+        await update.message.reply_text(_t(lang,
+            f"⚠️ Collector not installed: {SNAPSHOT_SCRIPT}",
+            f"⚠️ Collector belum terpasang: {SNAPSHOT_SCRIPT}",
+        ))
         return
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
     force = bool(context.args and context.args[0].lower() in ("force", "fresh", "-f"))
@@ -2364,10 +2461,13 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
     except subprocess.TimeoutExpired:
-        await update.message.reply_text("⚠️ Collector timeout (>120s).")
+        await update.message.reply_text(_t(lang, "⚠️ Collector timeout (>120s).", "⚠️ Collector timeout (>120 detik)."))
         return
     if proc.returncode != 0:
-        await update.message.reply_text(f"⚠️ Collector failed: {proc.stderr[-500:]}")
+        await update.message.reply_text(_t(lang,
+            f"⚠️ Collector failed: {proc.stderr[-500:]}",
+            f"⚠️ Collector gagal: {proc.stderr[-500:]}",
+        ))
         return
     logger.info("status command served (0 model tokens, force=%s)", force)
     await _reply_chunked(update, f"```\n{proc.stdout.strip()}\n```")
@@ -2630,8 +2730,36 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             ]]),
         )
         return
+    if str(update.effective_chat.id) not in _read_chat_languages():
+        await update.message.reply_text(
+            "\U0001f310 Which language should the bot's own replies use? Your own "
+            "messages can be in either language regardless -- this only picks the "
+            "bot's fixed text, like this wizard.\n\n"
+            "Bahasa apa untuk balasan tetap bot? Pesan Anda sendiri boleh bahasa apa "
+            "saja -- ini cuma pilih teks tetap bot, seperti wizard ini.",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("\U0001f1ee\U0001f1e9 Indonesia", callback_data="startlang:id"),
+                InlineKeyboardButton("\U0001f1ec\U0001f1e7 English", callback_data="startlang:en"),
+            ]]),
+        )
+        return
     await update.message.reply_text(_wizard_text(), parse_mode="HTML",
                                     reply_markup=_wizard_keyboard({}))
+
+
+async def cmd_start_lang_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if not _may_run_setup(update):
+        await query.answer("Not permitted.", show_alert=True)
+        return
+    await query.answer()
+    _, choice = query.data.split(":", 1)
+    chat_id = str(update.effective_chat.id)
+    prefs = _read_chat_languages()
+    prefs[chat_id] = choice
+    _write_chat_languages(prefs)
+    await query.edit_message_text(_wizard_text(), parse_mode="HTML",
+                                  reply_markup=_wizard_keyboard({}))
 
 
 async def cmd_setup_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2835,7 +2963,8 @@ Every reply ends with a "— by ..." tag. If it's ever NOT "{TIERS[0]['label']}"
 /agentstatus — live check: is each AI tier actually up right now?
 /providers — which AI tiers are configured and which are healthy (0 tokens)
 /usemodel [name] — force a specific tier for this chat (Opus, Gemini Pro-high, ...); `/usemodel auto` for the default chain
-/gdrive — is Google Drive connected, and where files land (0 tokens)
+/gdrive — pick (or show) which connected Drive account this room uploads to (0 tokens)
+/lang [en|id] — set/show this chat's language for the bot's own fixed replies (0 tokens)
 /mode — read-only right now, or able to make changes? (0 tokens)
 /unlock [minutes] — open a time-boxed window for real changes (owner anywhere, or a registered group's own admin -- capped at 10 min from a group)
 /lock — close that window early
@@ -2887,7 +3016,8 @@ Setiap balasan diakhiri tanda "— by ...". Kalau tandanya BUKAN "{TIERS[0]['lab
 /agentstatus — cek langsung: tiap tingkat AI benar-benar hidup sekarang?
 /providers — tingkat AI mana saja yang dipakai dan mana yang sehat (NOL token)
 /usemodel [nama] — paksa satu tingkatan tertentu untuk chat ini (Opus, Gemini Pro-high, ...); `/usemodel auto` untuk balik ke rantai default
-/gdrive — Google Drive sudah terhubung atau belum, dan file masuk ke mana (NOL token)
+/gdrive — pilih (atau lihat) akun Drive mana yang dipakai room ini untuk upload (NOL token)
+/lang [en|id] — atur/lihat bahasa balasan tetap bot untuk chat ini (NOL token)
 /mode — agent lagi read-only atau boleh mengubah? (NOL token)
 /unlock [menit] — buka mode tulis untuk waktu terbatas (pemilik di mana saja, atau admin grup terdaftar -- dibatasi maks 10 menit dari grup)
 /lock — tutup lebih awal
@@ -3021,23 +3151,27 @@ async def cmd_unlock(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     that hands the agent the ability to change production -- so it is not
     something a group can reach, even a registered one.
     """
+    lang = _chat_lang(update)
     if not await _may_authorize_group_action(update, context):
         logger.warning(
             "refused /unlock from chat=%s user=%s",
             getattr(update.effective_chat, "id", "?"),
             getattr(update.effective_user, "id", "?"),
         )
-        await update.message.reply_text(
-            "🔒 Bot owner, or a registered group's own admin."
-        )
+        await update.message.reply_text(_t(lang,
+            "🔒 Bot owner, or a registered group's own admin.",
+            "🔒 Pemilik bot, atau admin dari grup yang sudah terdaftar.",
+        ))
         return
     if not _keys_configured():
-        await update.message.reply_text(
+        await update.message.reply_text(_t(lang,
             "⚠️ Write-mode keys are not set up, so there is nothing to unlock — the agent "
             f"is using whatever `{SSH_ACTIVE_KEY.name}` already points at.\n\n"
             "See README (\"Write mode\") to enable the two-key setup.",
-            parse_mode="Markdown",
-        )
+            "⚠️ Kunci write-mode belum disiapkan, jadi tidak ada yang perlu dibuka — agent "
+            f"masih memakai kunci yang sekarang ada di `{SSH_ACTIVE_KEY.name}`.\n\n"
+            "Lihat README (\"Write mode\") untuk mengaktifkan setup dua kunci.",
+        ), parse_mode="Markdown")
         return
 
     cap = _effective_unlock_cap(update)
@@ -3046,7 +3180,10 @@ async def cmd_unlock(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         try:
             minutes = int(context.args[0])
         except ValueError:
-            await update.message.reply_text(f"Usage: /unlock [minutes, max {cap} here]")
+            await update.message.reply_text(_t(lang,
+                f"Usage: /unlock [minutes, max {cap} here]",
+                f"Pakai: /unlock [menit, maks {cap} di sini]",
+            ))
             return
     # Opening write access is the most consequential thing this bot can do,
     # so it takes more than a tap from a signed-in device. The PIN is the
@@ -3054,19 +3191,23 @@ async def cmd_unlock(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     # entered on a keypad so it never becomes a message in the chat.
     await request_pin(
         update, "unlock", {"minutes": minutes},
-        f"🔓 Confirm opening write mode for {min(minutes, cap)} minute(s).",
+        _t(lang,
+           f"🔓 Confirm opening write mode for {min(minutes, cap)} minute(s).",
+           f"🔓 Konfirmasi buka write mode untuk {min(minutes, cap)} menit.",
+        ),
     )
 
 
 async def cmd_lock(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await _may_authorize_group_action(update, context):
         return
+    lang = _chat_lang(update)
     was_open = write_mode_expires_at() is not None
     lock_write_mode()
-    await update.message.reply_text(
-        "🔒 Write mode closed. Back to read-only." if was_open
-        else "🔒 Already read-only."
-    )
+    await update.message.reply_text(_t(lang,
+        "🔒 Write mode closed. Back to read-only." if was_open else "🔒 Already read-only.",
+        "🔒 Write mode ditutup. Kembali read-only." if was_open else "🔒 Memang sudah read-only.",
+    ))
 
 
 async def cmd_usemodel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3077,26 +3218,39 @@ async def cmd_usemodel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     left open to anyone who can merely talk to the bot."""
     if not await _may_authorize_group_action(update, context):
         return
+    lang = _chat_lang(update)
     chat_id = str(update.effective_chat.id)
     overrides = _read_model_overrides()
 
     if not context.args:
         current = overrides.get(chat_id)
-        lines = ["\U0001f9e0 <b>Model selection</b>", ""]
+        lines = [_t(lang, "\U0001f9e0 <b>Model selection</b>", "\U0001f9e0 <b>Pilihan model</b>"), ""]
         if current:
             label = BACKEND_LABELS.get(current, current)
-            lines.append(f"Forced: <b>{_tg_escape(label)}</b> for this chat.")
-            lines.append("Every turn tries this first; the default chain still backs it up if it's unavailable.")
+            lines.append(_t(lang,
+                f"Forced: <b>{_tg_escape(label)}</b> for this chat.",
+                f"Dipaksa: <b>{_tg_escape(label)}</b> untuk chat ini.",
+            ))
+            lines.append(_t(lang,
+                "Every turn tries this first; the default chain still backs it up if it's unavailable.",
+                "Tiap turn coba ini duluan; rantai default tetap jadi cadangan kalau tidak tersedia.",
+            ))
         else:
-            lines.append(f"Auto (default chain) -- currently <b>{_tg_escape(TIERS[0]['label'])}</b> first.")
+            lines.append(_t(lang,
+                f"Auto (default chain) -- currently <b>{_tg_escape(TIERS[0]['label'])}</b> first.",
+                f"Auto (rantai default) -- sekarang <b>{_tg_escape(TIERS[0]['label'])}</b> duluan.",
+            ))
         lines.append("")
-        lines.append("Default chain (always on, cheapest first):")
+        lines.append(_t(lang, "Default chain (always on, cheapest first):", "Rantai default (selalu aktif, termurah dulu):"))
         lines.extend(f"  \u2022 {_tg_escape(t['label'])}" for t in TIERS)
         lines.append("")
-        lines.append("Extra, on-demand only:")
+        lines.append(_t(lang, "Extra, on-demand only:", "Tambahan, cuma on-demand:"))
         lines.extend(f"  \u2022 {_tg_escape(t['label'])}" for t in EXTRA_TIERS)
         lines.append("")
-        lines.append("<code>/usemodel &lt;name&gt;</code> to force one, <code>/usemodel auto</code> for the default chain.")
+        lines.append(_t(lang,
+            "<code>/usemodel &lt;name&gt;</code> to force one, <code>/usemodel auto</code> for the default chain.",
+            "<code>/usemodel &lt;nama&gt;</code> untuk paksa satu, <code>/usemodel auto</code> untuk balik ke rantai default.",
+        ))
         await update.message.reply_text("\n".join(lines), parse_mode="HTML")
         return
 
@@ -3104,22 +3258,29 @@ async def cmd_usemodel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if choice.lower() == "auto":
         if overrides.pop(chat_id, None) is not None:
             _write_model_overrides(overrides)
-        await update.message.reply_text("\U0001f504 Back to auto -- default cheapest-first chain.")
+        await update.message.reply_text(_t(lang,
+            "\U0001f504 Back to auto -- default cheapest-first chain.",
+            "\U0001f504 Balik ke auto -- rantai default termurah dulu.",
+        ))
         return
 
     tier = _find_tier_by_alias(choice)
     if not tier:
         names = ", ".join(t["label"] for t in ALL_TIERS)
-        await update.message.reply_text(f"Don't recognize {choice!r}. Options: {names}, or auto.")
+        await update.message.reply_text(_t(lang,
+            f"Don't recognize {choice!r}. Options: {names}, or auto.",
+            f"Tidak kenal {choice!r}. Pilihan: {names}, atau auto.",
+        ))
         return
 
     overrides[chat_id] = tier["model"]
     _write_model_overrides(overrides)
-    await update.message.reply_text(
+    await update.message.reply_text(_t(lang,
         f"\U0001f3af Forcing <b>{_tg_escape(tier['label'])}</b> for this chat's next turns. "
         "<code>/usemodel auto</code> to go back to the default chain.",
-        parse_mode="HTML",
-    )
+        f"\U0001f3af Memaksa <b>{_tg_escape(tier['label'])}</b> untuk turn berikutnya di chat ini. "
+        "<code>/usemodel auto</code> untuk balik ke rantai default.",
+    ), parse_mode="HTML")
 
 
 async def cmd_gdrive(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3130,31 +3291,46 @@ async def cmd_gdrive(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     /usemodel: a room-wide setting, not a per-person one."""
     if not await _may_authorize_group_action(update, context):
         return
+    lang = _chat_lang(update)
     accounts = _list_gdrive_accounts()
     if not accounts:
-        await update.message.reply_text(
+        await update.message.reply_text(_t(lang,
             "\U0001f4c1 No Google Drive account is connected yet. Ask the operator to "
             "connect one (see README \u201cGoogle Drive\u201d) -- a one-time step done "
-            "directly on the host, not through Telegram."
-        )
+            "directly on the host, not through Telegram.",
+            "\U0001f4c1 Belum ada akun Google Drive yang terhubung. Minta operator untuk "
+            "hubungkan satu (lihat README \u201cGoogle Drive\u201d) -- langkah sekali-jalan "
+            "langsung di host, bukan lewat Telegram.",
+        ))
         return
     chat_id = str(update.effective_chat.id)
-    current = _read_gdrive_room_accounts().get(chat_id)
-    lines = ["\U0001f4c1 <b>Google Drive account for this room</b>", ""]
-    if current and current in accounts:
-        lines.append(f"Currently: <b>{_tg_escape(current)}</b>")
+    explicit = _read_gdrive_room_accounts().get(chat_id)
+    effective = _gdrive_effective_default(chat_id, accounts)
+    lines = [_t(lang, "\U0001f4c1 <b>Google Drive account for this room</b>", "\U0001f4c1 <b>Akun Google Drive untuk room ini</b>"), ""]
+    if explicit and explicit in accounts:
+        lines.append(_t(lang, f"Currently: <b>{_tg_escape(explicit)}</b>", f"Sekarang: <b>{_tg_escape(explicit)}</b>"))
+    elif effective:
+        lines.append(_t(lang,
+            f"Using <b>{_tg_escape(effective)}</b> automatically -- the only account connected.",
+            f"Otomatis pakai <b>{_tg_escape(effective)}</b> -- satu-satunya akun yang terhubung.",
+        ))
     else:
-        lines.append("Not picked yet -- uploads here won't work until you choose one.")
+        lines.append(_t(lang,
+            "Not picked yet -- uploads here won't work until you choose one.",
+            "Belum dipilih -- upload di sini belum jalan sampai kamu pilih satu.",
+        ))
     lines.append("")
-    lines.append("Tap one to use it here:")
+    lines.append(_t(lang, "Tap one to use it here:", "Tap salah satu untuk dipakai di sini:"))
     rows = [[InlineKeyboardButton(
-        f"{'\u2705 ' if a == current else ''}{a}", callback_data=f"gdrv:{a}",
+        f"{'\u2705 ' if a == effective else ''}{a}", callback_data=f"gdrv:{a}",
     )] for a in accounts]
     lines.append("")
-    lines.append(
+    lines.append(_t(lang,
         "Need a different account entirely (not listed above)? That's still a "
-        "one-time step done directly on the host -- ask the operator to connect one."
-    )
+        "one-time step done directly on the host -- ask the operator to connect one.",
+        "Butuh akun lain (belum ada di atas)? Tetap langkah sekali-jalan langsung "
+        "di host -- minta operator hubungkan satu.",
+    ))
     await update.message.reply_text(
         "\n".join(lines), parse_mode="HTML", reply_markup=InlineKeyboardMarkup(rows)
     )
@@ -3162,43 +3338,53 @@ async def cmd_gdrive(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 async def cmd_gdrive_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
+    lang = _chat_lang(update)
     if not await _may_authorize_group_action(update, context):
-        await query.answer("Not permitted.", show_alert=True)
+        await query.answer(_t(lang, "Not permitted.", "Tidak diizinkan."), show_alert=True)
         return
     await query.answer()
     _, remote = query.data.split(":", 1)
     if remote not in _list_gdrive_accounts():
-        await query.edit_message_text("That account isn't connected any more. Run /gdrive again.")
+        await query.edit_message_text(_t(lang,
+            "That account isn't connected any more. Run /gdrive again.",
+            "Akun itu sudah tidak terhubung lagi. Jalankan /gdrive lagi.",
+        ))
         return
     chat_id = str(update.effective_chat.id)
     room_accounts = _read_gdrive_room_accounts()
     room_accounts[chat_id] = remote
     _write_gdrive_room_accounts(room_accounts)
-    await query.edit_message_text(
+    await query.edit_message_text(_t(lang,
         f"\U0001f4c1 This room now uploads to Drive account: <b>{_tg_escape(remote)}</b>",
-        parse_mode="HTML",
-    )
+        f"\U0001f4c1 Room ini sekarang upload ke akun Drive: <b>{_tg_escape(remote)}</b>",
+    ), parse_mode="HTML")
 
 
 async def cmd_mode(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Zero-token check of what the agent can currently do."""
     if not _authorized(update):
         return
+    lang = _chat_lang(update)
     if not _keys_configured():
-        await update.message.reply_text(
+        await update.message.reply_text(_t(lang,
             "⚠️ Write-mode keys not configured — the agent uses one fixed SSH key, so it "
-            "can change things at any time. See README (\"Write mode\") to gate that."
-        )
+            "can change things at any time. See README (\"Write mode\") to gate that.",
+            "⚠️ Kunci write-mode belum diatur — agent pakai satu kunci SSH tetap, jadi bisa "
+            "mengubah apa pun kapan saja. Lihat README (\"Write mode\") untuk memagarinya.",
+        ))
         return
     until = write_mode_expires_at()
     if until:
         left = int((until - _dt.datetime.now().timestamp()) / 60) + 1
-        await update.message.reply_text(f"🔓 Write mode OPEN — about {left} minute(s) left.")
+        await update.message.reply_text(_t(lang,
+            f"🔓 Write mode OPEN — about {left} minute(s) left.",
+            f"🔓 Write mode TERBUKA — sisa sekitar {left} menit.",
+        ))
     else:
-        await update.message.reply_text(
-            "🔒 Read-only. Investigation, audits and reports work normally.\n"
-            "Need a change? /unlock [minutes]"
-        )
+        await update.message.reply_text(_t(lang,
+            "🔒 Read-only. Investigation, audits and reports work normally.\nNeed a change? /unlock [minutes]",
+            "🔒 Read-only. Investigasi, audit, dan laporan tetap jalan normal.\nPerlu mengubah sesuatu? /unlock [menit]",
+        ))
 
 
 async def request_pin(update: Update, action: str, payload: dict, prompt: str) -> None:
@@ -3597,25 +3783,36 @@ async def cmd_providers(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     read straight from config and the in-memory cooldown table."""
     if not _authorized(update):
         return
-    lines = [f"\U0001f9e9 <b>Fallback chain ({len(TIERS)} tier(s))</b>", ""]
+    lang = _chat_lang(update)
+    lines = [f"\U0001f9e9 <b>{_t(lang, 'Fallback chain', 'Rantai fallback')} ({len(TIERS)} {_t(lang, 'tier(s)', 'tingkat')})</b>", ""]
     for i, t in enumerate(TIERS, 1):
         if _tier_available(t["model"]):
-            state = "✅ ready"
+            state = _t(lang, "✅ ready", "✅ siap")
         else:
             until, fails = _tier_cooldown[t["model"]]
             mins = int((until - _dt.datetime.now().timestamp()) / 60) + 1
-            state = f"⏸ cooling down ~{mins}m (after {fails} failure(s))"
-        role = "primary" if i == 1 else ("last resort" if i == len(TIERS) else f"fallback #{i - 1}")
+            state = _t(lang,
+                f"⏸ cooling down ~{mins}m (after {fails} failure(s))",
+                f"⏸ istirahat ~{mins}m (setelah {fails} kegagalan)",
+            )
+        role = (_t(lang, "primary", "utama") if i == 1
+                else _t(lang, "last resort", "terakhir") if i == len(TIERS)
+                else _t(lang, f"fallback #{i - 1}", f"cadangan #{i - 1}"))
         lines.append(
             f"{i}. <b>{_tg_escape(t['label'])}</b> — {role}\n"
             f"   <code>{_tg_escape(t['provider'])}</code> / <code>{_tg_escape(t['model'])}</code>\n"
             f"   {state}"
         )
-    lines.append(
+    lines.append(_t(lang,
         "\nReplies are tagged with whichever tier answered. Anything other than "
-        f"<b>{_tg_escape(TIERS[0]['label'])}</b> means the ones above it were unavailable."
-    )
-    lines.append("\n<i>Change the chain by editing TIERS in .env, then restart.</i>")
+        f"<b>{_tg_escape(TIERS[0]['label'])}</b> means the ones above it were unavailable.",
+        "\nTiap balasan ditandai tingkat yang menjawab. Kalau bukan "
+        f"<b>{_tg_escape(TIERS[0]['label'])}</b>, berarti yang di atasnya sedang tidak bisa dipakai.",
+    ))
+    lines.append(_t(lang,
+        "\n<i>Change the chain by editing TIERS in .env, then restart.</i>",
+        "\n<i>Ubah rantainya lewat TIERS di .env, lalu restart.</i>",
+    ))
     await _reply_chunked(update, "\n".join(lines), already_html=True)
 
 
@@ -4239,9 +4436,9 @@ async def check_all_tiers() -> list[dict]:
     return list(await asyncio.gather(*(_probe_one_tier(t) for t in TIERS)))
 
 
-def _format_agentstatus(results: list[dict], cached_age: Optional[float]) -> str:
+def _format_agentstatus(results: list[dict], cached_age: Optional[float], lang: str) -> str:
     up = sum(1 for r in results if r["ok"])
-    lines = [f"🩺 <b>Agent status</b> — {up}/{len(results)} online", ""]
+    lines = [f"🩺 <b>{_t(lang, 'Agent status', 'Status agent')}</b> — {up}/{len(results)} online", ""]
     for r in results:
         if r["ok"]:
             lines.append(
@@ -4256,12 +4453,17 @@ def _format_agentstatus(results: list[dict], cached_age: Optional[float]) -> str
                 f"   <i>{_tg_escape(r['error'])}</i>"
             )
     if cached_age is not None:
-        lines.append(f"\n<i>Cached, checked {int(cached_age)}s ago. /agentstatus force for a fresh check.</i>")
+        lines.append(_t(lang,
+            f"\n<i>Cached, checked {int(cached_age)}s ago. /agentstatus force for a fresh check.</i>",
+            f"\n<i>Dari cache, dicek {int(cached_age)} detik lalu. /agentstatus force untuk cek ulang.</i>",
+        ))
     else:
-        lines.append(
+        lines.append(_t(lang,
             "\n<i>Each check is a tiny real request to every tier -- a sliver of "
-            "quota, not a wasted turn. Results also feed /providers' cooldown state.</i>"
-        )
+            "quota, not a wasted turn. Results also feed /providers' cooldown state.</i>",
+            "\n<i>Tiap cek itu request nyata (kecil) ke tiap tier -- sedikit kuota, "
+            "bukan turn yang sia-sia. Hasilnya juga masuk ke status cooldown /providers.</i>",
+        ))
     return "\n".join(lines)
 
 
@@ -4272,22 +4474,25 @@ async def cmd_agentstatus(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     force = bool(context.args) and context.args[0].lower() in ("force", "refresh")
     now = _dt.datetime.now().timestamp()
     cache_age = now - _agentstatus_cache["at"]
+    lang = _chat_lang(update)
     if not force and _agentstatus_cache["results"] and cache_age < AGENTSTATUS_CACHE_SECONDS:
-        await _reply_chunked(update, _format_agentstatus(_agentstatus_cache["results"], cache_age),
+        await _reply_chunked(update, _format_agentstatus(_agentstatus_cache["results"], cache_age, lang),
                              already_html=True)
         return
 
-    msg = await update.message.reply_text(
-        f"🩺 Checking {len(TIERS)} tier(s)…")
+    msg = await update.message.reply_text(_t(lang, f"🩺 Checking {len(TIERS)} tier(s)…", f"🩺 Cek {len(TIERS)} tier…"))
     try:
         results = await asyncio.wait_for(check_all_tiers(), timeout=AGENTSTATUS_PROBE_TIMEOUT + 15)
     except asyncio.TimeoutError:
-        await msg.edit_text("⚠️ The check itself timed out. Try /agentstatus again.")
+        await msg.edit_text(_t(lang,
+            "⚠️ The check itself timed out. Try /agentstatus again.",
+            "⚠️ Pengecekannya sendiri timeout. Coba /agentstatus lagi.",
+        ))
         return
     _agentstatus_cache["at"] = now
     _agentstatus_cache["results"] = results
 
-    text = _format_agentstatus(results, None)
+    text = _format_agentstatus(results, None, lang)
     try:
         await msg.delete()
     except Exception:
@@ -4480,6 +4685,7 @@ def main() -> None:
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("cancel", cmd_cancel))
     app.add_handler(CallbackQueryHandler(cmd_setup_button, pattern="^setup:"))
+    app.add_handler(CallbackQueryHandler(cmd_start_lang_button, pattern="^startlang:"))
     app.add_handler(CommandHandler("chatid", cmd_chatid))
     app.add_handler(CommandHandler("registergroup", cmd_registergroup))
     app.add_handler(CommandHandler("unregistergroup", cmd_unregistergroup))
@@ -4514,6 +4720,7 @@ def main() -> None:
     app.add_handler(CommandHandler("lock", cmd_lock))
     app.add_handler(CommandHandler("usemodel", cmd_usemodel))
     app.add_handler(CommandHandler("gdrive", cmd_gdrive))
+    app.add_handler(CommandHandler(["lang", "language"], cmd_lang))
     app.add_handler(CallbackQueryHandler(cmd_gdrive_button, pattern="^gdrv:"))
     app.add_handler(CommandHandler("mode", cmd_mode))
     app.add_handler(CommandHandler("learned", cmd_learned))

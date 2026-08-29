@@ -1,5 +1,37 @@
 # Changelog
 
+## v0.2b.6 -- per-chat language (`/lang`), Google Drive auto-picks a sole account
+
+**`/lang` (or `/language`) sets which language the bot's own fixed text replies
+in, per chat** -- English or Indonesian, independent of `/help`'s own separate
+EN/ID choice and independent of the agent's actual answers, which already mirror
+whatever language a prompt is written in on their own. A new chat gets asked once,
+the first time `/start` shows its setup card; an already-set-up deployment keeps
+replying in `DEFAULT_LANGUAGE` (`id` unless set otherwise) until a chat picks
+explicitly. Migrated the 8 commands with the most hardcoded text so far --
+`/usemodel`, `/gdrive` (+ its picker button), `/mode`, `/providers`,
+`/agentstatus`, `/status`, `/unlock`, `/lock` -- via a small `_t(lang, en, id)`
+helper; the rest still reply in whatever language their source currently has
+(mostly Indonesian in this deployment). This also fully collapses those 8
+functions' old repo=English/production=Indonesian fork into one shared,
+bilingual source -- both copies are now byte-identical there (docstrings aside).
+
+**Google Drive: with exactly one account connected, every chat uses it
+automatically** -- no ambiguity to ask about, so `/gdrive`'s picker only becomes
+mandatory the moment a *second* account is connected. A chat that was already
+auto-using the sole account keeps working unchanged when a second account
+appears; only chats that never uploaded anything get asked to choose.
+
+**Also fixed:** `/help`'s `/gdrive` line still described the pre-multi-account
+single-status version -- missed when `cmd_gdrive` itself was rewritten for
+v0.2b.5's picker. Synced in both languages, in both repo and production copies.
+
+19/19 new tests pass for the language system (gating, persistence, the
+confirmation message's own language, migrated commands actually flipping output);
+the existing `/usemodel` (20/20) and Google Drive (26/26, two new cases added for
+the auto-default behavior) suites re-verified with no regressions.
+
+
 ## v0.2b.5 -- multiple Drive accounts, per-room default, group auto-scoping; /help fully synced
 
 **More than one Google Drive account can be connected now**, each its own rclone
