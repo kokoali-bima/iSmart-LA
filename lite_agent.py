@@ -3455,21 +3455,28 @@ async def request_pin(update: Update, action: str, payload: dict, prompt: str) -
     The action is NOT performed here -- it is parked with the session and only
     runs once the PIN checks out, in _pin_verified().
     """
+    lang = _chat_lang(update)
     if not pin_is_set():
-        await update.effective_message.reply_text(
+        await update.effective_message.reply_text(_t(lang,
             "🔢 No PIN is set yet, so sensitive actions are blocked.\n"
-            "Set one first with /setpin (owner, private DM)."
-        )
+            "Set one first with /setpin (owner, private DM).",
+            "🔢 PIN belum diatur, jadi aksi sensitif diblokir.\n"
+            "Atur dulu dengan /setpin (owner, DM pribadi).",
+        ))
         return
     left = pin_locked_out()
     if left:
-        await update.effective_message.reply_text(
-            f"⛔ Too many wrong PIN attempts. Locked for another {left // 60 + 1} minute(s)."
-        )
+        await update.effective_message.reply_text(_t(lang,
+            f"⛔ Too many wrong PIN attempts. Locked for another {left // 60 + 1} minute(s).",
+            f"⛔ Terlalu banyak PIN salah. Terkunci {left // 60 + 1} menit lagi.",
+        ))
         return
     token = _new_pin_session(action, payload, update.effective_chat.id)
     await update.effective_message.reply_text(
-        f"{prompt}\n\n🔢 Enter your {PIN_LENGTH}-digit PIN:\n{_pin_masked(0)}",
+        f"{prompt}\n\n" + _t(lang,
+            f"🔢 Enter your {PIN_LENGTH}-digit PIN:\n{_pin_masked(0)}",
+            f"🔢 Masukkan {PIN_LENGTH}-digit PIN Anda:\n{_pin_masked(0)}",
+        ),
         reply_markup=_pin_keyboard(token, 0),
     )
 
@@ -3490,9 +3497,11 @@ async def cmd_pin_key(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     global _pin_lockout_until
     query = update.callback_query
     _, token, key = query.data.split(":", 2)
+    lang = _chat_lang(update)
     session = _pin_sessions.get(token)
     if not session:
-        await query.answer("This PIN entry expired — start again.", show_alert=True)
+        await query.answer(_t(lang, "This PIN entry expired — start again.",
+                                   "PIN ini sudah kedaluwarsa — mulai lagi."), show_alert=True)
         return
     # Who may drive the keypad depends on the action: most stay owner-only,
     # but a registered group's own admin may complete a schedule they were
@@ -3502,24 +3511,26 @@ async def cmd_pin_key(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     else:
         may_touch = _is_owner(update)
     if not may_touch:
-        await query.answer("Not permitted.", show_alert=True)
+        await query.answer(_t(lang, "Not permitted.", "Tidak diizinkan."), show_alert=True)
         return
     # ...but the action decides whether this is an acceptable PLACE to do it.
     if (session["action"] not in PIN_ACTIONS_ALLOWED_IN_GROUP
             and not _is_trusted_origin(update)):
-        await query.answer("This action can only be confirmed in a private DM.",
-                           show_alert=True)
+        await query.answer(_t(lang,
+            "This action can only be confirmed in a private DM.",
+            "Aksi ini cuma bisa dikonfirmasi lewat DM pribadi.",
+        ), show_alert=True)
         return
     if session["expires"] < _dt.datetime.now().timestamp():
         _pin_sessions.pop(token, None)
-        await query.answer("Expired.", show_alert=True)
-        await query.edit_message_text("🔢 PIN entry expired.")
+        await query.answer(_t(lang, "Expired.", "Kedaluwarsa."), show_alert=True)
+        await query.edit_message_text(_t(lang, "🔢 PIN entry expired.", "🔢 PIN sudah kedaluwarsa."))
         return
 
     if key == "cancel":
         _pin_sessions.pop(token, None)
         await query.answer()
-        await query.edit_message_text("✖️ Cancelled.")
+        await query.edit_message_text(_t(lang, "✖️ Cancelled.", "✖️ Dibatalkan."))
         return
     if key == "del":
         session["digits"] = session["digits"][:-1]
@@ -3528,7 +3539,8 @@ async def cmd_pin_key(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     await query.answer()
 
     header = (query.message.text or "").split("\n🔢")[0].split("\n●")[0].split("\n○")[0]
-    header = header.split("\n❌")[0].rstrip() + f"\n\n🔢 {PIN_LENGTH}-digit PIN:"
+    header = header.split("\n❌")[0].rstrip() + _t(lang,
+        f"\n\n🔢 {PIN_LENGTH}-digit PIN:", f"\n\n🔢 {PIN_LENGTH}-digit PIN Anda:")
     filled = len(session["digits"])
     if filled < PIN_LENGTH:
         await _redraw(query, header, token, filled)
@@ -3548,14 +3560,19 @@ async def cmd_pin_key(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             _pin_sessions.pop(token, None)
             _pin_lockout_until = _dt.datetime.now().timestamp() + PIN_LOCKOUT_SECONDS
             logger.error("PIN lockout triggered after %d failed attempts", PIN_MAX_ATTEMPTS)
-            await query.edit_message_text(
+            await query.edit_message_text(_t(lang,
                 f"⛔ Wrong PIN {PIN_MAX_ATTEMPTS} times. Locked for "
-                f"{PIN_LOCKOUT_SECONDS // 60} minutes."
-            )
+                f"{PIN_LOCKOUT_SECONDS // 60} minutes.",
+                f"⛔ PIN salah {PIN_MAX_ATTEMPTS} kali. Terkunci "
+                f"{PIN_LOCKOUT_SECONDS // 60} menit.",
+            ))
             return
         remaining = PIN_MAX_ATTEMPTS - session["attempts"]
         logger.warning("wrong PIN (%d attempt(s) left)", remaining)
-        await _redraw(query, header, token, 0, f"\n❌ Wrong PIN — {remaining} attempt(s) left.")
+        await _redraw(query, header, token, 0, _t(lang,
+            f"\n❌ Wrong PIN — {remaining} attempt(s) left.",
+            f"\n❌ PIN salah — {remaining} percobaan lagi.",
+        ))
         return
 
     _pin_sessions.pop(token, None)
@@ -3565,25 +3582,31 @@ async def cmd_pin_key(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 async def _pin_capture(update: Update, query, session: dict, token: str, entered: str) -> None:
     """Two-step entry for a new PIN: type it, then type it again. A mistyped PIN
     that locks you out of your own production changes is a bad afternoon."""
+    lang = _chat_lang(update)
     if session["action"] == "new_pin_capture":
         _pin_sessions.pop(token, None)
         confirm_token = _new_pin_session("new_pin_confirm", {"first": entered},
                                          update.effective_chat.id)
-        await query.edit_message_text(
+        await query.edit_message_text(_t(lang,
             f"🔢 Enter the same {PIN_LENGTH} digits again to confirm:\n{_pin_masked(0)}",
-            reply_markup=_pin_keyboard(confirm_token, 0),
-        )
+            f"🔢 Masukkan lagi {PIN_LENGTH} digit yang sama untuk konfirmasi:\n{_pin_masked(0)}",
+        ), reply_markup=_pin_keyboard(confirm_token, 0))
         return
 
     _pin_sessions.pop(token, None)
     if entered != session["payload"]["first"]:
-        await query.edit_message_text("❌ The two entries didn't match. Run /setpin again.")
+        await query.edit_message_text(_t(lang,
+            "❌ The two entries didn't match. Run /setpin again.",
+            "❌ Dua isian tidak sama. Ulangi /setpin.",
+        ))
         return
     set_pin(entered)
-    await query.edit_message_text(
+    await query.edit_message_text(_t(lang,
         "✅ PIN set. It now guards scheduled tasks and /unlock.\n"
-        "It is stored only as a salted hash, and it is never typed into the chat."
-    )
+        "It is stored only as a salted hash, and it is never typed into the chat.",
+        "✅ PIN tersimpan. Sekarang menjaga task terjadwal dan /unlock.\n"
+        "Disimpan hanya sebagai hash yang di-salt, dan tidak pernah diketik di chat.",
+    ))
 
 
 async def _pin_verified(update: Update, context: ContextTypes.DEFAULT_TYPE,
@@ -3599,10 +3622,12 @@ async def _pin_verified(update: Update, context: ContextTypes.DEFAULT_TYPE,
         await _do_unlock_and_resume(update, context, query)
         return
 
+    lang = _chat_lang(update)
     if action == "rmboundary":
         rule = payload["rule"]
         write_boundaries([x for x in read_boundaries() if x != rule])
-        await query.edit_message_text(f"🚧 Removed: {_tg_escape(rule)}", parse_mode="HTML")
+        await query.edit_message_text(_t(lang, f"🚧 Removed: {_tg_escape(rule)}",
+                                              f"🚧 Dihapus: {_tg_escape(rule)}"), parse_mode="HTML")
         return
 
     if action == "addserver":
@@ -3615,14 +3640,16 @@ async def _pin_verified(update: Update, context: ContextTypes.DEFAULT_TYPE,
             install_schedule(item, update.effective_user.id)
         except Exception as exc:
             logger.exception("schedule install failed")
-            await query.edit_message_text(f"⚠️ Could not install: {exc}")
+            await query.edit_message_text(_t(lang, f"⚠️ Could not install: {exc}", f"⚠️ Gagal pasang: {exc}"))
             return
-        await query.edit_message_text(
+        await query.edit_message_text(_t(lang,
             f"✅ Installed <b>{_tg_escape(item['name'])}</b> — runs "
             f"<code>{_tg_escape(item['when'])}</code>.\n"
             f"See /schedules, remove with /unschedule {_tg_escape(item['name'])}.",
-            parse_mode="HTML",
-        )
+            f"✅ Terpasang <b>{_tg_escape(item['name'])}</b> — jalan "
+            f"<code>{_tg_escape(item['when'])}</code>.\n"
+            f"Lihat /schedules, hapus dengan /unschedule {_tg_escape(item['name'])}.",
+        ), parse_mode="HTML")
         return
 
     if action == "unlock":
@@ -3630,30 +3657,40 @@ async def _pin_verified(update: Update, context: ContextTypes.DEFAULT_TYPE,
             until = unlock_write_mode(payload["minutes"], max_minutes=_effective_unlock_cap(update))
         except OSError as exc:
             logger.exception("unlock failed")
-            await query.edit_message_text(f"⚠️ Could not unlock: {exc}")
+            await query.edit_message_text(_t(lang, f"⚠️ Could not unlock: {exc}", f"⚠️ Gagal buka: {exc}"))
             return
         left = int((until - _dt.datetime.now().timestamp()) / 60) + 1
-        await query.edit_message_text(
+        await query.edit_message_text(_t(lang,
             f"🔓 Write mode open for {left} minute(s). It re-locks by itself; "
-            "/lock closes it sooner. Hard boundaries still apply."
-        )
+            "/lock closes it sooner. Hard boundaries still apply.",
+            f"🔓 Write mode terbuka {left} menit. Terkunci sendiri lagi nanti; "
+            "/lock untuk tutup lebih awal. Hard boundaries tetap berlaku.",
+        ))
         return
 
     logger.error("unknown PIN action: %s", action)
-    await query.edit_message_text("⚠️ Internal error: unknown action.")
+    await query.edit_message_text(_t(lang, "⚠️ Internal error: unknown action.", "⚠️ Error internal: aksi tidak dikenal."))
 
 
 async def _begin_new_pin(update: Update, query=None) -> None:
     token = _new_pin_session("new_pin_capture", {}, update.effective_chat.id)
     chat = update.effective_chat
     in_group = bool(chat and chat.type != "private")
+    lang = _chat_lang(update)
     text = (
-        f"🔢 Choose a new {PIN_LENGTH}-digit PIN.\n"
-        "Avoid birthdays and 123456 — this is the last gate in front of "
-        f"production changes.\n"
-        + ("\n\u2139\ufe0f You're doing this in a group. Your digits stay private "
-           "(they never become a message), but the group can see that you're "
-           "setting a PIN right now.\n" if in_group else "")
+        _t(lang, f"🔢 Choose a new {PIN_LENGTH}-digit PIN.\n", f"🔢 Pilih PIN baru {PIN_LENGTH} digit.\n")
+        + _t(lang,
+             "Avoid birthdays and 123456 — this is the last gate in front of production changes.\n",
+             "Hindari tanggal lahir dan 123456 — ini gerbang terakhir sebelum perubahan production.\n",
+        )
+        + (_t(lang,
+             "\n\u2139\ufe0f You're doing this in a group. Your digits stay private "
+             "(they never become a message), but the group can see that you're "
+             "setting a PIN right now.\n",
+             "\n\u2139\ufe0f Kamu lagi di grup. Digitnya tetap privat "
+             "(tidak pernah jadi pesan), tapi grup bisa lihat kamu sedang "
+             "mengatur PIN sekarang.\n",
+        ) if in_group else "")
         + f"{_pin_masked(0)}"
     )
     kb = _pin_keyboard(token, 0)
@@ -3677,8 +3714,10 @@ async def cmd_setpin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         # doesn't exist or they simply aren't allowed to use it.
         return
     if pin_is_set():
-        await request_pin(update, "change_pin_start", {},
-                          "🔢 Changing your PIN. First, confirm the CURRENT one.")
+        await request_pin(update, "change_pin_start", {}, _t(_chat_lang(update),
+            "🔢 Changing your PIN. First, confirm the CURRENT one.",
+            "🔢 Mengganti PIN. Konfirmasi dulu PIN yang SEKARANG.",
+        ))
         return
     await _begin_new_pin(update)
 
@@ -3696,23 +3735,26 @@ async def offer_schedules(update: Update, proposals: list[dict]) -> None:
             f"{item['name']}{_dt.datetime.now().timestamp()}".encode()
         ).hexdigest()[:16]
         _pending_schedules[token] = item
+        lang = _chat_lang(update)
         warn = ""
         if item["needs_write"]:
-            warn = (
+            warn = _t(lang,
                 "\n\n⚠️ This task asks for WRITE access, so it can change things "
-                "with nobody watching. Only approve that if it genuinely needs to."
+                "with nobody watching. Only approve that if it genuinely needs to.",
+                "\n\n⚠️ Task ini minta akses TULIS, jadi bisa mengubah sesuatu "
+                "tanpa ada yang mengawasi. Setujui cuma kalau memang perlu.",
             )
         await _msg(update).reply_text(
-            f"🗓 <b>Install this scheduled task?</b>\n\n"
-            f"<b>Name:</b> <code>{_tg_escape(item['name'])}</code>\n"
-            f"<b>When:</b> <code>{_tg_escape(item['when'])}</code>\n"
-            f"<b>Runs:</b> <code>{_tg_escape(item['run'][:300])}</code>\n"
-            f"<b>Write access:</b> {'YES' if item['needs_write'] else 'no'}"
-            f"{warn}",
+            _t(lang, f"🗓 <b>Install this scheduled task?</b>\n\n", f"🗓 <b>Pasang jadwal ini?</b>\n\n")
+            + _t(lang, f"<b>Name:</b> ", f"<b>Nama:</b> ") + f"<code>{_tg_escape(item['name'])}</code>\n"
+            + _t(lang, f"<b>When:</b> ", f"<b>Kapan:</b> ") + f"<code>{_tg_escape(item['when'])}</code>\n"
+            + _t(lang, f"<b>Runs:</b> ", f"<b>Menjalankan:</b> ") + f"<code>{_tg_escape(item['run'][:300])}</code>\n"
+            + _t(lang, f"<b>Write access:</b> ", f"<b>Akses tulis:</b> ") + ('YES' if item['needs_write'] else 'no')
+            + warn,
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("✅ Install", callback_data=f"sched_ok:{token}"),
-                InlineKeyboardButton("✖️ Cancel", callback_data=f"sched_no:{token}"),
+                InlineKeyboardButton(_t(lang, "✅ Install", "✅ Pasang"), callback_data=f"sched_ok:{token}"),
+                InlineKeyboardButton(_t(lang, "✖️ Cancel", "✖️ Batal"), callback_data=f"sched_no:{token}"),
             ]]),
         )
 
@@ -3720,28 +3762,35 @@ async def offer_schedules(update: Update, proposals: list[dict]) -> None:
 async def cmd_schedule_decision(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     action, _, token = query.data.partition(":")
+    lang = _chat_lang(update)
     if not await _may_authorize_group_action(update, context):
-        await query.answer("Bot owner, or a registered group's own admin.", show_alert=True)
+        await query.answer(_t(lang, "Bot owner, or a registered group's own admin.",
+                                   "Pemilik bot, atau admin dari grup yang sudah terdaftar."), show_alert=True)
         return
     item = _pending_schedules.pop(token, None)
     if not item:
         await query.answer()
-        await query.edit_message_text("That proposal has expired — ask again if you still want it.")
+        await query.edit_message_text(_t(lang,
+            "That proposal has expired — ask again if you still want it.",
+            "Proposal itu sudah kedaluwarsa — minta lagi kalau masih mau.",
+        ))
         return
     if action == "sched_no":
         await query.answer()
-        await query.edit_message_text(f"✖️ Not installed: {item['name']}")
+        await query.edit_message_text(_t(lang, f"✖️ Not installed: {item['name']}", f"✖️ Tidak dipasang: {item['name']}"))
         return
     # The tap alone is not the authorisation. It only says WHICH proposal; the
     # PIN says a person -- not just a logged-in device -- actually wants it.
     await query.answer()
-    await query.edit_message_text(
+    await query.edit_message_text(_t(lang,
         f"🗓 Installing <b>{_tg_escape(item['name'])}</b> — confirm with your PIN.",
-        parse_mode="HTML",
-    )
+        f"🗓 Memasang <b>{_tg_escape(item['name'])}</b> — konfirmasi dengan PIN.",
+    ), parse_mode="HTML")
     await request_pin(
-        update, "schedule_install", {"item": item},
-        f"🗓 Confirm installing scheduled task <b>{_tg_escape(item['name'])}</b>.",
+        update, "schedule_install", {"item": item}, _t(lang,
+            f"🗓 Confirm installing scheduled task <b>{_tg_escape(item['name'])}</b>.",
+            f"🗓 Konfirmasi pasang task terjadwal <b>{_tg_escape(item['name'])}</b>.",
+        ),
     )
 
 
@@ -3812,12 +3861,19 @@ async def cmd_adopt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Pull pre-existing cron entries into the registry so they become visible
     and removable. Written for a real case: the agent installed a daily report
     before this feature existed, and it was invisible from Telegram."""
+    lang = _chat_lang(update)
     if not _is_trusted_origin(update):
-        await update.message.reply_text("🔒 Only the bot owner, in a private DM.")
+        await update.message.reply_text(_t(lang,
+            "🔒 Only the bot owner, in a private DM.",
+            "🔒 Hanya pemilik bot, lewat DM pribadi.",
+        ))
         return
     orphans = unmanaged_cron_lines()
     if not orphans:
-        await update.message.reply_text("Nothing to adopt — every cron entry is already managed.")
+        await update.message.reply_text(_t(lang,
+            "Nothing to adopt — every cron entry is already managed.",
+            "Tidak ada yang perlu di-adopt — semua cron entry sudah terkelola.",
+        ))
         return
     items = _read_schedules()
     known = {s["name"] for s in items}
@@ -3843,16 +3899,21 @@ async def cmd_adopt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         adopted.append(name)
         adopted_raw_lines.add(line.strip())
     if not adopted:
-        await update.message.reply_text("Found cron entries but could not parse any of them.")
+        await update.message.reply_text(_t(lang,
+            "Found cron entries but could not parse any of them.",
+            "Ada cron entry ditemukan tapi tidak ada yang bisa di-parse.",
+        ))
         return
     # strip_lines removes the ORIGINAL raw line now that it lives in the
     # managed block under a new name -- without this it would run twice.
     _rebuild_crontab(items, strip_lines=adopted_raw_lines)
     _write_schedules(items)
-    await update.message.reply_text(
+    await update.message.reply_text(_t(lang,
         f"✅ Adopted {len(adopted)} entry/entries: {', '.join(adopted)}\n"
-        "They now show in /schedules and can be removed with /unschedule."
-    )
+        "They now show in /schedules and can be removed with /unschedule.",
+        f"✅ Ter-adopt {len(adopted)} entry: {', '.join(adopted)}\n"
+        "Sekarang muncul di /schedules dan bisa dihapus dengan /unschedule.",
+    ))
 
 
 async def cmd_providers(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -4391,29 +4452,49 @@ async def offer_unlock(update: Update, reason: str, original_prompt: str,
         "prompt": original_prompt, "reason": reason, "vmid": vmid,
         "expires": _dt.datetime.now().timestamp() + PENDING_WRITE_TTL,
     }
+    lang = _chat_lang(update)
     offer_snapshot = vmid and needs_snapshot_offer(reason)
     rows = []
     if offer_snapshot:
         rows.append([InlineKeyboardButton(
-            f"📸 Snapshot VM {vmid}, then unlock", callback_data="nw:snap")])
-        rows.append([InlineKeyboardButton("🔓 Unlock without a snapshot", callback_data="nw:nosnap")])
+            _t(lang, f"📸 Snapshot VM {vmid}, then unlock", f"📸 Snapshot VM {vmid}, lalu unlock"),
+            callback_data="nw:snap")])
+        rows.append([InlineKeyboardButton(
+            _t(lang, "🔓 Unlock without a snapshot", "🔓 Unlock tanpa snapshot"), callback_data="nw:nosnap")])
     else:
-        rows.append([InlineKeyboardButton("🔓 Unlock", callback_data="nw:nosnap")])
-    rows.append([InlineKeyboardButton("✖️ Leave it locked", callback_data="nw:cancel")])
+        rows.append([InlineKeyboardButton(_t(lang, "🔓 Unlock", "🔓 Unlock"), callback_data="nw:nosnap")])
+    rows.append([InlineKeyboardButton(_t(lang, "✖️ Leave it locked", "✖️ Biarkan terkunci"), callback_data="nw:cancel")])
 
-    note = ("\n\n<i>Afterwards I'll tell the agent to continue — it keeps the same "
-            "conversation, so it doesn't re-investigate, just carries on. That is a "
-            "second turn, but a short one.</i>")
+    note = _t(lang,
+        "\n\n<i>Afterwards I'll tell the agent to continue — it keeps the same "
+        "conversation, so it doesn't re-investigate, just carries on. That is a "
+        "second turn, but a short one.</i>",
+        "\n\n<i>Setelah ini saya suruh agent lanjut — masih di percakapan yang sama, "
+        "jadi tidak menyelidiki ulang, cuma lanjut. Itu turn kedua, tapi singkat.</i>",
+    )
     if vmid and not offer_snapshot:
-        note = ("\n\n<i>No snapshot offer for a plain power operation -- it wouldn't "
-                "protect anything a reboot could touch.</i>") + note
+        note = _t(lang,
+            "\n\n<i>No snapshot offer for a plain power operation -- it wouldn't "
+            "protect anything a reboot could touch.</i>",
+            "\n\n<i>Tidak ada tawaran snapshot untuk operasi power biasa -- tidak ada "
+            "yang perlu dilindungi dari sekadar reboot.</i>",
+        ) + note
     elif not vmid:
-        note = ("\n\n<i>I couldn't tell which VM this is about, so there's no snapshot "
-                "offer. Snapshot it yourself first if it matters.</i>") + note
+        note = _t(lang,
+            "\n\n<i>I couldn't tell which VM this is about, so there's no snapshot "
+            "offer. Snapshot it yourself first if it matters.</i>",
+            "\n\n<i>Saya tidak bisa tahu VM mana yang dimaksud, jadi tidak ada tawaran "
+            "snapshot. Snapshot sendiri dulu kalau itu penting.</i>",
+        ) + note
     await update.message.reply_text(
-        f"🔒 <b>The agent needs write access.</b>\n\n"
-        f"It wants to: <b>{_tg_escape(reason[:300])}</b>\n\n"
-        f"Right now its credential physically can't change anything.{note}",
+        _t(lang,
+           f"🔒 <b>The agent needs write access.</b>\n\n"
+           f"It wants to: <b>{_tg_escape(reason[:300])}</b>\n\n"
+           f"Right now its credential physically can't change anything.{note}",
+           f"🔒 <b>Agent butuh akses tulis.</b>\n\n"
+           f"Ingin: <b>{_tg_escape(reason[:300])}</b>\n\n"
+           f"Kredensialnya secara fisik belum bisa mengubah apa pun sekarang.{note}",
+        ),
         parse_mode="HTML", reply_markup=InlineKeyboardMarkup(rows))
 
 
@@ -4421,44 +4502,53 @@ async def cmd_needwrite_button(update: Update, context: ContextTypes.DEFAULT_TYP
     query = update.callback_query
     choice = query.data.split(":", 1)[1]
     chat_id = update.effective_chat.id
+    lang = _chat_lang(update)
     if not await _may_authorize_group_action(update, context):
-        await query.answer("Bot owner, or a registered group's own admin.", show_alert=True)
+        await query.answer(_t(lang, "Bot owner, or a registered group's own admin.",
+                                   "Pemilik bot, atau admin dari grup yang sudah terdaftar."), show_alert=True)
         return
     pending = _pending_write.get(chat_id)
     if not pending or pending["expires"] < _dt.datetime.now().timestamp():
         _pending_write.pop(chat_id, None)
         await query.answer()
-        await query.edit_message_text("That request expired. Just ask again.")
+        await query.edit_message_text(_t(lang, "That request expired. Just ask again.",
+                                               "Permintaan itu sudah kedaluwarsa. Minta lagi saja."))
         return
     await query.answer()
 
     if choice == "cancel":
         _pending_write.pop(chat_id, None)
-        await query.edit_message_text("🔒 Left locked. Nothing was changed.")
+        await query.edit_message_text(_t(lang, "🔒 Left locked. Nothing was changed.",
+                                               "🔒 Tetap terkunci. Tidak ada yang diubah."))
         return
 
     pending["snapshot"] = (choice == "snap")
-    await query.edit_message_text(
+    await query.edit_message_text(_t(lang,
         "📸 Snapshot then unlock — confirm with your PIN." if pending["snapshot"]
-        else "🔓 Unlock — confirm with your PIN.")
+        else "🔓 Unlock — confirm with your PIN.",
+        "📸 Snapshot lalu unlock — konfirmasi dengan PIN." if pending["snapshot"]
+        else "🔓 Unlock — konfirmasi dengan PIN.",
+    ))
     await request_pin(update, "unlock_and_resume",
                       {"minutes": WRITE_MODE_DEFAULT_MINUTES},
-                      "🔓 Confirm opening write mode.")
+                      _t(lang, "🔓 Confirm opening write mode.", "🔓 Konfirmasi buka write mode."))
 
 
 async def _do_unlock_and_resume(update: Update, context: ContextTypes.DEFAULT_TYPE,
                                 query) -> None:
     """PIN cleared: snapshot if asked, open write mode, then re-run the request."""
     chat_id = update.effective_chat.id
+    lang = _chat_lang(update)
     pending = _pending_write.pop(chat_id, None)
     if not pending:
-        await query.edit_message_text("That request expired. Just ask again.")
+        await query.edit_message_text(_t(lang, "That request expired. Just ask again.",
+                                               "Permintaan itu sudah kedaluwarsa. Minta lagi saja."))
         return
     loop = asyncio.get_running_loop()
 
     if pending.get("snapshot") and pending.get("vmid"):
         vmid = pending["vmid"]
-        await query.edit_message_text(f"📸 Snapshotting VM {vmid}…")
+        await query.edit_message_text(_t(lang, f"📸 Snapshotting VM {vmid}…", f"📸 Snapshot VM {vmid}…"))
         node = await loop.run_in_executor(None, find_vm_node, vmid)
         ok, detail = await loop.run_in_executor(
             None, take_snapshot, vmid, node, pending["reason"])
@@ -4466,21 +4556,29 @@ async def _do_unlock_and_resume(update: Update, context: ContextTypes.DEFAULT_TY
             # A failed snapshot is a reason to stop, not a detail to note in
             # passing: proceeding would be making the change without the
             # rollback point that was explicitly asked for.
-            await query.edit_message_text(
+            await query.edit_message_text(_t(lang,
                 f"❌ Snapshot failed, so I've left write mode <b>closed</b>:\n"
                 f"<pre>{_tg_escape(detail)}</pre>\n\n"
                 "Storage full, or too many snapshots already? Worth checking before "
                 "changing anything. Ask again to retry, or use /unlock to proceed "
-                "without one.", parse_mode="HTML")
+                "without one.",
+                f"❌ Snapshot gagal, jadi write mode saya biarkan <b>tertutup</b>:\n"
+                f"<pre>{_tg_escape(detail)}</pre>\n\n"
+                "Storage penuh, atau sudah kebanyakan snapshot? Layak dicek dulu "
+                "sebelum mengubah apa pun. Minta lagi untuk coba ulang, atau pakai "
+                "/unlock untuk lanjut tanpa snapshot.",
+            ), parse_mode="HTML")
             return
-        await query.edit_message_text(f"📸 Snapshot <code>{_tg_escape(detail)}</code> taken.",
-                                      parse_mode="HTML")
+        await query.edit_message_text(_t(lang,
+            f"📸 Snapshot <code>{_tg_escape(detail)}</code> taken.",
+            f"📸 Snapshot <code>{_tg_escape(detail)}</code> selesai.",
+        ), parse_mode="HTML")
 
     try:
         until = unlock_write_mode(WRITE_MODE_DEFAULT_MINUTES, max_minutes=_effective_unlock_cap(update))
     except OSError as exc:
         logger.exception("unlock failed")
-        await query.message.reply_text(f"⚠️ Couldn't unlock: {exc}")
+        await query.message.reply_text(_t(lang, f"⚠️ Couldn't unlock: {exc}", f"⚠️ Gagal buka: {exc}"))
         return
     left = int((until - _dt.datetime.now().timestamp()) / 60) + 1
 
@@ -4495,8 +4593,10 @@ async def _do_unlock_and_resume(update: Update, context: ContextTypes.DEFAULT_TY
         # No NEEDS_WRITE line to quote, so fall back to the original request.
         follow_up = pending["prompt"]
 
-    await query.message.reply_text(
-        f"🔓 Write mode open for {left} min. Telling the agent to continue…")
+    await query.message.reply_text(_t(lang,
+        f"🔓 Write mode open for {left} min. Telling the agent to continue…",
+        f"🔓 Write mode terbuka {left} menit. Menyuruh agent lanjut…",
+    ))
     await _run_turn(update, context, follow_up)
 
 

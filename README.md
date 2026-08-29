@@ -4,7 +4,7 @@ A lightweight Telegram bridge to **Claude Code** and **Antigravity CLI (agy)**, 
 infrastructure monitoring and investigation -- built to be dramatically cheaper to run
 than a full agent framework, while staying just as capable for real operational work.
 
-> **Status: v0.2b.7 -- early/beta.** Built and battle-tested against a real production
+> **Status: v0.2b.8 -- early/beta.** Built and battle-tested against a real production
 > Proxmox VE cluster over several days of iteration, including a live-fire test of the
 > unlock/PIN/snapshot flow against real infrastructure. Works well; still has known
 > rough edges (see [Known limitations](#known-limitations)).
@@ -416,17 +416,18 @@ once, the first time `/start` shows its setup card; existing deployments fall
 back to `DEFAULT_LANGUAGE` (`id` unless set otherwise in `.env`) until a chat
 picks explicitly.
 
-29 commands are migrated so far — everything except the multi-step flows
-(`/start`'s wizard, `/setpin` and the PIN keypad, `/addserver`'s wizard, `/adopt`,
-and the schedule/unlock confirmation cards), which still reply in whatever
-language their source currently has (mostly Indonesian in this deployment):
+37 commands are migrated so far, including the whole PIN system and the
+schedule/unlock confirmation cards — everything except `/start`'s own wizard and
+`/addserver`'s wizard, which still reply in whatever language their source
+currently has (mostly Indonesian in this deployment):
 
 `/usemodel`, `/gdrive` (+ its picker button), `/mode`, `/providers`,
 `/agentstatus`, `/status`, `/unlock`, `/lock`, `/new`, `/session`, `/sessions`,
 `/remember`, `/memory`, `/tools`, `/graduate`, `/chatid`, `/registergroup`,
 `/unregistergroup`, `/cancel`, `/learned`, `/forget`, `/servers`,
 `/removeserver`, `/boundaries`, `/addboundary`, `/rmboundary`, `/snapshots`,
-`/schedules`, `/unschedule`.
+`/schedules`, `/unschedule`, `/setpin` (+ the PIN keypad), `/adopt`, and the
+scheduled-task and write-mode confirmation cards.
 
 This is separate from two other things it's easy to conflate: **the agent's own
 answers** already mirror whatever language you write your prompt in, being an LLM

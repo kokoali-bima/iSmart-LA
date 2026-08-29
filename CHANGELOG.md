@@ -1,5 +1,26 @@
 # Changelog
 
+## v0.2b.8 -- `/lang` migration reaches the PIN system and confirmation cards (37 total)
+
+Follow-up to v0.2b.7: migrated the PIN system itself -- `request_pin`,
+`cmd_pin_key` (the keypad handler), `_pin_capture`, `_pin_verified` (every
+action branch: rmboundary, schedule_install, unlock), `_begin_new_pin`,
+`/setpin` -- plus the schedule and write-mode confirmation cards:
+`offer_schedules`, `cmd_schedule_decision`, `/adopt`, `offer_unlock`,
+`cmd_needwrite_button`, `_do_unlock_and_resume`. 37 commands total now
+respect `/lang`; what's left is specifically `/start`'s own setup wizard and
+`/addserver`'s wizard.
+
+This was deliberately its own batch rather than folded into v0.2b.7: the PIN
+system is what every other sensitive action (`/unlock`, `/rmboundary`,
+`/addserver`, scheduling) confirms through, so getting it right mattered more
+than moving fast through it.
+
+22/22 new tests pass (PIN flows and confirmation cards checked in both
+languages); all four earlier language/feature suites re-verified with no
+regressions. Deployed and restarted with 0 errors.
+
+
 ## v0.2b.7 -- `/lang` migration extended to 21 more commands (29 total)
 
 Follow-up to v0.2b.6: migrated the rest of the single-message commands to the
