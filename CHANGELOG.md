@@ -1,5 +1,37 @@
 # Changelog
 
+## v0.2b.4 -- Google Drive delivery
+
+**The agent can now save a file straight to Google Drive**, not just send it through
+Telegram. Mention "gdrive" (or Google Drive) and where you want it in a normal
+message -- the agent creates the file, then emits `GDRIVE: file=<path> | to=<relative
+path>`, which the bot picks up: uploads via [rclone](https://rclone.org/drive/)
+(creating any missing subfolder automatically -- nothing needs pre-registering),
+replies with a shareable link, and strips the marker line from what you see. New
+`/gdrive` (0 tokens) reports whether it's connected and where files land.
+
+Connecting the account is a **one-time step done directly on the host, not through
+Telegram** -- same reasoning as the SSH keypair setup: OAuth needs a real browser,
+and this is infrequent enough that a guided chat wizard isn't worth building yet.
+Uses `scope=drive.file`, so the connected account only ever exposes files rclone
+itself creates -- never the rest of that Drive. Same secret-scan gate already used
+for Telegram delivery applies here too: a file containing a credential is refused,
+not uploaded.
+
+One root folder ("iSmart-LA Data" by default) holds everything; per-request
+subfolders (e.g. one per client) are named in the message itself, not configured
+ahead of time -- `/usemodel`'s "ask for it by name" shape applied to a different
+problem.
+
+Verified with a real end-to-end upload against the actual connected account (not
+just mocked) -- file landed in the right nested subfolder, correct shareable link
+returned, cleaned up after. 16/16 mocked tests pass otherwise: extraction, the
+credential gate, not-configured handling, and rclone's copyto/link subprocess shape.
+Also documented (in passing): rclone's shared default OAuth client is being retired
+sometime in 2026 and can hit a shared rate limit under load -- noted in the README,
+not yet worked around with a dedicated client_id.
+
+
 ## v0.2b.3 -- `/usemodel`: two extra tiers, opt-in only
 
 **`/usemodel` adds Claude Opus and Gemini Pro-high as extra tiers, without touching

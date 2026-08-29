@@ -92,6 +92,14 @@ LOG_FILE = BASE_DIR / "lite-agent.log"
 # involved, so a repeat of an already-solved case costs zero tokens. See /status.
 RUN_SCHEDULED = BASE_DIR / "tools" / "run_scheduled.py"
 SNAPSHOT_SCRIPT = BASE_DIR / "tools" / "cluster_snapshot.py"
+# Google Drive delivery -- connecting the account is a one-time step done
+# directly on the host (like the SSH keypair), not through Telegram; this is
+# just what runs once it already is connected. drive.file OAuth scope means
+# the connected account only ever exposes files rclone itself created.
+RCLONE_BIN = os.environ.get("RCLONE_BIN", "rclone")
+GDRIVE_REMOTE = os.environ.get("GDRIVE_REMOTE", "gdrive")
+GDRIVE_ROOT = os.environ.get("GDRIVE_ROOT", "iSmart-LA Data")
+RCLONE_CONF = Path.home() / ".config" / "rclone" / "rclone.conf"
 LIST_TOOLS_SCRIPT = BASE_DIR / "tools" / "list_tools.py"
 
 # /graduate turns the case you *just* solved into a reusable parameterized
@@ -829,6 +837,23 @@ def extract_snapshots(text: str) -> tuple[str, list[dict]]:
             out.append({"vmid": fields["vmid"], "node": fields.get("node", "?"),
                         "snapname": fields["name"], "reason": fields.get("reason", "")})
     return SNAPSHOT_LINE_RE.sub("", text).strip(), out
+
+
+GDRIVE_LINE_RE = re.compile(r"^\s*GDRIVE:\s*(.+?)\s*$", re.MULTILINE)
+
+
+def extract_gdrive(text: str) -> tuple[str, list[dict]]:
+    """GDRIVE: file=/tmp/report.md | to=ikan/A/report.md -- destination is
+    always relative to GDRIVE_ROOT, filename included."""
+    out = []
+    for raw in GDRIVE_LINE_RE.findall(text):
+        fields = {}
+        for chunk in raw.split("|"):
+            k, _, v = chunk.partition("=")
+            fields[k.strip().lower()] = v.strip()
+        if fields.get("file") and fields.get("to"):
+            out.append({"file": fields["file"], "to": fields["to"]})
+    return GDRIVE_LINE_RE.sub("", text).strip(), out
 
 
 SERVERS_FILE = BASE_DIR / "servers.json"
@@ -2121,6 +2146,76 @@ async def _send_media_file(update: Update, path: str, sent_hashes: set[str]) -> 
         await _msg(update).reply_text(f"⚠️ Failed to send {p.name}: upload error.")
 
 
+def _gdrive_configured() -> bool:
+    if not RCLONE_CONF.exists():
+        return False
+    try:
+        return f"[{GDRIVE_REMOTE}]" in RCLONE_CONF.read_text(encoding="utf-8")
+    except OSError:
+        return False
+
+
+def _gdrive_upload(local_path: str, drive_rel_path: str) -> tuple[bool, str]:
+    """Copy one local file to GDRIVE_ROOT/drive_rel_path via rclone, then fetch
+    a shareable link. Blocking -- call via loop.run_in_executor. rclone creates
+    any missing intermediate folders on its own, so the caller never needs to
+    check or create the destination first."""
+    dest = f"{GDRIVE_REMOTE}:{GDRIVE_ROOT}/{drive_rel_path}"
+    try:
+        subprocess.run(
+            [RCLONE_BIN, "copyto", local_path, dest],
+            check=True, capture_output=True, text=True, timeout=120,
+        )
+        link = subprocess.run(
+            [RCLONE_BIN, "link", dest],
+            check=True, capture_output=True, text=True, timeout=30,
+        )
+        return True, link.stdout.strip()
+    except subprocess.CalledProcessError as exc:
+        return False, ((exc.stderr or exc.stdout or str(exc)) or "").strip()[:500]
+    except subprocess.TimeoutExpired:
+        return False, "timed out talking to Google Drive"
+
+
+async def _send_to_gdrive(update: Update, req: dict) -> None:
+    local_path = req["file"]
+    p = Path(local_path)
+    if not p.is_absolute():
+        p = BASE_DIR / p
+    if not p.exists() or not p.is_file():
+        logger.warning("GDRIVE source not found: %s", local_path)
+        await _msg(update).reply_text(f"\u26a0\ufe0f File not found, couldn't upload to Drive: {local_path}")
+        return
+    size = p.stat().st_size
+    # Same gate as MEDIA: delivery -- leaving the box via Drive deserves the
+    # same caution as leaving it via Telegram.
+    if _SECRETS and size <= 8 * 1024 * 1024:
+        try:
+            blob = p.read_bytes().decode("utf-8", errors="ignore")
+        except OSError:
+            blob = ""
+        if any(sec in blob for sec in _SECRETS):
+            logger.error("REFUSED to upload %s to Drive -- it contains a credential", p)
+            await _msg(update).reply_text(
+                f"\U0001f512 *{p.name}* was not uploaded to Drive: it contains a credential "
+                f"(token/API key). Strip that out first if it really needs sending.",
+                parse_mode="Markdown",
+            )
+            return
+    if not _gdrive_configured():
+        await _msg(update).reply_text(
+            "\u26a0\ufe0f Google Drive isn't connected yet -- see README (\"Google Drive\") to set it up."
+        )
+        return
+    loop = asyncio.get_running_loop()
+    ok, detail = await loop.run_in_executor(None, _gdrive_upload, str(p), req["to"])
+    if ok:
+        await _msg(update).reply_text(f"\U0001f4c1 Uploaded to Drive: {req['to']}\n{detail}")
+    else:
+        await _msg(update).reply_text(f"\u26a0\ufe0f Drive upload failed for {req['to']}: {detail}")
+
+
+
 async def cmd_new(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _authorized(update):
         return
@@ -2679,6 +2774,7 @@ Every reply ends with a "— by ..." tag. If it's ever NOT "{TIERS[0]['label']}"
 /agentstatus — live check: is each AI tier actually up right now?
 /providers — which AI tiers are configured and which are healthy (0 tokens)
 /usemodel [name] — force a specific tier for this chat (Opus, Gemini Pro-high, ...); `/usemodel auto` for the default chain
+/gdrive — is Google Drive connected, and where files land (0 tokens)
 /mode — read-only right now, or able to make changes? (0 tokens)
 /unlock [minutes] — owner-only, DM-only: allow real changes for a limited window
 /lock — close that window early
@@ -2942,6 +3038,28 @@ async def cmd_usemodel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await update.message.reply_text(
         f"\U0001f3af Forcing <b>{_tg_escape(tier['label'])}</b> for this chat's next turns. "
         "<code>/usemodel auto</code> to go back to the default chain.",
+        parse_mode="HTML",
+    )
+
+
+async def cmd_gdrive(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Status check for the Google Drive connection -- connecting the account
+    itself is a one-time step done directly on the host, not through Telegram
+    (same as the SSH keypair setup), so this only reports what's already there."""
+    if not _authorized(update):
+        return
+    if not _gdrive_configured():
+        await update.message.reply_text(
+            "\U0001f4c1 Google Drive isn't connected. Ask the operator to set it up "
+            "(see README \u201cGoogle Drive\u201d) -- a one-time step done directly on "
+            "the host, not through Telegram."
+        )
+        return
+    await update.message.reply_text(
+        f"\U0001f4c1 Google Drive connected. Files land under <b>{_tg_escape(GDRIVE_ROOT)}</b> "
+        "in that account's Drive, inside whatever subfolder you name.\n\n"
+        "Just mention \u201cgdrive\u201d (or Google Drive) and where you want it, e.g.:\n"
+        "<code>save this as report.md to gdrive /client-a/report.md</code>",
         parse_mode="HTML",
     )
 
@@ -4115,6 +4233,7 @@ async def _run_turn(update: Update, context: ContextTypes.DEFAULT_TYPE, text: st
     for snap in snapshots_taken:
         register_snapshot(snap)
     clean_text, media_paths = extract_media_paths(reply_text)
+    clean_text, gdrive_requests = extract_gdrive(clean_text)
 
     # Persist BEFORE delivery: if Telegram is having a bad moment, the thing the
     # agent worked out about this environment shouldn't be lost with the message.
@@ -4146,6 +4265,8 @@ async def _run_turn(update: Update, context: ContextTypes.DEFAULT_TYPE, text: st
             sent_hashes: set[str] = set()
             for path in media_paths:
                 await _send_media_file(update, path, sent_hashes)
+            for req in gdrive_requests:
+                await _send_to_gdrive(update, req)
             if schedule_proposals and await _may_authorize_group_action(update, context):
                 await offer_schedules(update, schedule_proposals)
             elif schedule_proposals:
@@ -4276,6 +4397,7 @@ def main() -> None:
     app.add_handler(CommandHandler("unlock", cmd_unlock))
     app.add_handler(CommandHandler("lock", cmd_lock))
     app.add_handler(CommandHandler("usemodel", cmd_usemodel))
+    app.add_handler(CommandHandler("gdrive", cmd_gdrive))
     app.add_handler(CommandHandler("mode", cmd_mode))
     app.add_handler(CommandHandler("learned", cmd_learned))
     app.add_handler(CommandHandler("forget", cmd_forget))

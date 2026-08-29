@@ -167,6 +167,23 @@ cd <slides_dir> && zip -j -q /path/to/cluster_slides.zip slide*.jpg
 Deliver the `.zip` plus the HTML report via `MEDIA:` lines, and delete any oversized
 intermediate files before finishing.
 
+## Saving a file to Google Drive
+
+If the user explicitly mentions "gdrive" or "Google Drive" and names (or implies) a
+destination, create the file locally first (as above), then add a line by itself:
+
+GDRIVE: file=<local file path> | to=<relative/path/including-filename>
+
+Example -- user says "simpan history percakapan ini di file A.md ke folder gdrive
+/ikan/A" -> after writing /tmp/A.md:
+
+GDRIVE: file=/tmp/A.md | to=ikan/A/A.md
+
+The bot uploads it and replies with a shareable link; the marker line itself is
+stripped from what the user sees. The destination folder is created automatically if
+it doesn't exist yet -- you never need to check or create it first. Only do this when
+Drive is explicitly named; otherwise deliver via MEDIA: as usual.
+
 ## Batch independent tool calls together
 
 Request multiple INDEPENDENT actions as PARALLEL tool calls in the SAME turn instead

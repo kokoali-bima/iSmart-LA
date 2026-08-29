@@ -4,7 +4,7 @@ A lightweight Telegram bridge to **Claude Code** and **Antigravity CLI (agy)**, 
 infrastructure monitoring and investigation -- built to be dramatically cheaper to run
 than a full agent framework, while staying just as capable for real operational work.
 
-> **Status: v0.2b.3 -- early/beta.** Built and battle-tested against a real production
+> **Status: v0.2b.4 -- early/beta.** Built and battle-tested against a real production
 > Proxmox VE cluster over several days of iteration, including a live-fire test of the
 > unlock/PIN/snapshot flow against real infrastructure. Works well; still has known
 > rough edges (see [Known limitations](#known-limitations)).
@@ -200,6 +200,7 @@ Ollama, say), since something has to translate between protocols.
 | `/agentstatus` | tiny probe each | Live check: is each tier actually up right now? |
 | `/providers` | **0 tokens** | Which AI tiers are configured, and which are healthy |
 | `/usemodel [name]` | owner/admin | Force a specific tier for this chat (Opus, Gemini Pro-high, ...); `auto` for the default chain |
+| `/gdrive` | **0 tokens** | Is Google Drive connected, and where files land |
 | `/mode` | **0 tokens** | Read-only right now, or able to change things? |
 | `/unlock [min]` | owner/admin | Open a time-boxed window for real changes (capped at 10 min from a group) |
 | `/lock` | owner/admin | Close that window early |
@@ -321,6 +322,54 @@ one. Both `/addserver` and `/removeserver` are owner-or-group-admin, and
 Only a marked block of `~/.ssh/config` is ever rewritten; anything you put there
 by hand is copied through untouched (tested explicitly — clobbering somebody's
 own SSH config would be a worse bug than the one this fixes).
+
+### Google Drive (optional)
+
+Lets the agent save a file straight to a Google Drive folder instead of (or in
+addition to) sending it through Telegram — useful once reports need to land
+somewhere a client or teammate can browse, not just be attached to a chat message.
+
+**Connecting the account is a one-time step done directly on the host, not through
+Telegram** — the same reasoning as the SSH keypair: an OAuth flow needs a real
+browser, and this is infrequent enough that a guided chat wizard isn't worth
+building. Uses [rclone](https://rclone.org/drive/) with `scope=drive.file`, so the
+connected account only ever exposes files rclone itself creates — never your
+existing Drive contents.
+
+```bash
+# on any machine with a browser (does not have to be the server):
+rclone authorize "drive" --drive-scope drive.file
+# paste the resulting {"access_token": ...} JSON into a file on the server, then:
+python3 -c '
+from pathlib import Path
+import json, sys
+token = Path("/tmp/gdrive_token.json").read_text().strip()
+json.loads(token)  # sanity-check
+conf = Path.home() / ".config/rclone/rclone.conf"
+conf.parent.mkdir(parents=True, exist_ok=True)
+conf.write_text(f"[gdrive]\ntype = drive\nscope = drive.file\ntoken = {token}\n")
+conf.chmod(0o600)
+'
+rclone mkdir "gdrive:iSmart-LA Data"   # the root folder every upload lands under
+```
+
+Once connected, nothing else is needed — `/gdrive` confirms the connection and
+where files land (0 tokens). From then on, mention "gdrive" or "Google Drive" in a
+normal message and where you want it, and the agent handles the rest:
+
+> "save this as report.md to gdrive /client-a/report.md"
+
+The agent creates the file, then emits a line the bot recognises
+(`GDRIVE: file=<local path> | to=<relative path>`), which is stripped from what
+you see; the bot uploads it (creating any missing subfolder automatically) and
+replies with a shareable link. Same secret-scan gate as sending a file through
+Telegram — a file containing a credential is refused, not uploaded.
+
+**Known limitation:** rclone's shared default `client_id` (used above, since it
+needs no Google Cloud project of your own) is being retired sometime in 2026 and
+can occasionally hit a shared rate limit under global load (rclone retries with
+backoff automatically). If it stops working, the fix is creating your own
+`client_id` — see rclone's docs linked above.
 
 ### Write mode
 
