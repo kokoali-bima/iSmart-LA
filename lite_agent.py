@@ -2379,18 +2379,25 @@ async def cmd_new(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     active = state["active"]
     state["sessions"][active] = dict(EMPTY_SESSION)
     save_sessions(sessions)
-    await update.message.reply_text(f"Session '{active}' restarted (fresh). \U0001f9f9")
+    lang = _chat_lang(update)
+    await update.message.reply_text(_t(lang,
+        f"Session '{active}' restarted (fresh). \U0001f9f9",
+        f"Sesi '{active}' dimulai ulang (fresh). \U0001f9f9",
+    ))
 
 
 async def cmd_session(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _authorized(update):
         return
+    lang = _chat_lang(update)
     name = " ".join(context.args).strip() if context.args else ""
     if not name:
-        await update.message.reply_text(
+        await update.message.reply_text(_t(lang,
             "Usage: /session <name>\nExample: /session incident-123\n"
-            "Use /sessions to see existing sessions."
-        )
+            "Use /sessions to see existing sessions.",
+            "Pakai: /session <nama>\nContoh: /session qradar-incident\n"
+            "Ketik /sessions buat lihat daftar sesi yang sudah ada.",
+        ))
         return
     chat_id = str(update.effective_chat.id)
     sessions = load_sessions()
@@ -2401,9 +2408,15 @@ async def cmd_session(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     state["active"] = name
     save_sessions(sessions)
     if is_new:
-        await update.message.reply_text(f"New session '{name}' created & active. \U0001f4c2")
+        await update.message.reply_text(_t(lang,
+            f"New session '{name}' created & active. \U0001f4c2",
+            f"Sesi baru '{name}' dibuat & aktif. \U0001f4c2",
+        ))
     else:
-        await update.message.reply_text(f"Switched to session '{name}' (continuing from before). \U0001f4c2")
+        await update.message.reply_text(_t(lang,
+            f"Switched to session '{name}' (continuing from before). \U0001f4c2",
+            f"Pindah ke sesi '{name}' (lanjut dari sebelumnya). \U0001f4c2",
+        ))
 
 
 async def cmd_sessions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2412,23 +2425,28 @@ async def cmd_sessions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     chat_id = str(update.effective_chat.id)
     sessions = load_sessions()
     state = get_chat_state(sessions, chat_id)
-    lines = ["\U0001f4c2 Saved sessions:"]
+    lang = _chat_lang(update)
+    lines = [_t(lang, "\U0001f4c2 Saved sessions:", "\U0001f4c2 Sesi tersimpan:")]
     for name in state["sessions"]:
-        marker = " (active)" if name == state["active"] else ""
+        marker = _t(lang, " (active)", " (aktif)") if name == state["active"] else ""
         lines.append(f"• {name}{marker}")
-    lines.append("\nSwitch session: /session <name>")
+    lines.append(_t(lang, "\nSwitch session: /session <name>", "\nPindah sesi: /session <nama>"))
     await update.message.reply_text("\n".join(lines))
 
 
 async def cmd_remember(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _authorized(update):
         return
+    lang = _chat_lang(update)
     fact = " ".join(context.args).strip() if context.args else ""
     if not fact:
-        await update.message.reply_text("Usage: /remember <fact to remember permanently>")
+        await update.message.reply_text(_t(lang,
+            "Usage: /remember <fact to remember permanently>",
+            "Pakai: /remember <fakta yang mau disimpan permanen>",
+        ))
         return
     append_memory(fact)
-    await update.message.reply_text(f"\U0001f4dd Remembered: {fact}")
+    await update.message.reply_text(_t(lang, f"\U0001f4dd Remembered: {fact}", f"\U0001f4dd Diingat: {fact}"))
 
 
 async def cmd_memory(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2436,7 +2454,11 @@ async def cmd_memory(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         return
     text = load_memory_text()
     if not text:
-        await update.message.reply_text("MEMORY.md is empty. Add facts with /remember <fact>.")
+        lang = _chat_lang(update)
+        await update.message.reply_text(_t(lang,
+            "MEMORY.md is empty. Add facts with /remember <fact>.",
+            "MEMORY.md masih kosong. Tambah lewat /remember <fakta>.",
+        ))
         return
     await _reply_chunked(update, text)
 
@@ -2477,13 +2499,17 @@ async def cmd_tools(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """List graduated skills. Zero model tokens -- just reads the registry."""
     if not _authorized(update):
         return
+    lang = _chat_lang(update)
     if not LIST_TOOLS_SCRIPT.exists():
-        await update.message.reply_text(f"⚠️ Not installed: {LIST_TOOLS_SCRIPT}")
+        await update.message.reply_text(_t(lang,
+            f"⚠️ Not installed: {LIST_TOOLS_SCRIPT}",
+            f"⚠️ Belum terpasang: {LIST_TOOLS_SCRIPT}",
+        ))
         return
     proc = subprocess.run(
         ["python3", str(LIST_TOOLS_SCRIPT)], capture_output=True, text=True, timeout=30
     )
-    out = proc.stdout.strip() or proc.stderr.strip() or "(empty)"
+    out = proc.stdout.strip() or proc.stderr.strip() or _t(lang, "(empty)", "(kosong)")
     await _reply_chunked(update, f"```\n{out}\n```")
 
 
@@ -2495,13 +2521,17 @@ async def cmd_graduate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     worth saving."""
     if not _authorized(update):
         return
+    lang = _chat_lang(update)
     name = "-".join(context.args).strip().lower() if context.args else ""
     if not name or not re.fullmatch(r"[a-z0-9][a-z0-9_-]*", name):
-        await update.message.reply_text(
+        await update.message.reply_text(_t(lang,
             "Usage: /graduate <script-name>\n"
             "Example: /graduate backup-coverage\n"
-            "(lowercase letters, digits, - and _ only)"
-        )
+            "(lowercase letters, digits, - and _ only)",
+            "Pakai: /graduate <nama-script>\n"
+            "Contoh: /graduate backup-coverage\n"
+            "(huruf kecil, angka, - dan _ saja)",
+        ))
         return
 
     chat_id = str(update.effective_chat.id)
@@ -2510,12 +2540,16 @@ async def cmd_graduate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     active = state["active"]
     claude_session_id = state["sessions"].get(active, {}).get("claude", {}).get(CLAUDE_MODEL_PRIMARY)
     if not claude_session_id:
-        await update.message.reply_text(
+        await update.message.reply_text(_t(lang,
             "No Claude ('dede iku') conversation in this session to graduate yet "
             "(if the last turn was answered by Gemini/'mini', /graduate can't see "
             "that history -- current limitation, each tier keeps its own history). "
-            "Ask again until Claude answers, or finish the case first, then /graduate."
-        )
+            "Ask again until Claude answers, or finish the case first, then /graduate.",
+            "Belum ada percakapan Claude (dede iku) di sesi ini buat di-graduate (kalau turn "
+            "terakhir dijawab Gemini/mini, /graduate belum bisa lihat history-nya -- "
+            "keterbatasan saat ini, tiap backend punya history sendiri). Coba tanya ulang "
+            "sampai dijawab Claude dulu, atau selesaikan kasusnya, baru /graduate.",
+        ))
         return
 
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
@@ -2539,7 +2573,7 @@ async def cmd_graduate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         name, usage.get("input_tokens"), usage.get("output_tokens"),
         usage.get("cache_read_input_tokens"),
     )
-    await _reply_chunked(update, result.get("result") or "(no response)")
+    await _reply_chunked(update, result.get("result") or _t(lang, "(no response)", "(tidak ada respons)"))
 
 
 async def cmd_chatid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2549,24 +2583,30 @@ async def cmd_chatid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     safe to leave open even to people not yet authorized for anything else."""
     chat = update.effective_chat
     user = update.effective_user
-    kind = {"private": "Private DM", "group": "Group", "supergroup": "Supergroup", "channel": "Channel"}.get(
-        chat.type, chat.type
-    )
+    lang = _chat_lang(update)
+    kind = _t(lang,
+        {"private": "Private DM", "group": "Group", "supergroup": "Supergroup", "channel": "Channel"},
+        {"private": "DM pribadi", "group": "Grup", "supergroup": "Supergrup", "channel": "Channel"},
+    ).get(chat.type, chat.type)
     lines = [
         f"\U0001f4cd Chat ID ({kind}): `{chat.id}`",
     ]
     if user:
-        lines.append(f"\U0001f464 Your User ID: `{user.id}`")
+        lines.append(_t(lang, f"\U0001f464 Your User ID: `{user.id}`", f"\U0001f464 User ID kamu: `{user.id}`"))
     if chat.type != "private":
-        lines.append(
+        lines.append(_t(lang,
             "\nTo open this bot to EVERY member of this group, ask an admin to run "
-            "`/registergroup` here (or send the Chat ID above to an admin)."
-        )
+            "`/registergroup` here (or send the Chat ID above to an admin).",
+            "\nBuat buka akses bot ini ke SEMUA anggota grup ini, minta admin ketik "
+            "`/registergroup` di grup ini (atau kirim Chat ID di atas ke admin).",
+        ))
     else:
-        lines.append(
+        lines.append(_t(lang,
             "\nTo request personal access (not via a group), send the User ID above "
-            "to an admin to be added to `ALLOWED_USER_IDS`."
-        )
+            "to an admin to be added to `ALLOWED_USER_IDS`.",
+            "\nBuat minta akses personal (bukan lewat grup), kirim User ID di atas "
+            "ke admin buat ditambahkan ke `ALLOWED_USER_IDS`.",
+        ))
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
@@ -2618,22 +2658,27 @@ async def cmd_registergroup(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         # Deliberately don't reveal *why* -- same non-response whether the
         # command doesn't exist or the user isn't allowed to use it.
         return
+    lang = _chat_lang(update)
     chat = update.effective_chat
     if chat.type == "private":
-        await update.message.reply_text(
-            "This command is for groups, not a private DM -- run it inside the group you want to open access to."
-        )
+        await update.message.reply_text(_t(lang,
+            "This command is for groups, not a private DM -- run it inside the group you want to open access to.",
+            "Command ini buat grup, bukan DM pribadi -- jalankan di dalam grup yang mau dibuka aksesnya.",
+        ))
         return
     if chat.id in ALLOWED_GROUP_IDS:
-        await update.message.reply_text(f"This group (`{chat.id}`) is already registered.", parse_mode="Markdown")
+        await update.message.reply_text(_t(lang,
+            f"This group (`{chat.id}`) is already registered.",
+            f"Grup ini (`{chat.id}`) sudah terdaftar sebelumnya.",
+        ), parse_mode="Markdown")
         return
     ALLOWED_GROUP_IDS.add(chat.id)
     _save_allowed_groups_file(ALLOWED_GROUP_IDS)
     logger.info("group registered by admin: chat_id=%s title=%s", chat.id, chat.title)
-    await update.message.reply_text(
+    await update.message.reply_text(_t(lang,
         f"✅ Group *{chat.title or chat.id}* registered. Every member can now use this bot.",
-        parse_mode="Markdown",
-    )
+        f"✅ Grup *{chat.title or chat.id}* terdaftar. Semua anggota sekarang bisa pakai bot ini.",
+    ), parse_mode="Markdown")
 
 
 async def cmd_unregistergroup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2642,14 +2687,18 @@ async def cmd_unregistergroup(update: Update, context: ContextTypes.DEFAULT_TYPE
     whitelisted) are untouched."""
     if not _is_admin(update):
         return
+    lang = _chat_lang(update)
     chat = update.effective_chat
     if chat.id not in ALLOWED_GROUP_IDS:
-        await update.message.reply_text("This group isn't registered.")
+        await update.message.reply_text(_t(lang, "This group isn't registered.", "Grup ini belum/tidak terdaftar."))
         return
     ALLOWED_GROUP_IDS.discard(chat.id)
     _save_allowed_groups_file(ALLOWED_GROUP_IDS)
     logger.info("group unregistered by admin: chat_id=%s title=%s", chat.id, chat.title)
-    await update.message.reply_text(f"Access revoked for group *{chat.title or chat.id}*.", parse_mode="Markdown")
+    await update.message.reply_text(_t(lang,
+        f"Access revoked for group *{chat.title or chat.id}*.",
+        f"Akses grup *{chat.title or chat.id}* dicabut.",
+    ), parse_mode="Markdown")
 
 
 def _may_run_setup(update: Update) -> bool:
@@ -2906,12 +2955,13 @@ async def _handle_wizard_input(update: Update, context: ContextTypes.DEFAULT_TYP
 async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _authorized(update):
         return
+    lang = _chat_lang(update)
     state = _wizard.pop(update.effective_chat.id, None)
     if state:
         state["handle"].kill()
-        await update.message.reply_text("✖️ Cancelled.")
+        await update.message.reply_text(_t(lang, "✖️ Cancelled.", "✖️ Dibatalkan."))
     else:
-        await update.message.reply_text("Nothing to cancel.")
+        await update.message.reply_text(_t(lang, "Nothing to cancel.", "Tidak ada yang perlu dibatalkan."))
 
 
 def _tier_summary() -> str:
@@ -3087,19 +3137,27 @@ async def cmd_learned(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     """Everything the agent worked out about this environment by itself."""
     if not _authorized(update):
         return
+    lang = _chat_lang(update)
     facts = _learned_facts()
     if not facts:
-        await update.message.reply_text(
+        await update.message.reply_text(_t(lang,
             "The agent hasn't recorded anything about this environment yet.\n\n"
             "Environment knowledge fills itself in as you use it. Safety rules "
-            "(hard boundaries) live in the protected zone and never change with it."
-        )
+            "(hard boundaries) live in the protected zone and never change with it.",
+            "Agent belum mencatat apa pun tentang lingkungan ini.\n\n"
+            "Pengetahuan lingkungan terisi sendiri sambil jalan. Aturan keselamatan "
+            "(hard boundaries) ada di zona terkunci dan tidak pernah ikut berubah.",
+        ))
         return
     numbered = "\n".join(f"{i}. {f[2:]}" for i, f in enumerate(facts, 1))
     await _reply_chunked(
         update,
-        f"🧠 What the agent has worked out about this environment ({len(facts)}):\n\n{numbered}"
-        "\n\nSomething wrong in there? Remove it with /forget <number>.",
+        _t(lang,
+           f"🧠 What the agent has worked out about this environment ({len(facts)}):\n\n{numbered}"
+           "\n\nSomething wrong in there? Remove it with /forget <number>.",
+           f"🧠 Yang sudah dipelajari agent tentang lingkungan ini ({len(facts)}):\n\n{numbered}"
+           "\n\nSalah satu keliru? Hapus dengan /forget <nomor>.",
+        ),
     )
 
 
@@ -3108,13 +3166,16 @@ async def cmd_forget(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     written without being asked must be just as easy to take back."""
     if not _authorized(update):
         return
+    lang = _chat_lang(update)
     arg = (context.args[0] if context.args else "").strip()
     facts = _learned_facts()
     if not arg.isdigit() or not (1 <= int(arg) <= len(facts)):
-        await update.message.reply_text(
+        await update.message.reply_text(_t(lang,
             f"Usage: /forget <number>\nNumbers come from /learned "
-            f"({len(facts)} recorded right now)."
-        )
+            f"({len(facts)} recorded right now).",
+            f"Pakai: /forget <nomor>\nLihat nomornya di /learned "
+            f"({len(facts)} catatan saat ini).",
+        ))
         return
     idx = int(arg) - 1
     target = facts[idx]
@@ -3137,9 +3198,10 @@ async def cmd_forget(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         )
         removed = True
     logger.info("forgot learned fact: %s", target)
-    await update.message.reply_text(
-        f"🗑 Forgotten:\n{target[2:]}" if removed else "Nothing was removed."
-    )
+    await update.message.reply_text(_t(lang,
+        f"🗑 Forgotten:\n{target[2:]}" if removed else "Nothing was removed.",
+        f"🗑 Dilupakan:\n{target[2:]}" if removed else "Tidak ada yang dihapus.",
+    ))
 
 
 async def cmd_unlock(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3688,47 +3750,62 @@ async def cmd_schedules(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     registry and the crontab, no model involved."""
     if not _authorized(update):
         return
+    lang = _chat_lang(update)
     items = _read_schedules()
     lines: list[str] = []
     if items:
-        lines.append(f"🗓 <b>Scheduled tasks ({len(items)})</b>\n")
+        lines.append(_t(lang, f"🗓 <b>Scheduled tasks ({len(items)})</b>\n", f"🗓 <b>Task terjadwal ({len(items)})</b>\n"))
         for it in items:
-            flag = " ⚠️ <i>write access</i>" if it.get("needs_write") else ""
+            flag = _t(lang, " ⚠️ <i>write access</i>", " ⚠️ <i>akses tulis</i>") if it.get("needs_write") else ""
             lines.append(
                 f"• <b>{_tg_escape(it['name'])}</b>{flag}\n"
-                f"  <code>{_tg_escape(it['when'])}</code> — since {it.get('created_at','?')}\n"
+                f"  <code>{_tg_escape(it['when'])}</code> — "
+                + _t(lang, f"since {it.get('created_at','?')}", f"sejak {it.get('created_at','?')}") + "\n"
                 f"  <code>{_tg_escape(it['run'][:160])}</code>"
             )
     else:
-        lines.append("🗓 No scheduled tasks registered.")
+        lines.append(_t(lang, "🗓 No scheduled tasks registered.", "🗓 Belum ada task terjadwal."))
 
     orphans = unmanaged_cron_lines()
     if orphans:
-        lines.append(
+        lines.append(_t(lang,
             "\n⚠️ <b>Unmanaged cron entries</b> — these run on a timer but were not "
-            "installed through this bot, so they cannot be removed with /unschedule:"
-        )
+            "installed through this bot, so they cannot be removed with /unschedule:",
+            "\n⚠️ <b>Cron entry tidak terkelola</b> — ini jalan terjadwal tapi tidak dipasang "
+            "lewat bot ini, jadi tidak bisa dihapus dengan /unschedule:",
+        ))
         for o in orphans[:10]:
             lines.append(f"  <code>{_tg_escape(o[:160])}</code>")
-        lines.append("<i>Use /adopt to bring them under management.</i>")
+        lines.append(_t(lang, "<i>Use /adopt to bring them under management.</i>",
+                              "<i>Pakai /adopt untuk membawanya ke pengelolaan.</i>"))
 
     if items:
-        lines.append("\nRemove one: /unschedule &lt;name&gt;")
+        lines.append(_t(lang, "\nRemove one: /unschedule &lt;name&gt;", "\nHapus satu: /unschedule &lt;nama&gt;"))
     await _reply_chunked(update, "\n".join(lines), already_html=True)
 
 
 async def cmd_unschedule(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    lang = _chat_lang(update)
     if not await _may_authorize_group_action(update, context):
-        await update.message.reply_text("🔒 Bot owner, or a registered group's own admin.")
+        await update.message.reply_text(_t(lang,
+            "🔒 Bot owner, or a registered group's own admin.",
+            "🔒 Pemilik bot, atau admin dari grup yang sudah terdaftar.",
+        ))
         return
     name = (context.args[0] if context.args else "").strip()
     if not name:
-        await update.message.reply_text("Usage: /unschedule <name>\nSee names with /schedules")
+        await update.message.reply_text(_t(lang,
+            "Usage: /unschedule <name>\nSee names with /schedules",
+            "Pakai: /unschedule <nama>\nLihat nama di /schedules",
+        ))
         return
     if remove_schedule(name):
-        await update.message.reply_text(f"🗑 Removed scheduled task: {name}")
+        await update.message.reply_text(_t(lang, f"🗑 Removed scheduled task: {name}", f"🗑 Task terjadwal dihapus: {name}"))
     else:
-        await update.message.reply_text(f"No scheduled task named '{name}'. See /schedules")
+        await update.message.reply_text(_t(lang,
+            f"No scheduled task named '{name}'. See /schedules",
+            f"Tidak ada task terjadwal bernama '{name}'. Lihat /schedules",
+        ))
 
 
 async def cmd_adopt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -4132,11 +4209,14 @@ async def cmd_servers(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     """Everything the agent has been told it may reach. Zero tokens."""
     if not _authorized(update):
         return
+    lang = _chat_lang(update)
     items = _read_servers()
     if not items:
-        return await update.message.reply_text(
-            "🖥 No servers registered.\n\nAdd one with /addserver.")
-    lines = [f"🖥 <b>Registered servers ({len(items)})</b>", ""]
+        return await update.message.reply_text(_t(lang,
+            "🖥 No servers registered.\n\nAdd one with /addserver.",
+            "🖥 Belum ada server terdaftar.\n\nTambahkan lewat /addserver.",
+        ))
+    lines = [_t(lang, f"🖥 <b>Registered servers ({len(items)})</b>", f"🖥 <b>Server terdaftar ({len(items)})</b>"), ""]
     for it in items:
         kind = SERVER_KINDS.get(it.get("kind"), "?")
         if it.get("flavour") and it["flavour"] != it.get("kind"):
@@ -4144,35 +4224,45 @@ async def cmd_servers(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         lines.append(
             f"• <b>{_tg_escape(it['name'])}</b> — {_tg_escape(kind)}\n"
             f"  <code>{_tg_escape(it['user'])}@{_tg_escape(it['host'])}:{it.get('port', 22)}</code>"
-            + (f"\n  cluster: {len(it['cluster_hosts']) + 1} nodes" if it.get("cluster_hosts") else "")
-            + f"\n  added {it.get('added_at', '?')}"
+            + (_t(lang, f"\n  cluster: {len(it['cluster_hosts']) + 1} nodes",
+                       f"\n  cluster: {len(it['cluster_hosts']) + 1} node") if it.get("cluster_hosts") else "")
+            + _t(lang, f"\n  added {it.get('added_at', '?')}", f"\n  ditambahkan {it.get('added_at', '?')}")
         )
-    lines.append("\nRemove one: /removeserver &lt;name&gt;")
+    lines.append(_t(lang, "\nRemove one: /removeserver &lt;name&gt;", "\nHapus satu: /removeserver &lt;nama&gt;"))
     await _reply_chunked(update, "\n".join(lines), already_html=True)
 
 
 async def cmd_removeserver(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _may_run_setup(update):
         return
+    lang = _chat_lang(update)
     if not _is_owner(update) and not await _is_group_admin(update, context):
-        await update.message.reply_text("🔒 Bot owner or a group admin only.")
+        await update.message.reply_text(_t(lang, "🔒 Bot owner or a group admin only.", "🔒 Cuma pemilik bot atau admin grup."))
         return
     name = (context.args[0] if context.args else "").strip()
     if not name:
-        return await update.message.reply_text(
-            "Usage: /removeserver <name>\nSee names with /servers")
+        return await update.message.reply_text(_t(lang,
+            "Usage: /removeserver <name>\nSee names with /servers",
+            "Pakai: /removeserver <nama>\nLihat nama di /servers",
+        ))
     items = _read_servers()
     kept = [s for s in items if s["name"] != name]
     if len(kept) == len(items):
-        return await update.message.reply_text(f"No server named '{name}'. See /servers")
+        return await update.message.reply_text(_t(lang,
+            f"No server named '{name}'. See /servers",
+            f"Tidak ada server bernama '{name}'. Lihat /servers",
+        ))
     _rebuild_ssh_config(kept)
     _write_servers(kept)
     logger.warning("SERVER REMOVED name=%s by=%s", name, update.effective_user.id)
-    await update.message.reply_text(
+    await update.message.reply_text(_t(lang,
         f"🗑 Removed <b>{_tg_escape(name)}</b> from ~/.ssh/config.\n\n"
         "<i>The agent may still mention it from what it learned earlier — "
         "check /learned and /forget if that matters.</i>",
-        parse_mode="HTML")
+        f"🗑 Dihapus <b>{_tg_escape(name)}</b> dari ~/.ssh/config.\n\n"
+        "<i>Agent mungkin masih menyebutnya dari yang sudah dipelajari sebelumnya — "
+        "cek /learned dan /forget kalau itu penting.</i>",
+    ), parse_mode="HTML")
 
 
 async def cmd_boundaries(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -4181,42 +4271,58 @@ async def cmd_boundaries(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     nobody can check."""
     if not _authorized(update):
         return
+    lang = _chat_lang(update)
     items = read_boundaries()
     if not items:
-        return await update.message.reply_text(
+        return await update.message.reply_text(_t(lang,
             "🚧 <b>No hard boundaries set.</b>\n\nNothing is currently marked off-limits. "
             "Add the first with <code>/addboundary &lt;rule&gt;</code>.\n\n"
             "<i>These are what stop a misunderstanding from becoming an incident — "
             "the agent is told it may never do them, whatever it is asked.</i>",
-            parse_mode="HTML")
-    lines = [f"🚧 <b>Hard boundaries ({len(items)})</b>", ""]
+            "🚧 <b>Belum ada hard boundary.</b>\n\nTidak ada yang ditandai terlarang saat ini. "
+            "Tambahkan yang pertama dengan <code>/addboundary &lt;aturan&gt;</code>.\n\n"
+            "<i>Ini yang mencegah kesalahpahaman jadi insiden — agent diberitahu tidak boleh "
+            "melakukannya, apa pun yang diminta.</i>",
+        ), parse_mode="HTML")
+    lines = [_t(lang, f"🚧 <b>Hard boundaries ({len(items)})</b>", f"🚧 <b>Hard boundary ({len(items)})</b>"), ""]
     lines += [f"{i}. {_tg_escape(x)}" for i, x in enumerate(items, 1)]
-    lines.append("\n<i>Add: /addboundary &lt;rule&gt;   Remove: /rmboundary &lt;number&gt;</i>")
+    lines.append(_t(lang,
+        "\n<i>Add: /addboundary &lt;rule&gt;   Remove: /rmboundary &lt;number&gt;</i>",
+        "\n<i>Tambah: /addboundary &lt;aturan&gt;   Hapus: /rmboundary &lt;nomor&gt;</i>",
+    ))
     await _reply_chunked(update, "\n".join(lines), already_html=True)
 
 
 async def cmd_addboundary(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _may_run_setup(update):
         return
+    lang = _chat_lang(update)
     if not _is_owner(update) and not await _is_group_admin(update, context):
-        return await update.message.reply_text("🔒 Bot owner or a group admin only.")
+        return await update.message.reply_text(_t(lang, "🔒 Bot owner or a group admin only.", "🔒 Cuma pemilik bot atau admin grup."))
     rule = " ".join(context.args).strip() if context.args else ""
     if len(rule) < 8:
-        return await update.message.reply_text(
+        return await update.message.reply_text(_t(lang,
             "Usage: /addboundary <rule>\n\n"
             'e.g. /addboundary The VM "prod-db" — never stop or restart it\n\n'
-            "Be specific: a vague rule is one the agent has to interpret.")
+            "Be specific: a vague rule is one the agent has to interpret.",
+            "Pakai: /addboundary <aturan>\n\n"
+            'contoh: /addboundary VM "prod-db" — jangan pernah dihentikan atau restart\n\n'
+            "Spesifik ya: aturan yang samar cuma bikin agent menerjemahkan sendiri.",
+        ))
     items = read_boundaries()
     if rule in items:
-        return await update.message.reply_text("That boundary is already recorded.")
+        return await update.message.reply_text(_t(lang, "That boundary is already recorded.", "Boundary itu sudah tercatat."))
     items.append(rule)
     write_boundaries(items)
     logger.warning("BOUNDARY ADDED by=%s: %s", update.effective_user.id, rule)
-    await update.message.reply_text(
+    await update.message.reply_text(_t(lang,
         f"🚧 Added. {len(items)} boundar{'y' if len(items) == 1 else 'ies'} now in force.\n\n"
         "<i>It takes effect on the next new conversation — existing ones already "
         "have the older list. Use /new to apply it right away.</i>",
-        parse_mode="HTML")
+        f"🚧 Ditambahkan. {len(items)} boundary sekarang berlaku.\n\n"
+        "<i>Efeknya mulai di percakapan baru berikutnya — yang sedang jalan masih pakai "
+        "daftar lama. Pakai /new untuk langsung terapkan.</i>",
+    ), parse_mode="HTML")
 
 
 async def cmd_rmboundary(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -4225,42 +4331,55 @@ async def cmd_rmboundary(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     slowing down."""
     if not _may_run_setup(update):
         return
+    lang = _chat_lang(update)
     if not _is_owner(update) and not await _is_group_admin(update, context):
-        return await update.message.reply_text("🔒 Bot owner or a group admin only.")
+        return await update.message.reply_text(_t(lang, "🔒 Bot owner or a group admin only.", "🔒 Cuma pemilik bot atau admin grup."))
     arg = (context.args[0] if context.args else "").strip()
     items = read_boundaries()
     if not arg.isdigit() or not (1 <= int(arg) <= len(items)):
-        return await update.message.reply_text(
-            f"Usage: /rmboundary <number>\nSee /boundaries ({len(items)} recorded).")
+        return await update.message.reply_text(_t(lang,
+            f"Usage: /rmboundary <number>\nSee /boundaries ({len(items)} recorded).",
+            f"Pakai: /rmboundary <nomor>\nLihat di /boundaries ({len(items)} tercatat).",
+        ))
     target = items[int(arg) - 1]
     if pin_is_set():
-        await request_pin(update, "rmboundary", {"rule": target},
-                          f"🚧 Removing a boundary:\n\n<i>{_tg_escape(target)}</i>")
+        await request_pin(update, "rmboundary", {"rule": target}, _t(lang,
+            f"🚧 Removing a boundary:\n\n<i>{_tg_escape(target)}</i>",
+            f"🚧 Menghapus boundary:\n\n<i>{_tg_escape(target)}</i>",
+        ))
     else:
         write_boundaries([x for x in items if x != target])
-        await update.message.reply_text(f"🚧 Removed: {target}")
+        await update.message.reply_text(_t(lang, f"🚧 Removed: {target}", f"🚧 Dihapus: {target}"))
 
 
 async def cmd_snapshots(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Snapshots the agent took before changing something. Zero tokens."""
     if not _authorized(update):
         return
+    lang = _chat_lang(update)
     items = read_snapshots()
     if not items:
-        return await update.message.reply_text(
+        return await update.message.reply_text(_t(lang,
             "📸 No snapshots recorded yet.\n\n"
             "<i>The agent is told to snapshot a VM before changing it, and each one "
             "it takes shows up here so it can be cleaned up later.</i>",
-            parse_mode="HTML")
-    lines = [f"📸 <b>Snapshots taken before changes ({len(items)})</b>", ""]
+            "📸 Belum ada snapshot tercatat.\n\n"
+            "<i>Agent diinstruksikan snapshot VM sebelum mengubahnya, dan tiap yang "
+            "diambil muncul di sini biar bisa dibersihkan nanti.</i>",
+        ), parse_mode="HTML")
+    lines = [_t(lang, f"📸 <b>Snapshots taken before changes ({len(items)})</b>",
+                     f"📸 <b>Snapshot yang diambil sebelum perubahan ({len(items)})</b>"), ""]
     for i, s in enumerate(items[-25:], 1):
         lines.append(
             f"{i}. VM <b>{_tg_escape(str(s.get('vmid')))}</b> on "
             f"{_tg_escape(str(s.get('node')))} — <code>{_tg_escape(s.get('snapname', '?'))}</code>\n"
             f"   {s.get('at', '?')}" + (f" — {_tg_escape(s['reason'])}" if s.get("reason") else ""))
-    lines.append(
+    lines.append(_t(lang,
         "\n<i>Delete one on the cluster with: qm delsnapshot &lt;vmid&gt; &lt;name&gt;</i>\n"
-        "<i>Snapshots hold disk space, so they are worth clearing once a change has proven good.</i>")
+        "<i>Snapshots hold disk space, so they are worth clearing once a change has proven good.</i>",
+        "\n<i>Hapus satu di cluster dengan: qm delsnapshot &lt;vmid&gt; &lt;nama&gt;</i>\n"
+        "<i>Snapshot makan ruang disk, jadi layak dibersihkan setelah perubahan terbukti aman.</i>",
+    ))
     await _reply_chunked(update, "\n".join(lines), already_html=True)
 
 

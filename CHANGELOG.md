@@ -1,5 +1,28 @@
 # Changelog
 
+## v0.2b.7 -- `/lang` migration extended to 21 more commands (29 total)
+
+Follow-up to v0.2b.6: migrated the rest of the single-message commands to the
+`_t(lang, en, id)` pattern -- sessions/memory (`/new`, `/session`, `/sessions`,
+`/remember`, `/memory`), utility/admin (`/tools`, `/graduate`, `/chatid`,
+`/registergroup`, `/unregistergroup`, `/cancel`), and registry-listing
+(`/learned`, `/forget`, `/servers`, `/removeserver`, `/boundaries`,
+`/addboundary`, `/rmboundary`, `/snapshots`, `/schedules`, `/unschedule`). 29
+commands total now respect `/lang`; what's left is specifically the multi-step
+flows (`/start`'s wizard, `/setpin` + the PIN keypad, `/addserver`'s wizard,
+`/adopt`, the schedule/unlock confirmation cards) -- deliberately deferred since
+they touch more shared state and are riskier to migrate carelessly.
+
+42/42 new tests pass (each migrated command checked in both languages); the
+existing `/usemodel`, Google Drive, and v0.2b.6 language suites re-verified
+with no regressions. Deployed and restarted with 0 errors -- interrupted partway
+through by an unrelated ~10-minute network outage to the host (ping/SSH both
+timed out; the VM itself never rebooted and `lite-agent.service` stayed active
+throughout with zero log entries, so the running bot was very likely unaffected
+-- the outage only blocked *this* deploy from reaching the host, not the host
+serving live traffic).
+
+
 ## v0.2b.6 -- per-chat language (`/lang`), Google Drive auto-picks a sole account
 
 **`/lang` (or `/language`) sets which language the bot's own fixed text replies
