@@ -4,7 +4,7 @@ A lightweight Telegram bridge to **Claude Code** and **Antigravity CLI (agy)**, 
 infrastructure monitoring and investigation -- built to be dramatically cheaper to run
 than a full agent framework, while staying just as capable for real operational work.
 
-> **Status: v0.2b.4 -- early/beta.** Built and battle-tested against a real production
+> **Status: v0.2b.5 -- early/beta.** Built and battle-tested against a real production
 > Proxmox VE cluster over several days of iteration, including a live-fire test of the
 > unlock/PIN/snapshot flow against real infrastructure. Works well; still has known
 > rough edges (see [Known limitations](#known-limitations)).
@@ -200,7 +200,7 @@ Ollama, say), since something has to translate between protocols.
 | `/agentstatus` | tiny probe each | Live check: is each tier actually up right now? |
 | `/providers` | **0 tokens** | Which AI tiers are configured, and which are healthy |
 | `/usemodel [name]` | owner/admin | Force a specific tier for this chat (Opus, Gemini Pro-high, ...); `auto` for the default chain |
-| `/gdrive` | **0 tokens** | Is Google Drive connected, and where files land |
+| `/gdrive` | owner/admin, **0 tokens** | Pick (or show) which connected Drive account this room uploads to |
 | `/mode` | **0 tokens** | Read-only right now, or able to change things? |
 | `/unlock [min]` | owner/admin | Open a time-boxed window for real changes (capped at 10 min from a group) |
 | `/lock` | owner/admin | Close that window early |
@@ -328,34 +328,53 @@ own SSH config would be a worse bug than the one this fixes).
 Lets the agent save a file straight to a Google Drive folder instead of (or in
 addition to) sending it through Telegram — useful once reports need to land
 somewhere a client or teammate can browse, not just be attached to a chat message.
+More than one account can be connected (a personal one, a company one, one per
+client...) with each chat picking its own default independently.
 
-**Connecting the account is a one-time step done directly on the host, not through
+**Connecting an account is a one-time step done directly on the host, not through
 Telegram** — the same reasoning as the SSH keypair: an OAuth flow needs a real
 browser, and this is infrequent enough that a guided chat wizard isn't worth
-building. Uses [rclone](https://rclone.org/drive/) with `scope=drive.file`, so the
-connected account only ever exposes files rclone itself creates — never your
+building. Uses [rclone](https://rclone.org/drive/) with `scope=drive.file`, so a
+connected account only ever exposes files rclone itself creates — never its
 existing Drive contents.
 
 ```bash
 # on any machine with a browser (does not have to be the server):
 rclone authorize "drive" --drive-scope drive.file
-# paste the resulting {"access_token": ...} JSON into a file on the server, then:
+# paste the resulting {"access_token": ...} JSON into a file on the server, then --
+# pick a remote name: "gdrive" for the first account, "gdrive_<something>" for
+# every one after that (e.g. gdrive_company, gdrive_clienta) -- that naming
+# convention IS how the bot discovers which accounts exist, nothing else to register:
 python3 -c '
 from pathlib import Path
 import json, sys
+name = "gdrive"  # or gdrive_<something> for a second/third/... account
 token = Path("/tmp/gdrive_token.json").read_text().strip()
 json.loads(token)  # sanity-check
 conf = Path.home() / ".config/rclone/rclone.conf"
 conf.parent.mkdir(parents=True, exist_ok=True)
-conf.write_text(f"[gdrive]\ntype = drive\nscope = drive.file\ntoken = {token}\n")
+with conf.open("a") as f:
+    f.write(f"\n[{name}]\ntype = drive\nscope = drive.file\ntoken = {token}\n")
 conf.chmod(0o600)
 '
-rclone mkdir "gdrive:iSmart-LA Data"   # the root folder every upload lands under
+# IMPORTANT: check for an existing root folder before creating one -- if this
+# remote turns out to be the SAME underlying Google account as one already
+# connected (a typo'd name, or re-authorizing the same account by mistake),
+# `mkdir` would silently create a SECOND "iSmart-LA Data" folder side by side
+# with the first, and nothing would notice until files start landing in the
+# wrong one:
+rclone lsd gdrive: | grep "iSmart-LA Data" || rclone mkdir "gdrive:iSmart-LA Data"
 ```
 
-Once connected, nothing else is needed — `/gdrive` confirms the connection and
-where files land (0 tokens). From then on, mention "gdrive" or "Google Drive" in a
-normal message and where you want it, and the agent handles the rest:
+Once at least one account is connected, `/gdrive` in any chat shows a picker —
+tap one to make it that chat's default. **A chat must explicitly pick one before
+anything can upload there** — deliberately no silent fallback to "whichever account
+connected first," since that's exactly the kind of mistake that sends a file to the
+wrong place unnoticed. Adding a further account is still the host-side step above;
+`/gdrive` only lets a chat choose among accounts that already exist.
+
+From then on, mention "gdrive" or "Google Drive" in a normal message and where you
+want it, and the agent handles the rest:
 
 > "save this as report.md to gdrive /client-a/report.md"
 
@@ -364,6 +383,17 @@ The agent creates the file, then emits a line the bot recognises
 you see; the bot uploads it (creating any missing subfolder automatically) and
 replies with a shareable link. Same secret-scan gate as sending a file through
 Telegram — a file containing a credential is refused, not uploaded.
+
+**In a group, uploads land inside that group's own subfolder automatically** —
+`iSmart-LA Data/<group name>/...` — without the model needing to know or add the
+group's name itself. Asking for the shared root instead (a path starting with `/`)
+only works for that group's own admin (or the owner); anyone else's attempt is
+quietly kept inside the group's folder rather than refused outright, the same way
+an untrusted fact from a group is quietly not remembered rather than erroring. This
+matters most when several groups share the *same* connected account (e.g. one
+company account used across multiple client rooms) — the folder split is a
+convenience default, not a hard permission boundary enforced by Google itself, so
+treat the escape hatch as something only a trusted admin should reach for.
 
 **Known limitation:** rclone's shared default `client_id` (used above, since it
 needs no Google Cloud project of your own) is being retired sometime in 2026 and

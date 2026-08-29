@@ -1,5 +1,54 @@
 # Changelog
 
+## v0.2b.5 -- multiple Drive accounts, per-room default, group auto-scoping; /help fully synced
+
+**More than one Google Drive account can be connected now**, each its own rclone
+remote (`gdrive`, `gdrive_company`, `gdrive_clienta`, ...) -- still a one-time
+host-side step, just repeatable. `/gdrive` in any chat now shows a picker instead of
+a plain status line; tap one to make it that chat's default. **A chat must
+explicitly pick an account before anything uploads there** -- no silent fallback to
+"whichever account connected first," since that's exactly the kind of default that
+sends a file to the wrong place unnoticed. `/gdrive` is now gated like `/usemodel`
+(owner anywhere, or a registered group's own admin) since it's a room-wide setting,
+not a per-person one.
+
+**Uploads from a group land inside that group's own subfolder automatically** --
+`iSmart-LA Data/<group name>/...` -- without the agent needing to know or add the
+group's name itself. A path starting with `/` asks for the shared root instead, but
+that escape only actually works for the room's own admin (or the owner); anyone
+else's attempt is quietly kept inside the group's folder rather than refused
+outright -- same precedent as an untrusted fact from a group being quietly not
+remembered rather than erroring. This matters most when several groups share the
+*same* connected account (e.g. one company account across multiple client rooms) --
+the folder split is a convenience default, not a hard permission boundary Google
+itself enforces, so the escape hatch is deliberately not open to everyone.
+
+README's setup instructions now check for an existing root folder before creating
+one -- connecting a second remote that turns out to be the *same* underlying Google
+account (a typo'd name, or re-authorizing the same account by mistake) would
+otherwise silently create a second "iSmart-LA Data" folder side by side with the
+first.
+
+**Also: `/help` fully synced across all four copies** (repo EN/ID, production
+EN/ID). Audit turned up three independent drifts: repo's own Indonesian copy was
+missing ~12 commands (the same gap fixed for production's copy back in v0.2b.3,
+never applied to repo's own); production's English copy had the identical gap in
+the other direction, never fixed either way; and all four copies still described
+`/unlock` as "owner-only, DM-only", stale since v0.2b.2. Production's title also
+still read "Lite Agent" in both languages, pre-dating the rename -- fixed to
+"iSmart-LA" in both. (Command *replies* themselves -- `/usemodel`, `/gdrive`, `/mode`,
+etc -- are still each deployment's fixed language, not switched at runtime; only
+`/help` offers an explicit EN/ID choice. Making every reply follow a per-chat
+language preference was considered and deliberately deferred -- a much larger
+change than fits alongside everything else here.)
+
+25/25 tests pass for the multi-account behavior: account discovery from
+`rclone.conf`, per-room storage, group-folder scoping and its admin-only escape
+hatch (including the silent-confinement case for a non-admin), and the picker's
+permission gating. Verified end-to-end against the real connected account: refused
+before a room picked one, uploaded successfully once it did.
+
+
 ## v0.2b.4 -- Google Drive delivery
 
 **The agent can now save a file straight to Google Drive**, not just send it through

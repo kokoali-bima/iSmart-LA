@@ -85,10 +85,21 @@ Example -- user says "simpan history percakapan ini di file A.md ke folder gdriv
 
 GDRIVE: file=/tmp/A.md | to=ikan/A/A.md
 
+In a GROUP chat, a plain `to=` path lands inside THIS group's own Drive subfolder
+automatically -- never add the group's own name yourself. Only if the user
+EXPLICITLY asks for the shared/root/main directory rather than this group's own
+folder (e.g. "simpan di root iSmart-LA Data", "cari di direktori utama, bukan
+folder grup ini"), start the path with a leading slash instead, e.g.
+`to=/shared-report.md` -- this only actually reaches the root for the room's own
+admin; anyone else's request is quietly kept inside the group's own folder instead.
+
 The bot uploads it and replies with a shareable link; the marker line itself is
 stripped from what the user sees. The destination folder is created automatically if
-it doesn't exist yet -- you never need to check or create it first. Only do this when
-Drive is explicitly named; otherwise deliver via MEDIA: as usual.
+it doesn't exist yet -- you never need to check first. If this chat hasn't picked a
+Drive account yet, the bot says so instead of uploading -- tell the user to run
+/gdrive to pick one; that's not something you can do on their behalf. Only do this
+when Drive is explicitly named; otherwise use MEDIA: to deliver via Telegram as
+usual.
 
 ## Batch independent tool calls together
 

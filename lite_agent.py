@@ -97,9 +97,13 @@ SNAPSHOT_SCRIPT = BASE_DIR / "tools" / "cluster_snapshot.py"
 # just what runs once it already is connected. drive.file OAuth scope means
 # the connected account only ever exposes files rclone itself created.
 RCLONE_BIN = os.environ.get("RCLONE_BIN", "rclone")
-GDRIVE_REMOTE = os.environ.get("GDRIVE_REMOTE", "gdrive")
 GDRIVE_ROOT = os.environ.get("GDRIVE_ROOT", "iSmart-LA Data")
 RCLONE_CONF = Path.home() / ".config" / "rclone" / "rclone.conf"
+# Which connected Drive account each chat uploads to -- {chat_id: remote}.
+# Deliberately no fallback default: a room must explicitly pick one via
+# /gdrive before anything uploads, so a file never lands in an account
+# nobody meant to use for that room.
+GDRIVE_ROOM_ACCOUNTS_FILE = BASE_DIR / "gdrive_room_accounts.json"
 LIST_TOOLS_SCRIPT = BASE_DIR / "tools" / "list_tools.py"
 
 # /graduate turns the case you *just* solved into a reusable parameterized
@@ -2146,21 +2150,69 @@ async def _send_media_file(update: Update, path: str, sent_hashes: set[str]) -> 
         await _msg(update).reply_text(f"⚠️ Failed to send {p.name}: upload error.")
 
 
-def _gdrive_configured() -> bool:
+def _list_gdrive_accounts() -> list[str]:
+    """Every connected Drive account -- any rclone remote named exactly
+    "gdrive" or "gdrive_<something>". That naming convention is the whole
+    registry; no separate file to keep in sync with rclone.conf itself."""
     if not RCLONE_CONF.exists():
-        return False
+        return []
     try:
-        return f"[{GDRIVE_REMOTE}]" in RCLONE_CONF.read_text(encoding="utf-8")
+        text = RCLONE_CONF.read_text(encoding="utf-8")
     except OSError:
-        return False
+        return []
+    names = re.findall(r"^\[(gdrive(?:_[A-Za-z0-9_-]+)?)\]", text, re.MULTILINE)
+    return sorted(names, key=lambda n: (n != "gdrive", n))
 
 
-def _gdrive_upload(local_path: str, drive_rel_path: str) -> tuple[bool, str]:
-    """Copy one local file to GDRIVE_ROOT/drive_rel_path via rclone, then fetch
-    a shareable link. Blocking -- call via loop.run_in_executor. rclone creates
-    any missing intermediate folders on its own, so the caller never needs to
-    check or create the destination first."""
-    dest = f"{GDRIVE_REMOTE}:{GDRIVE_ROOT}/{drive_rel_path}"
+def _read_gdrive_room_accounts() -> dict:
+    if not GDRIVE_ROOM_ACCOUNTS_FILE.exists():
+        return {}
+    try:
+        return json.loads(GDRIVE_ROOM_ACCOUNTS_FILE.read_text())
+    except Exception:
+        logger.warning("gdrive_room_accounts.json unreadable", exc_info=True)
+        return {}
+
+
+def _write_gdrive_room_accounts(items: dict) -> None:
+    GDRIVE_ROOM_ACCOUNTS_FILE.write_text(json.dumps(items, indent=2))
+
+
+def _sanitize_drive_folder_name(name: str) -> str:
+    """A Telegram group title, made safe as a single path segment -- no
+    slashes to accidentally escape into a different folder, no leading/
+    trailing junk, capped so an absurd title can't produce an absurd path."""
+    cleaned = re.sub(r"[/\\]+", "-", name or "").strip()
+    return (cleaned or "group")[:80]
+
+
+async def _gdrive_effective_path(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                                  to_raw: str) -> str:
+    """A plain path lands inside THIS chat's own Drive subfolder when the
+    chat is a group -- the model never needs to know or add the group's
+    name itself. A leading "/" asks for the shared root instead, but that
+    only works for the room's own admin (or the owner) -- anyone else's
+    escape attempt is quietly kept inside the group's own folder instead of
+    erroring, the same way an untrusted LEARN: line is quietly dropped
+    rather than refused with a scary message. A DM has no group folder to
+    begin with, so it always goes straight to the path given."""
+    chat = update.effective_chat
+    rel = to_raw.lstrip("/")
+    if chat is None or chat.type == "private":
+        return rel
+    wants_root = to_raw.startswith("/")
+    if wants_root and await _may_authorize_group_action(update, context):
+        return rel
+    folder = _sanitize_drive_folder_name(chat.title or str(chat.id))
+    return f"{folder}/{rel}"
+
+
+def _gdrive_upload(remote: str, local_path: str, drive_rel_path: str) -> tuple[bool, str]:
+    """Copy one local file to <remote>:GDRIVE_ROOT/drive_rel_path via rclone,
+    then fetch a shareable link. Blocking -- call via loop.run_in_executor.
+    rclone creates any missing intermediate folders on its own, so the
+    caller never needs to check or create the destination first."""
+    dest = f"{remote}:{GDRIVE_ROOT}/{drive_rel_path}"
     try:
         subprocess.run(
             [RCLONE_BIN, "copyto", local_path, dest],
@@ -2177,7 +2229,7 @@ def _gdrive_upload(local_path: str, drive_rel_path: str) -> tuple[bool, str]:
         return False, "timed out talking to Google Drive"
 
 
-async def _send_to_gdrive(update: Update, req: dict) -> None:
+async def _send_to_gdrive(update: Update, context: ContextTypes.DEFAULT_TYPE, req: dict) -> None:
     local_path = req["file"]
     p = Path(local_path)
     if not p.is_absolute():
@@ -2202,17 +2254,26 @@ async def _send_to_gdrive(update: Update, req: dict) -> None:
                 parse_mode="Markdown",
             )
             return
-    if not _gdrive_configured():
+    accounts = _list_gdrive_accounts()
+    if not accounts:
         await _msg(update).reply_text(
             "\u26a0\ufe0f Google Drive isn't connected yet -- see README (\"Google Drive\") to set it up."
         )
         return
+    chat_id = str(update.effective_chat.id)
+    remote = _read_gdrive_room_accounts().get(chat_id)
+    if not remote or remote not in accounts:
+        await _msg(update).reply_text(
+            "\U0001f4c1 This room hasn't picked a Drive account yet -- run /gdrive to choose one."
+        )
+        return
+    rel_path = await _gdrive_effective_path(update, context, req["to"])
     loop = asyncio.get_running_loop()
-    ok, detail = await loop.run_in_executor(None, _gdrive_upload, str(p), req["to"])
+    ok, detail = await loop.run_in_executor(None, _gdrive_upload, remote, str(p), rel_path)
     if ok:
-        await _msg(update).reply_text(f"\U0001f4c1 Uploaded to Drive: {req['to']}\n{detail}")
+        await _msg(update).reply_text(f"\U0001f4c1 Uploaded to Drive ({remote}): {rel_path}\n{detail}")
     else:
-        await _msg(update).reply_text(f"\u26a0\ufe0f Drive upload failed for {req['to']}: {detail}")
+        await _msg(update).reply_text(f"\u26a0\ufe0f Drive upload failed for {rel_path}: {detail}")
 
 
 
@@ -2776,7 +2837,7 @@ Every reply ends with a "— by ..." tag. If it's ever NOT "{TIERS[0]['label']}"
 /usemodel [name] — force a specific tier for this chat (Opus, Gemini Pro-high, ...); `/usemodel auto` for the default chain
 /gdrive — is Google Drive connected, and where files land (0 tokens)
 /mode — read-only right now, or able to make changes? (0 tokens)
-/unlock [minutes] — owner-only, DM-only: allow real changes for a limited window
+/unlock [minutes] — open a time-boxed window for real changes (owner anywhere, or a registered group's own admin -- capped at 10 min from a group)
 /lock — close that window early
 /learned — see what the agent figured out about this environment BY ITSELF
 /forget <number> — delete one wrong learned fact (numbers come from /learned)
@@ -2806,13 +2867,32 @@ Setiap balasan diakhiri tanda "— by ...". Kalau tandanya BUKAN "{TIERS[0]['lab
 
 *Daftar perintah*
 /status — cek status instan, NOL token (langsung dari script, bukan model)
-/tools — daftar skill yang sudah dijadikan script, NOL token
-/graduate <nama> — ubah case yang BARU SAJA diselesaikan jadi script yang bisa dipakai ulang (gratis dipakai lagi)
-/new — mulai ulang sesi AKTIF dari nol (riwayat percakapan direset, MEMORY.md tidak berubah)
-/session <nama> — buat/pindah ke sesi bernama, untuk memisahkan case yang berbeda
-/sessions — lihat semua sesi yang tersimpan
-/remember <fakta> — simpan fakta PERMANEN, dibaca di SETIAP sesi & SETIAP tingkatan, meski sudah berkali-kali /new
+/tools — daftar skill yang sudah jadi script, NOL token
+/graduate <nama> — ubah kasus yang BARU SAJA selesai jadi script reusable (gratis dipakai lagi)
+/new — mulai ulang sesi AKTIF dari nol (riwayat percakapan direset, MEMORY.md tetap ada)
+/session <nama> — buat/pindah ke sesi bernama, buat pisahin kasus berbeda
+/sessions — lihat semua sesi tersimpan
+/remember <fakta> — simpan fakta PERMANEN, ikut kebaca di SEMUA sesi & SEMUA tingkatan, walau sudah /new berkali-kali
 /memory — lihat isi memori saat ini
+/schedules — semua yang jalan terjadwal, dan isinya apa (NOL token)
+/unschedule <nama> — hapus satu task terjadwal
+/adopt — bawa cron lama ke dalam kelolaan bot
+/setpin — atur/ganti PIN 6 angka (lewat keypad, tidak pernah diketik di chat)
+/boundaries — apa yang tidak boleh dilakukan agent (NOL token)
+/addboundary <aturan> — tambah   /rmboundary <n> — hapus (pakai PIN)
+/snapshots — snapshot yang diambil sebelum perubahan (NOL token)
+/servers — daftar mesin yang boleh diakses agent (NOL token)
+/addserver — daftarkan mesin baru, langkah demi langkah
+/removeserver <nama> — hapus satu
+/agentstatus — cek langsung: tiap tingkat AI benar-benar hidup sekarang?
+/providers — tingkat AI mana saja yang dipakai dan mana yang sehat (NOL token)
+/usemodel [nama] — paksa satu tingkatan tertentu untuk chat ini (Opus, Gemini Pro-high, ...); `/usemodel auto` untuk balik ke rantai default
+/gdrive — Google Drive sudah terhubung atau belum, dan file masuk ke mana (NOL token)
+/mode — agent lagi read-only atau boleh mengubah? (NOL token)
+/unlock [menit] — buka mode tulis untuk waktu terbatas (pemilik di mana saja, atau admin grup terdaftar -- dibatasi maks 10 menit dari grup)
+/lock — tutup lebih awal
+/learned — lihat apa saja yang agent pelajari SENDIRI soal lingkungan ini
+/forget <nomor> — hapus satu catatan hasil belajar yang keliru (nomornya dari /learned)
 /cancel — batalkan form bertahap yang sedang jalan (/start, /addserver)
 /help — panduan ini (pilih EN atau ID)
 
@@ -3043,23 +3123,59 @@ async def cmd_usemodel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 async def cmd_gdrive(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Status check for the Google Drive connection -- connecting the account
-    itself is a one-time step done directly on the host, not through Telegram
-    (same as the SSH keypair setup), so this only reports what's already there."""
-    if not _authorized(update):
+    """Pick (or show) which connected Drive account this room uploads to.
+    Connecting an account itself is still a one-time step done directly on
+    the host, not through Telegram (same as the SSH keypair setup) -- this
+    only lets a room choose among accounts that already exist. Gated like
+    /usemodel: a room-wide setting, not a per-person one."""
+    if not await _may_authorize_group_action(update, context):
         return
-    if not _gdrive_configured():
+    accounts = _list_gdrive_accounts()
+    if not accounts:
         await update.message.reply_text(
-            "\U0001f4c1 Google Drive isn't connected. Ask the operator to set it up "
-            "(see README \u201cGoogle Drive\u201d) -- a one-time step done directly on "
-            "the host, not through Telegram."
+            "\U0001f4c1 No Google Drive account is connected yet. Ask the operator to "
+            "connect one (see README \u201cGoogle Drive\u201d) -- a one-time step done "
+            "directly on the host, not through Telegram."
         )
         return
+    chat_id = str(update.effective_chat.id)
+    current = _read_gdrive_room_accounts().get(chat_id)
+    lines = ["\U0001f4c1 <b>Google Drive account for this room</b>", ""]
+    if current and current in accounts:
+        lines.append(f"Currently: <b>{_tg_escape(current)}</b>")
+    else:
+        lines.append("Not picked yet -- uploads here won't work until you choose one.")
+    lines.append("")
+    lines.append("Tap one to use it here:")
+    rows = [[InlineKeyboardButton(
+        f"{'\u2705 ' if a == current else ''}{a}", callback_data=f"gdrv:{a}",
+    )] for a in accounts]
+    lines.append("")
+    lines.append(
+        "Need a different account entirely (not listed above)? That's still a "
+        "one-time step done directly on the host -- ask the operator to connect one."
+    )
     await update.message.reply_text(
-        f"\U0001f4c1 Google Drive connected. Files land under <b>{_tg_escape(GDRIVE_ROOT)}</b> "
-        "in that account's Drive, inside whatever subfolder you name.\n\n"
-        "Just mention \u201cgdrive\u201d (or Google Drive) and where you want it, e.g.:\n"
-        "<code>save this as report.md to gdrive /client-a/report.md</code>",
+        "\n".join(lines), parse_mode="HTML", reply_markup=InlineKeyboardMarkup(rows)
+    )
+
+
+async def cmd_gdrive_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if not await _may_authorize_group_action(update, context):
+        await query.answer("Not permitted.", show_alert=True)
+        return
+    await query.answer()
+    _, remote = query.data.split(":", 1)
+    if remote not in _list_gdrive_accounts():
+        await query.edit_message_text("That account isn't connected any more. Run /gdrive again.")
+        return
+    chat_id = str(update.effective_chat.id)
+    room_accounts = _read_gdrive_room_accounts()
+    room_accounts[chat_id] = remote
+    _write_gdrive_room_accounts(room_accounts)
+    await query.edit_message_text(
+        f"\U0001f4c1 This room now uploads to Drive account: <b>{_tg_escape(remote)}</b>",
         parse_mode="HTML",
     )
 
@@ -4266,7 +4382,7 @@ async def _run_turn(update: Update, context: ContextTypes.DEFAULT_TYPE, text: st
             for path in media_paths:
                 await _send_media_file(update, path, sent_hashes)
             for req in gdrive_requests:
-                await _send_to_gdrive(update, req)
+                await _send_to_gdrive(update, context, req)
             if schedule_proposals and await _may_authorize_group_action(update, context):
                 await offer_schedules(update, schedule_proposals)
             elif schedule_proposals:
@@ -4398,6 +4514,7 @@ def main() -> None:
     app.add_handler(CommandHandler("lock", cmd_lock))
     app.add_handler(CommandHandler("usemodel", cmd_usemodel))
     app.add_handler(CommandHandler("gdrive", cmd_gdrive))
+    app.add_handler(CallbackQueryHandler(cmd_gdrive_button, pattern="^gdrv:"))
     app.add_handler(CommandHandler("mode", cmd_mode))
     app.add_handler(CommandHandler("learned", cmd_learned))
     app.add_handler(CommandHandler("forget", cmd_forget))
