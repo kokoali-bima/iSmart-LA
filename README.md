@@ -4,7 +4,7 @@ A lightweight Telegram bridge to **Claude Code** and **Antigravity CLI (agy)**, 
 infrastructure monitoring and investigation -- built to be dramatically cheaper to run
 than a full agent framework, while staying just as capable for real operational work.
 
-> **Status: v0.2b.9 -- early/beta.** Built and battle-tested against a real production
+> **Status: v0.2b.10 -- early/beta.** Built and battle-tested against a real production
 > Proxmox VE cluster over several days of iteration, including a live-fire test of the
 > unlock/PIN/snapshot flow against real infrastructure. Works well; still has known
 > rough edges (see [Known limitations](#known-limitations)).
@@ -420,7 +420,12 @@ picks explicitly.
 (`/start`'s own setup card, `/addserver`'s step-by-step form), the whole PIN
 system and keypad, and the schedule/unlock confirmation cards all respect
 whichever language the chat picked. Nothing in the bot's own fixed text is
-locked to one language any more.
+locked to one language any more. A follow-up audit swept every
+`reply_text`/`edit_message_text`/`answer` call in the file specifically
+looking for anything the per-command migration passes missed — it found six
+(file-delivery errors, one exception handler each in `/graduate` and the
+server wizard, a permission-denial message, the turn-level error/retry/LEARN
+messages, and the last-resort global error handler), all now fixed too.
 
 This is separate from two other things it's easy to conflate: **the agent's own
 answers** already mirror whatever language you write your prompt in, being an LLM

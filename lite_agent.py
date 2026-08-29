@@ -2172,16 +2172,22 @@ async def _send_media_file(update: Update, path: str, sent_hashes: set[str]) -> 
     p = Path(path)
     if not p.is_absolute():
         p = BASE_DIR / p
+    lang = _chat_lang(update)
     if not p.exists() or not p.is_file():
         logger.warning("MEDIA path not found: %s", path)
-        await _msg(update).reply_text(f"⚠️ File not found, couldn't send it: {path}")
+        await _msg(update).reply_text(_t(lang,
+            f"⚠️ File not found, couldn't send it: {path}",
+            f"⚠️ File nggak ketemu buat dikirim: {path}",
+        ))
         return
     size = p.stat().st_size
     if size > TELEGRAM_MAX_FILE_BYTES:
-        await _msg(update).reply_text(
+        await _msg(update).reply_text(_t(lang,
             f"⚠️ File {p.name} ({size / 1024 / 1024:.1f}MB) exceeds Telegram's bot "
-            f"upload limit (50MB), can't send it."
-        )
+            f"upload limit (50MB), can't send it.",
+            f"⚠️ File {p.name} ({size / 1024 / 1024:.1f}MB) melebihi limit Telegram "
+            f"buat bot (50MB), nggak bisa dikirim.",
+        ))
         return
     digest = _file_sha256(p)
     if digest is not None and digest in sent_hashes:
@@ -2198,11 +2204,12 @@ async def _send_media_file(update: Update, path: str, sent_hashes: set[str]) -> 
             blob = ""
         if any(s in blob for s in _SECRETS):
             logger.error("REFUSED to send %s -- it contains a credential", p)
-            await _msg(update).reply_text(
+            await _msg(update).reply_text(_t(lang,
                 f"🔒 *{p.name}* was not sent: it contains a credential "
                 f"(token/API key). Strip that out first if it really needs sending.",
-                parse_mode="Markdown",
-            )
+                f"🔒 File *{p.name}* tidak dikirim: isinya memuat kredensial "
+                f"(token/API key). Hapus dulu bagian itu kalau memang perlu dikirim.",
+            ), parse_mode="Markdown")
             return
     try:
         with p.open("rb") as f:
@@ -2218,7 +2225,10 @@ async def _send_media_file(update: Update, path: str, sent_hashes: set[str]) -> 
             sent_hashes.add(digest)
     except Exception:
         logger.exception("failed to send media file %s", path)
-        await _msg(update).reply_text(f"⚠️ Failed to send {p.name}: upload error.")
+        await _msg(update).reply_text(_t(lang,
+            f"⚠️ Failed to send {p.name}: upload error.",
+            f"⚠️ Gagal kirim file {p.name}: error saat upload.",
+        ))
 
 
 def _list_gdrive_accounts() -> list[str]:
@@ -2561,7 +2571,7 @@ async def cmd_graduate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         result = run_claude(GRADUATE_INSTRUCTION.format(name=name), claude_session_id, active, CLAUDE_MODEL_PRIMARY)
     except Exception as exc:
         logger.exception("graduate failed")
-        await update.message.reply_text(f"⚠️ Error: {exc}")
+        await update.message.reply_text(_t(lang, f"⚠️ Error: {exc}", f"⚠️ Error: {exc}"))
         return
 
     new_session_id = result.get("session_id")
@@ -2814,7 +2824,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def cmd_start_lang_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     if not _may_run_setup(update):
-        await query.answer("Not permitted.", show_alert=True)
+        await query.answer(_t(_chat_lang(update), "Not permitted.", "Tidak diizinkan."), show_alert=True)
         return
     await query.answer()
     _, choice = query.data.split(":", 1)
@@ -4280,7 +4290,10 @@ async def _handle_server_input(update: Update, context: ContextTypes.DEFAULT_TYP
     except Exception as exc:
         logger.exception("could not prepare the agent keypair")
         _server_wizard.pop(chat_id, None)
-        await update.message.reply_text(f"⚠️ Couldn't prepare an SSH key: {exc}")
+        await update.message.reply_text(_t(lang,
+            f"⚠️ Couldn't prepare an SSH key: {exc}",
+            f"⚠️ Gagal siapkan SSH key: {exc}",
+        ))
         return True
 
     await update.message.reply_text(
@@ -4866,11 +4879,12 @@ async def _run_turn(update: Update, context: ContextTypes.DEFAULT_TYPE, text: st
     forced_model = _read_model_overrides().get(chat_id)
     forced_tier = next((t for t in ALL_TIERS if t["model"] == forced_model), None) if forced_model else None
 
+    lang = _chat_lang(update)
     try:
         result, model, attempts = run_combo(text, sess, active, forced_tier=forced_tier)
     except Exception as exc:
         logger.exception("combo run failed")
-        await update.message.reply_text(f"⚠️ Error: {exc}")
+        await update.message.reply_text(_t(lang, f"⚠️ Error: {exc}", f"⚠️ Error: {exc}"))
         return
 
     # re-load in case /session or /remember ran concurrently -- unlikely with
@@ -4881,7 +4895,7 @@ async def _run_turn(update: Update, context: ContextTypes.DEFAULT_TYPE, text: st
     save_sessions(sessions)
 
     label = BACKEND_LABELS.get(model, model)
-    reply_text = result.get("result") or "(no response)"
+    reply_text = result.get("result") or _t(lang, "(no response)", "(tidak ada respons)")
     reply_text, learned_facts = extract_learned(reply_text)
     reply_text, schedule_proposals = extract_schedules(reply_text)
     reply_text, snapshots_taken = extract_snapshots(reply_text)
@@ -4934,10 +4948,10 @@ async def _run_turn(update: Update, context: ContextTypes.DEFAULT_TYPE, text: st
                 # Visible, not silent: auto-writes the user can't see are how a
                 # brief quietly drifts away from what they think it says.
                 bullets = "\n".join(f"• {_tg_escape(f)}" for f in newly_learned)
-                await update.message.reply_text(
+                await update.message.reply_text(_t(lang,
                     f"🧠 <i>Recorded to environment knowledge ({len(newly_learned)} new):</i>\n{bullets}",
-                    parse_mode="HTML",
-                )
+                    f"🧠 <i>Dicatat ke pengetahuan lingkungan ({len(newly_learned)} baru):</i>\n{bullets}",
+                ), parse_mode="HTML")
             break
         except Exception:
             logger.exception(
@@ -4948,10 +4962,12 @@ async def _run_turn(update: Update, context: ContextTypes.DEFAULT_TYPE, text: st
                 await asyncio.sleep(3)
             else:
                 try:
-                    await update.message.reply_text(
+                    await update.message.reply_text(_t(lang,
                         "⚠️ The answer finished processing but couldn't be delivered "
-                        "(connection issue reaching Telegram). Please resend the same message."
-                    )
+                        "(connection issue reaching Telegram). Please resend the same message.",
+                        "⚠️ Jawaban sudah selesai diproses tapi gagal dikirim (masalah koneksi "
+                        "ke Telegram). Coba kirim ulang pesan yang sama.",
+                    ))
                 except Exception:
                     logger.exception("even the failure notice couldn't be delivered (chat=%s)", chat_id)
 
@@ -4996,11 +5012,14 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     if isinstance(update, Update):
         target = _msg(update)
         if target is not None:
+            lang = _chat_lang(update)
             try:
-                await target.reply_text(
+                await target.reply_text(_t(lang,
                     "⚠️ Something went wrong handling that. It is logged -- "
-                    "try again, and if it keeps happening the logs will say why."
-                )
+                    "try again, and if it keeps happening the logs will say why.",
+                    "⚠️ Ada yang salah waktu memproses itu. Sudah tercatat di log -- "
+                    "coba lagi, dan kalau terus terjadi, log-nya akan menunjukkan sebabnya.",
+                ))
             except Exception:
                 logger.warning("could not even deliver the error notice", exc_info=True)
 

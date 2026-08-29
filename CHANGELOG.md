@@ -1,5 +1,38 @@
 # Changelog
 
+## v0.2b.10 -- audit sweep closes six gaps the per-command migration missed
+
+Requested verification pass after v0.2b.9 claimed the `/lang` migration
+complete: wrote a sweep script that scans every `reply_text` /
+`edit_message_text` / `answer` call in the file and flags whichever ones
+aren't routed through `_t(lang, ...)`. It found six genuine gaps the
+command-by-command passes had walked past:
+
+- **`_send_media_file` was never touched at all** across the whole series --
+  every MEDIA: delivery error (not found, too large, contains a credential,
+  upload failed) was still hardcoded Indonesian in production, English in
+  repo. The single largest miss, since it fires on the same delivery path as
+  every report the agent hands back.
+- `cmd_graduate`'s exception handler -- previously left alone on the
+  reasoning "identical in both files already," which doesn't actually mean
+  it was translated, just that neither copy had been.
+- `cmd_start_lang_button`'s permission-denial message.
+- `_handle_server_input`'s SSH-key-preparation exception.
+- **`_run_turn` itself** -- the combo-run-failure error, the "(no response)"
+  fallback, the LEARN: confirmation notice, and the delivery-retry-failure
+  message. This is the core per-turn handler underlying every single AI
+  conversation, so despite being high-traffic it had simply never come up in
+  any of the command-scoped migration batches.
+- The global `on_error` handler (the last-resort catch-all when something
+  raises an uncaught exception).
+
+Audit sweep script now lives at `dev/audit_lang.py`, kept for reuse if
+`/lang` coverage ever needs re-checking after future changes -- it's
+read-only, makes no edits. 12/12 new tests pass for the six fixes; all six
+earlier language/feature suites (162 tests total) re-verified with no
+regressions. Deployed and restarted with 0 errors.
+
+
 ## v0.2b.9 -- `/lang` migration complete: every command and wizard
 
 Final follow-up to the v0.2b.6-8 series: migrated the last two pieces --
