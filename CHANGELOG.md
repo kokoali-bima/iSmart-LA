@@ -1,5 +1,43 @@
 # Changelog
 
+## v0.2b.3 -- `/usemodel`: two extra tiers, opt-in only
+
+**`/usemodel` adds Claude Opus and Gemini Pro-high as extra tiers, without touching
+the default chain at all.** The 4-tier fallback (Gemini Flash -> Gemini Pro-low ->
+Claude Haiku -> Claude Sonnet, cheapest first) stays exactly as it's been since it was
+deliberately locked to fixed defaults -- this deployment's own needs, not a general
+knob. The two new tiers sit outside that chain entirely: reachable only by asking for
+one by name (`/usemodel dede opus`, `/usemodel mini pro max`), for a case that
+genuinely needs more than the default chain offers. `/usemodel auto` reverts;
+`/usemodel` alone shows what's active. The override is per-chat, persisted, and gated
+the same as `/addserver` -- owner anywhere, or a registered group's own admin -- since
+picking a heavier tier spends this deployment's own shared subscription quota.
+
+A forced tier is tried first but the default chain still backs it up on failure rather
+than hard-erroring -- the `— by ...` tag on every reply already surfaces whenever that
+safety net had to fire, so silently falling back is more useful than leaving the user
+with nothing.
+
+**Also fixed while in the area:** the Indonesian `/help` text (what's actually shown
+to users, since production defaults to it) was missing roughly ten commands that the
+English version already listed -- `/schedules` through `/forget` were absent from the
+repo's copy, though production's own deployed copy already had the fuller list.
+Synced both to the same complete set, and refreshed `/unlock`'s stale "owner-only,
+DM-only" line to reflect what v0.2b.2 actually shipped.
+
+Investigated first and explicitly ruled out this round: a `/quota` command to check
+remaining Claude/Gemini usage. Neither `claude` nor `agy` exposes real quota or
+remaining-usage numbers through any CLI subcommand (`claude auth status` / `agy
+models` confirm login and list models, nothing about usage) -- building one would mean
+guessing from our own partial usage tracking and presenting it as authoritative, which
+isn't worth doing.
+
+20/20 tests pass: extra tiers stay disjoint from the default chain, alias matching,
+override persistence, the full owner/group-admin/member/stranger permission matrix,
+and that a forced tier's failure genuinely falls through to the default chain rather
+than erroring out.
+
+
 ## v0.2b.2 -- group admins can open write mode too, on a shorter leash
 
 **`/unlock` now works for a registered group's own admin**, not just the bot

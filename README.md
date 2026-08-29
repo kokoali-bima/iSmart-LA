@@ -4,7 +4,7 @@ A lightweight Telegram bridge to **Claude Code** and **Antigravity CLI (agy)**, 
 infrastructure monitoring and investigation -- built to be dramatically cheaper to run
 than a full agent framework, while staying just as capable for real operational work.
 
-> **Status: v0.2b.2 -- early/beta.** Built and battle-tested against a real production
+> **Status: v0.2b.3 -- early/beta.** Built and battle-tested against a real production
 > Proxmox VE cluster over several days of iteration, including a live-fire test of the
 > unlock/PIN/snapshot flow against real infrastructure. Works well; still has known
 > rough edges (see [Known limitations](#known-limitations)).
@@ -55,6 +55,29 @@ Claude Code usage on the same account.
   turn cold. (Trade-off found necessary in testing: letting one tier resume a
   conversation another tier started produced a single turn costing several times more
   than a fresh conversation would have.)
+
+### `/usemodel` -- an opt-in override, not a new default
+
+The 4-tier chain above is fixed on purpose (see "Design principles" below) -- this
+deployment's own needs, cheapest first, not a general knob. `/usemodel` doesn't change
+that default; it adds two **extra** tiers that sit outside the automatic chain entirely,
+reachable only by asking for one by name, for a case that genuinely needs more than the
+default chain offers:
+
+```
++-- Claude Opus              "dede opus"      (fixed-price, Claude Pro/Max)
++-- Gemini Pro-high           "mini pro max"   (fixed-price, Google AI Pro/Ultra)
+```
+
+`/usemodel dede opus` forces that tier for the rest of that chat's turns; the default
+chain still backs it up if it's ever unavailable, rather than hard-failing (the
+`— by ...` tag on every reply already shows when that safety net had to fire).
+`/usemodel auto` goes back to the default chain. `/usemodel` alone shows what's active.
+The override is per-chat -- a group and a DM can each have their own, independently.
+
+Gated the same as `/addserver` (owner anywhere, or a registered group's own admin):
+picking Opus or Pro-high spends this deployment's own shared subscription quota, so
+it isn't left open to anyone who can merely talk to the bot.
 
 ## Design principles
 
@@ -176,6 +199,7 @@ Ollama, say), since something has to translate between protocols.
 | `/removeserver <name>` | owner/admin | Unregister one |
 | `/agentstatus` | tiny probe each | Live check: is each tier actually up right now? |
 | `/providers` | **0 tokens** | Which AI tiers are configured, and which are healthy |
+| `/usemodel [name]` | owner/admin | Force a specific tier for this chat (Opus, Gemini Pro-high, ...); `auto` for the default chain |
 | `/mode` | **0 tokens** | Read-only right now, or able to change things? |
 | `/unlock [min]` | owner/admin | Open a time-boxed window for real changes (capped at 10 min from a group) |
 | `/lock` | owner/admin | Close that window early |

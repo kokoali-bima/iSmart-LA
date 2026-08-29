@@ -501,6 +501,7 @@ def _new_pin_session(action: str, payload: dict, chat_id: int) -> str:
 # --------------------------------------------------------------------------
 
 SCHEDULES_FILE = BASE_DIR / "schedules.json"
+MODEL_OVERRIDE_FILE = BASE_DIR / "model_overrides.json"  # {chat_id: model}
 CRON_BEGIN = "# BEGIN iSmart-LA managed -- edited by the bot, do not hand-edit"
 CRON_END = "# END iSmart-LA managed"
 # SCHEDULE: name=daily-report | when=0 8 * * * | run=python3 x.py | write=no
@@ -525,6 +526,32 @@ def _read_schedules() -> list[dict]:
 
 def _write_schedules(items: list[dict]) -> None:
     SCHEDULES_FILE.write_text(json.dumps(items, indent=2))
+
+
+def _read_model_overrides() -> dict:
+    if not MODEL_OVERRIDE_FILE.exists():
+        return {}
+    try:
+        return json.loads(MODEL_OVERRIDE_FILE.read_text())
+    except Exception:
+        logger.warning("model_overrides.json unreadable", exc_info=True)
+        return {}
+
+
+def _write_model_overrides(items: dict) -> None:
+    MODEL_OVERRIDE_FILE.write_text(json.dumps(items, indent=2))
+
+
+def _find_tier_by_alias(text: str) -> Optional[dict]:
+    """Match free-typed text against a known tier's label or model id,
+    case-insensitively -- spans both the default chain and the extras."""
+    needle = text.strip().lower()
+    if not needle:
+        return None
+    for t in ALL_TIERS:
+        if needle in (t["label"].lower(), t["model"].lower()):
+            return t
+    return None
 
 
 def _valid_cron(expr: str) -> bool:
@@ -1257,6 +1284,21 @@ if not TIERS:
 # escalation, and that's worth noticing without digging through logs.
 BACKEND_LABELS = {t["model"]: t["label"] for t in TIERS}
 
+# --------------------------------------------------------------------------
+# Extra tiers -- /usemodel only, NEVER part of the automatic fallback chain
+# above. Reaching for Opus or Gemini Pro-high on every routine turn would burn
+# through the shared subscription fast (see the ordering rationale above);
+# kept reachable only when someone deliberately names one for a case that
+# genuinely needs it. The default chain and its order are untouched by these
+# existing at all.
+# --------------------------------------------------------------------------
+EXTRA_TIERS = _parse_tiers(
+    "claude:claude-opus-5:dede opus,"
+    "agy:gemini-3.1-pro-high:mini pro max"
+)
+BACKEND_LABELS.update({t["model"]: t["label"] for t in EXTRA_TIERS})
+ALL_TIERS = TIERS + EXTRA_TIERS
+
 
 # --------------------------------------------------------------------------
 # Session persistence: telegram chat_id -> { active: name, sessions: {name: {
@@ -1650,7 +1692,8 @@ def _normalize_agy_result(parsed: dict) -> dict:
 #   -> claude haiku ("dede iku") -> claude sonnet ("dede nnet")
 # --------------------------------------------------------------------------
 
-def run_combo(prompt: str, sess: dict, session_name: str) -> tuple[dict, str, list[str]]:
+def run_combo(prompt: str, sess: dict, session_name: str,
+              forced_tier: Optional[dict] = None) -> tuple[dict, str, list[str]]:
     """Walk the TIERS chain in order, moving on only when a tier fails in a way
     another tier could plausibly survive.
 
@@ -1667,7 +1710,14 @@ def run_combo(prompt: str, sess: dict, session_name: str) -> tuple[dict, str, li
     agy_convs = sess.setdefault("agy", {})       # {model: conversation_id}
     claude_sessions = sess.setdefault("claude", {})  # {model: session_id}
 
-    for tier in TIERS:
+    # A forced tier (/usemodel) goes first; the normal chain still backs it up
+    # if it fails, rather than leaving the user with a hard error -- the reply
+    # tag already shows whenever that safety net had to fire.
+    chain = TIERS
+    if forced_tier is not None:
+        chain = [forced_tier] + [t for t in TIERS if t["model"] != forced_tier["model"]]
+
+    for tier in chain:
         provider, model = tier["provider"], tier["model"]
         if not _tier_available(model):
             attempts.append(f"{provider}:{model} SKIPPED (cooldown)")
@@ -1716,7 +1766,7 @@ def run_combo(prompt: str, sess: dict, session_name: str) -> tuple[dict, str, li
     if attempts and all("SKIPPED" in a for a in attempts):
         _tier_cooldown.clear()
         raise RuntimeError("Every tier is cooling down after recent failures; try again shortly.")
-    raise RuntimeError(f"All {len(TIERS)} tier(s) failed: {' -> '.join(attempts)}")
+    raise RuntimeError(f"All {len(chain)} tier(s) failed: {' -> '.join(attempts)}")
 
 
 # --------------------------------------------------------------------------
@@ -2628,6 +2678,7 @@ Every reply ends with a "— by ..." tag. If it's ever NOT "{TIERS[0]['label']}"
 /removeserver <name> — unregister one
 /agentstatus — live check: is each AI tier actually up right now?
 /providers — which AI tiers are configured and which are healthy (0 tokens)
+/usemodel [name] — force a specific tier for this chat (Opus, Gemini Pro-high, ...); `/usemodel auto` for the default chain
 /mode — read-only right now, or able to make changes? (0 tokens)
 /unlock [minutes] — owner-only, DM-only: allow real changes for a limited window
 /lock — close that window early
@@ -2839,6 +2890,59 @@ async def cmd_lock(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "🔒 Write mode closed. Back to read-only." if was_open
         else "🔒 Already read-only."
+    )
+
+
+async def cmd_usemodel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Force a specific tier to answer THIS chat's turns, bypassing the normal
+    cheapest-first order -- for a genuinely demanding case, not routine use.
+    Gated like /addserver (owner anywhere, or a registered group's own admin):
+    it spends this deployment's own shared subscription quota, so it isn't
+    left open to anyone who can merely talk to the bot."""
+    if not await _may_authorize_group_action(update, context):
+        return
+    chat_id = str(update.effective_chat.id)
+    overrides = _read_model_overrides()
+
+    if not context.args:
+        current = overrides.get(chat_id)
+        lines = ["\U0001f9e0 <b>Model selection</b>", ""]
+        if current:
+            label = BACKEND_LABELS.get(current, current)
+            lines.append(f"Forced: <b>{_tg_escape(label)}</b> for this chat.")
+            lines.append("Every turn tries this first; the default chain still backs it up if it's unavailable.")
+        else:
+            lines.append(f"Auto (default chain) -- currently <b>{_tg_escape(TIERS[0]['label'])}</b> first.")
+        lines.append("")
+        lines.append("Default chain (always on, cheapest first):")
+        lines.extend(f"  \u2022 {_tg_escape(t['label'])}" for t in TIERS)
+        lines.append("")
+        lines.append("Extra, on-demand only:")
+        lines.extend(f"  \u2022 {_tg_escape(t['label'])}" for t in EXTRA_TIERS)
+        lines.append("")
+        lines.append("<code>/usemodel &lt;name&gt;</code> to force one, <code>/usemodel auto</code> for the default chain.")
+        await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+        return
+
+    choice = " ".join(context.args).strip()
+    if choice.lower() == "auto":
+        if overrides.pop(chat_id, None) is not None:
+            _write_model_overrides(overrides)
+        await update.message.reply_text("\U0001f504 Back to auto -- default cheapest-first chain.")
+        return
+
+    tier = _find_tier_by_alias(choice)
+    if not tier:
+        names = ", ".join(t["label"] for t in ALL_TIERS)
+        await update.message.reply_text(f"Don't recognize {choice!r}. Options: {names}, or auto.")
+        return
+
+    overrides[chat_id] = tier["model"]
+    _write_model_overrides(overrides)
+    await update.message.reply_text(
+        f"\U0001f3af Forcing <b>{_tg_escape(tier['label'])}</b> for this chat's next turns. "
+        "<code>/usemodel auto</code> to go back to the default chain.",
+        parse_mode="HTML",
     )
 
 
@@ -3985,8 +4089,11 @@ async def _run_turn(update: Update, context: ContextTypes.DEFAULT_TYPE, text: st
 
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
 
+    forced_model = _read_model_overrides().get(chat_id)
+    forced_tier = next((t for t in ALL_TIERS if t["model"] == forced_model), None) if forced_model else None
+
     try:
-        result, model, attempts = run_combo(text, sess, active)
+        result, model, attempts = run_combo(text, sess, active, forced_tier=forced_tier)
     except Exception as exc:
         logger.exception("combo run failed")
         await update.message.reply_text(f"⚠️ Error: {exc}")
@@ -4168,6 +4275,7 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(cmd_schedule_decision, pattern="^sched_(ok|no):"))
     app.add_handler(CommandHandler("unlock", cmd_unlock))
     app.add_handler(CommandHandler("lock", cmd_lock))
+    app.add_handler(CommandHandler("usemodel", cmd_usemodel))
     app.add_handler(CommandHandler("mode", cmd_mode))
     app.add_handler(CommandHandler("learned", cmd_learned))
     app.add_handler(CommandHandler("forget", cmd_forget))
