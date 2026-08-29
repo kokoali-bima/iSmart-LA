@@ -1,5 +1,26 @@
 # Changelog
 
+## v0.2b.9 -- `/lang` migration complete: every command and wizard
+
+Final follow-up to the v0.2b.6-8 series: migrated the last two pieces --
+`/start`'s own setup wizard (`_wizard_text`/`_wizard_keyboard` now take a
+`lang` argument, `cmd_start`, `cmd_start_lang_button`, `cmd_setup_button`,
+`_begin_cli_login`, `_handle_wizard_input`) and `/addserver`'s step-by-step
+form (`cmd_addserver`, `_begin_addserver`, `cmd_server_button`, `_srv_prompt`,
+`_handle_server_input`, `_finish_addserver`).
+
+**Every command and flow now respects `/lang`.** Nothing in the bot's own
+fixed text is locked to one language any more -- what started as an
+infrastructure-plus-a-few-commands change in v0.2b.6 reached full coverage
+after four incremental batches, each tested and deployed on its own before
+moving to the next.
+
+33/33 new tests pass (wizard steps and confirmation prompts checked in both
+languages, `_srv_prompt`'s EN/ID dictionaries checked for actually differing
+per step); all five earlier language/feature suites re-verified with no
+regressions across the whole series. Deployed and restarted with 0 errors.
+
+
 ## v0.2b.8 -- `/lang` migration reaches the PIN system and confirmation cards (37 total)
 
 Follow-up to v0.2b.7: migrated the PIN system itself -- `request_pin`,

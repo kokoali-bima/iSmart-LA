@@ -1260,24 +1260,28 @@ def setup_summary() -> list[tuple[str, bool, str]]:
     ]
 
 
-def _wizard_keyboard(state: dict) -> InlineKeyboardMarkup:
+def _wizard_keyboard(state: dict, lang: str = "id") -> InlineKeyboardMarkup:
     rows = []
     for key, (label, done, _) in zip(("agy", "claude", "pin"), setup_summary()):
         mark = "✅" if done else "⬜"
-        verb = "Change" if done else "Set up"
+        verb = _t(lang, "Change", "Ganti") if done else _t(lang, "Set up", "Atur")
         rows.append([InlineKeyboardButton(f"{mark} {verb} {label}", callback_data=f"setup:{key}")])
-    rows.append([InlineKeyboardButton("✖️ Close", callback_data="setup:close")])
+    rows.append([InlineKeyboardButton(_t(lang, "✖️ Close", "✖️ Tutup"), callback_data="setup:close")])
     return InlineKeyboardMarkup(rows)
 
 
-def _wizard_text() -> str:
-    lines = ["\U0001f6e0 <b>iSmart-LA setup</b>", ""]
+def _wizard_text(lang: str = "id") -> str:
+    lines = [_t(lang, "\U0001f6e0 <b>iSmart-LA setup</b>", "\U0001f6e0 <b>Setup iSmart-LA</b>"), ""]
     for label, done, hint in setup_summary():
         lines.append(f"{'✅' if done else '⬜'} <b>{label}</b>\n   <i>{hint}</i>")
     if all(done for _, done, _ in setup_summary()):
-        lines.append("\nEverything is set up. Just talk to me normally.")
+        lines.append(_t(lang, "\nEverything is set up. Just talk to me normally.",
+                              "\nSemuanya sudah diatur. Tinggal chat biasa saja."))
     else:
-        lines.append("\nTap anything above to set it up. You can stop and come back later.")
+        lines.append(_t(lang,
+            "\nTap anything above to set it up. You can stop and come back later.",
+            "\nTap salah satu di atas untuk mengaturnya. Bisa berhenti dan lanjut nanti.",
+        ))
     return "\n".join(lines)
 
 
@@ -2752,30 +2756,41 @@ async def _is_group_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """The setup wizard, and the first thing anyone runs."""
+    lang = _chat_lang(update)
     if not _authorized(update):
-        await update.message.reply_text("Sorry, you're not authorized to use this bot.")
+        await update.message.reply_text(_t(lang,
+            "Sorry, you're not authorized to use this bot.",
+            "Maaf, kamu tidak diizinkan pakai bot ini.",
+        ))
         return
     if not _may_run_setup(update):
-        await update.message.reply_text(
+        await update.message.reply_text(_t(lang,
             "\U0001f44b I'm ready. Send anything to get started — status checks, "
-            "investigations, reports.\n\nType /help for the full guide."
-        )
+            "investigations, reports.\n\nType /help for the full guide.",
+            "\U0001f44b Saya siap. Kirim apa saja untuk mulai — cek status, "
+            "investigasi, laporan.\n\nKetik /help untuk panduan lengkap.",
+        ))
         return
     if not _is_owner(update) and not await _is_group_admin(update, context):
-        await update.message.reply_text(
+        await update.message.reply_text(_t(lang,
             "\U0001f44b I'm ready. Send anything to get started.\n\n"
             "Type /help for the guide. (Setup is limited to the bot owner and this "
-            "group's admins.)"
-        )
+            "group's admins.)",
+            "\U0001f44b Saya siap. Kirim apa saja untuk mulai.\n\n"
+            "Ketik /help untuk panduan. (Setup dibatasi untuk pemilik bot dan admin "
+            "grup ini.)",
+        ))
         return
 
     done = [d for _, d, _ in setup_summary()]
     if all(done) and not _is_owner(update):
-        await update.message.reply_text(
+        await update.message.reply_text(_t(lang,
             "✅ This bot is already set up by the owner.\n\nChange anything?",
+            "✅ Bot ini sudah diatur oleh pemilik.\n\nMau ubah sesuatu?",
+        ),
             reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("Yes, change setup", callback_data="setup:menu"),
-                InlineKeyboardButton("No, leave it", callback_data="setup:close"),
+                InlineKeyboardButton(_t(lang, "Yes, change setup", "Ya, ubah setup"), callback_data="setup:menu"),
+                InlineKeyboardButton(_t(lang, "No, leave it", "Tidak, biarkan"), callback_data="setup:close"),
             ]]),
         )
         return
@@ -2792,8 +2807,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             ]]),
         )
         return
-    await update.message.reply_text(_wizard_text(), parse_mode="HTML",
-                                    reply_markup=_wizard_keyboard({}))
+    await update.message.reply_text(_wizard_text(lang), parse_mode="HTML",
+                                    reply_markup=_wizard_keyboard({}, lang))
 
 
 async def cmd_start_lang_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2807,32 +2822,36 @@ async def cmd_start_lang_button(update: Update, context: ContextTypes.DEFAULT_TY
     prefs = _read_chat_languages()
     prefs[chat_id] = choice
     _write_chat_languages(prefs)
-    await query.edit_message_text(_wizard_text(), parse_mode="HTML",
-                                  reply_markup=_wizard_keyboard({}))
+    await query.edit_message_text(_wizard_text(choice), parse_mode="HTML",
+                                  reply_markup=_wizard_keyboard({}, choice))
 
 
 async def cmd_setup_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
+    lang = _chat_lang(update)
     _, _, what = query.data.partition(":")
     if not _may_run_setup(update):
-        await query.answer("Not permitted.", show_alert=True)
+        await query.answer(_t(lang, "Not permitted.", "Tidak diizinkan."), show_alert=True)
         return
     if not _is_owner(update) and not await _is_group_admin(update, context):
-        await query.answer("Group admins only.", show_alert=True)
+        await query.answer(_t(lang, "Group admins only.", "Cuma admin grup."), show_alert=True)
         return
     await query.answer()
 
     if what == "close":
-        await query.edit_message_text("Setup closed. Run /start any time.")
+        await query.edit_message_text(_t(lang, "Setup closed. Run /start any time.",
+                                              "Setup ditutup. Jalankan /start kapan saja."))
         return
     if what == "menu":
-        await query.edit_message_text(_wizard_text(), parse_mode="HTML",
-                                      reply_markup=_wizard_keyboard({}))
+        await query.edit_message_text(_wizard_text(lang), parse_mode="HTML",
+                                      reply_markup=_wizard_keyboard({}, lang))
         return
     if what == "pin":
         await _begin_new_pin(update, query) if not pin_is_set() else await request_pin(
-            update, "change_pin_start", {},
-            "🔢 Changing the PIN. First, confirm the CURRENT one.")
+            update, "change_pin_start", {}, _t(lang,
+                "🔢 Changing the PIN. First, confirm the CURRENT one.",
+                "🔢 Mengganti PIN. Konfirmasi dulu PIN yang SEKARANG.",
+            ))
         return
     if what in ("agy", "claude"):
         await _begin_cli_login(update, query, what)
@@ -2841,11 +2860,14 @@ async def cmd_setup_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 async def _begin_cli_login(update: Update, query, provider: str) -> None:
     """Kick off a provider's OAuth and show the URL."""
+    lang = _chat_lang(update)
     if not tmux_available():
-        await query.edit_message_text(
+        await query.edit_message_text(_t(lang,
             "⚠️ tmux isn't installed, and it's needed to drive the sign-in screen.\n"
             "Install it (<code>apt install tmux</code>) and try again.",
-            parse_mode="HTML")
+            "⚠️ tmux belum terpasang, padahal dibutuhkan untuk layar sign-in.\n"
+            "Pasang dulu (<code>apt install tmux</code>) lalu coba lagi.",
+        ), parse_mode="HTML")
         return
 
     if provider == "agy":
@@ -2854,13 +2876,14 @@ async def _begin_cli_login(update: Update, query, provider: str) -> None:
         cmd, human = [CLAUDE_BIN, "auth", "login"], "Claude Code"
 
     handle = LoginHandle(session=f"ismart-login-{provider}", command=cmd)
-    await query.edit_message_text(f"⏳ Starting {human} sign-in…")
+    await query.edit_message_text(_t(lang, f"⏳ Starting {human} sign-in…", f"⏳ Memulai sign-in {human}…"))
     try:
         handle.start()
         url = await asyncio.get_running_loop().run_in_executor(None, handle.wait_for_url, 45)
     except Exception as exc:
         logger.exception("login start failed for %s", provider)
-        await query.edit_message_text(f"⚠️ Couldn't start the sign-in: {exc}")
+        await query.edit_message_text(_t(lang, f"⚠️ Couldn't start the sign-in: {exc}",
+                                              f"⚠️ Gagal mulai sign-in: {exc}"))
         return
 
     if url is None:
@@ -2868,11 +2891,15 @@ async def _begin_cli_login(update: Update, query, provider: str) -> None:
         handle.kill()
         if LoginHandle.already_done(screen):
             _mark_setup(provider, update.effective_user.id)
-            await query.edit_message_text(f"✅ {human} is already signed in.")
+            await query.edit_message_text(_t(lang, f"✅ {human} is already signed in.",
+                                                  f"✅ {human} sudah sign-in."))
             return
-        await query.edit_message_text(
+        await query.edit_message_text(_t(lang,
             f"⚠️ Couldn't find a sign-in URL for {human}. Last output:\n\n"
-            f"<pre>{_tg_escape(screen[-600:])}</pre>", parse_mode="HTML")
+            f"<pre>{_tg_escape(screen[-600:])}</pre>",
+            f"⚠️ Tidak ketemu URL sign-in untuk {human}. Output terakhir:\n\n"
+            f"<pre>{_tg_escape(screen[-600:])}</pre>",
+        ), parse_mode="HTML")
         return
 
     _wizard[update.effective_chat.id] = {
@@ -2881,7 +2908,7 @@ async def _begin_cli_login(update: Update, query, provider: str) -> None:
         "human": human,
         "expires": _dt.datetime.now().timestamp() + WIZARD_TTL_SECONDS,
     }
-    await query.edit_message_text(
+    await query.edit_message_text(_t(lang,
         f"🔗 <b>Sign in to {human}</b>\n\n"
         "1. Open this on any device:\n"
         f"{_tg_escape(url)}\n\n"
@@ -2890,8 +2917,15 @@ async def _begin_cli_login(update: Update, query, provider: str) -> None:
         "<i>The code is single-use and expires quickly, which is why it's safe to "
         "paste in chat — unlike a password or an SSH key, which I'll never ask for.</i>\n\n"
         "Send /cancel to stop.",
-        parse_mode="HTML", disable_web_page_preview=True,
-    )
+        f"🔗 <b>Sign in ke {human}</b>\n\n"
+        "1. Buka ini di perangkat mana pun:\n"
+        f"{_tg_escape(url)}\n\n"
+        "2. Setujui, salin kode yang muncul.\n"
+        "3. <b>Kirim kode itu di sini sebagai pesan berikutnya.</b>\n\n"
+        "<i>Kodenya sekali-pakai dan cepat kedaluwarsa, makanya aman ditempel "
+        "di chat — beda dengan password atau SSH key, yang tidak akan pernah saya minta.</i>\n\n"
+        "Kirim /cancel untuk berhenti.",
+    ), parse_mode="HTML", disable_web_page_preview=True)
 
 
 async def _handle_wizard_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
@@ -2901,22 +2935,26 @@ async def _handle_wizard_input(update: Update, context: ContextTypes.DEFAULT_TYP
     state = _wizard.get(chat_id)
     if not state:
         return False
+    lang = _chat_lang(update)
     if state["expires"] < _dt.datetime.now().timestamp():
         _wizard.pop(chat_id, None)
         state["handle"].kill()
-        await update.message.reply_text("⌛ That sign-in expired. Run /start to try again.")
+        await update.message.reply_text(_t(lang,
+            "⌛ That sign-in expired. Run /start to try again.",
+            "⌛ Sign-in itu sudah kedaluwarsa. Jalankan /start untuk coba lagi.",
+        ))
         return True
 
     text = (update.message.text or "").strip()
     if text.lower() in ("/cancel", "cancel", "batal"):
         _wizard.pop(chat_id, None)
         state["handle"].kill()
-        await update.message.reply_text("✖️ Sign-in cancelled.")
+        await update.message.reply_text(_t(lang, "✖️ Sign-in cancelled.", "✖️ Sign-in dibatalkan."))
         return True
 
     handle, human = state["handle"], state["human"]
     _wizard.pop(chat_id, None)
-    await update.message.reply_text(f"⏳ Sending the code to {human}…")
+    await update.message.reply_text(_t(lang, f"⏳ Sending the code to {human}…", f"⏳ Mengirim kode ke {human}…"))
 
     # The code was a chat message and is a credential, however short-lived --
     # take it out of the history now rather than leaving it sitting there.
@@ -2932,7 +2970,7 @@ async def _handle_wizard_input(update: Update, context: ContextTypes.DEFAULT_TYP
     except Exception as exc:
         logger.exception("login completion failed")
         handle.kill()
-        await update.message.reply_text(f"⚠️ Sign-in failed: {exc}")
+        await update.message.reply_text(_t(lang, f"⚠️ Sign-in failed: {exc}", f"⚠️ Sign-in gagal: {exc}"))
         return True
     handle.kill()
 
@@ -2940,15 +2978,19 @@ async def _handle_wizard_input(update: Update, context: ContextTypes.DEFAULT_TYP
         provider = "agy" if "Antigravity" in human else "claude"
         _mark_setup(provider, update.effective_user.id)
         logger.warning("%s sign-in completed by user=%s", human, update.effective_user.id)
-        await update.message.reply_text(
+        await update.message.reply_text(_t(lang,
             f"✅ <b>{human} signed in.</b>\n\nRun /start to see what's left.",
-            parse_mode="HTML")
+            f"✅ <b>{human} sudah sign-in.</b>\n\nJalankan /start untuk lihat sisanya.",
+        ), parse_mode="HTML")
     else:
-        await update.message.reply_text(
+        await update.message.reply_text(_t(lang,
             f"⚠️ {human} didn't accept that code. It may have expired — codes are "
             f"short-lived, so grabbing a fresh one usually fixes it.\n\n"
             f"<pre>{_tg_escape(screen[-500:])}</pre>\n\nRun /start to retry.",
-            parse_mode="HTML")
+            f"⚠️ {human} tidak menerima kode itu. Mungkin sudah kedaluwarsa — kodenya "
+            f"cepat basi, biasanya ambil yang baru langsung beres.\n\n"
+            f"<pre>{_tg_escape(screen[-500:])}</pre>\n\nJalankan /start untuk coba lagi.",
+        ), parse_mode="HTML")
     return True
 
 
@@ -3958,19 +4000,24 @@ async def cmd_addserver(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     """Register a machine the agent may reach. PIN first -- this grants access."""
     if not _may_run_setup(update):
         return
+    lang = _chat_lang(update)
     if not _is_owner(update) and not await _is_group_admin(update, context):
-        await update.message.reply_text("🔒 Bot owner or a group admin only.")
+        await update.message.reply_text(_t(lang, "🔒 Bot owner or a group admin only.",
+                                              "🔒 Cuma pemilik bot atau admin grup."))
         return
     if pin_is_set():
-        await request_pin(update, "addserver", {}, "➕ Adding a server.")
+        await request_pin(update, "addserver", {}, _t(lang, "➕ Adding a server.", "➕ Menambah server."))
     else:
         # Nothing to verify against yet. Say so plainly instead of pretending
         # a gate exists -- and nudge, because this is exactly what it protects.
-        await update.message.reply_text(
+        await update.message.reply_text(_t(lang,
             "⚠️ No PIN is set, so this isn't protected yet. Set one with /setpin "
             "when you're done — it's what stops a stolen Telegram session from "
-            "adding a server nobody noticed."
-        )
+            "adding a server nobody noticed.",
+            "⚠️ Belum ada PIN, jadi ini belum terlindungi. Atur satu dengan /setpin "
+            "kalau sudah selesai — itu yang mencegah sesi Telegram yang dicuri "
+            "menambah server tanpa disadari.",
+        ))
         await _begin_addserver(update)
 
 
@@ -3979,12 +4026,14 @@ async def _begin_addserver(update: Update, query=None) -> None:
         "step": "kind", "data": {},
         "expires": _dt.datetime.now().timestamp() + SERVER_WIZARD_TTL,
     }
+    lang = _chat_lang(update)
     kb = InlineKeyboardMarkup(
         [[InlineKeyboardButton(label, callback_data=f"srv:kind:{key}")]
          for key, label in SERVER_KINDS.items()]
-        + [[InlineKeyboardButton("✖️ Cancel", callback_data="srv:cancel:")]]
+        + [[InlineKeyboardButton(_t(lang, "✖️ Cancel", "✖️ Batal"), callback_data="srv:cancel:")]]
     )
-    text = "➕ <b>Add a server</b>\n\nWhat kind of machine is it?"
+    text = _t(lang, "➕ <b>Add a server</b>\n\nWhat kind of machine is it?",
+                    "➕ <b>Tambah server</b>\n\nJenis mesinnya apa?")
     if query is not None:
         await query.edit_message_text(text, parse_mode="HTML", reply_markup=kb)
     else:
@@ -3993,21 +4042,24 @@ async def _begin_addserver(update: Update, query=None) -> None:
 
 async def cmd_server_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
+    lang = _chat_lang(update)
     _, action, value = query.data.split(":", 2)
     chat_id = update.effective_chat.id
     if not _may_run_setup(update):
-        await query.answer("Not permitted.", show_alert=True)
+        await query.answer(_t(lang, "Not permitted.", "Tidak diizinkan."), show_alert=True)
         return
     await query.answer()
 
     if action == "cancel":
         _server_wizard.pop(chat_id, None)
-        await query.edit_message_text("✖️ Cancelled. Nothing was saved.")
+        await query.edit_message_text(_t(lang, "✖️ Cancelled. Nothing was saved.",
+                                              "✖️ Dibatalkan. Tidak ada yang disimpan."))
         return
 
     state = _server_wizard.get(chat_id)
     if not state:
-        await query.edit_message_text("That form expired. Run /addserver again.")
+        await query.edit_message_text(_t(lang, "That form expired. Run /addserver again.",
+                                              "Form itu sudah kedaluwarsa. Jalankan /addserver lagi."))
         return
     data = state["data"]
 
@@ -4016,22 +4068,23 @@ async def cmd_server_button(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         if value == "hypervisor":
             state["step"] = "flavour"
             await query.edit_message_text(
-                "➕ <b>Add a server</b>\n\nWhich hypervisor?", parse_mode="HTML",
+                _t(lang, "➕ <b>Add a server</b>\n\nWhich hypervisor?",
+                         "➕ <b>Tambah server</b>\n\nHypervisor yang mana?"), parse_mode="HTML",
                 reply_markup=InlineKeyboardMarkup(
                     [[InlineKeyboardButton(l, callback_data=f"srv:flavour:{k}")]
                      for k, l in HYPERVISOR_FLAVOURS.items()]
-                    + [[InlineKeyboardButton("✖️ Cancel", callback_data="srv:cancel:")]]),
+                    + [[InlineKeyboardButton(_t(lang, "✖️ Cancel", "✖️ Batal"), callback_data="srv:cancel:")]]),
             )
             return
         data["flavour"] = value
         state["step"] = "name"
-        await query.edit_message_text(_srv_prompt("name"), parse_mode="HTML")
+        await query.edit_message_text(_srv_prompt("name", lang), parse_mode="HTML")
         return
 
     if action == "flavour":
         data["flavour"] = value
         state["step"] = "name"
-        await query.edit_message_text(_srv_prompt("name"), parse_mode="HTML")
+        await query.edit_message_text(_srv_prompt("name", lang), parse_mode="HTML")
         return
 
     if action == "cluster":
@@ -4041,11 +4094,15 @@ async def cmd_server_button(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             await _finish_addserver(update, query)
             return
         await query.edit_message_text(
-            "🔍 Scan the cluster now?\n\nRead-only — it just asks which nodes exist "
-            "and how many guests are running. No changes, and it doesn't need write mode.",
+            _t(lang,
+               "🔍 Scan the cluster now?\n\nRead-only — it just asks which nodes exist "
+               "and how many guests are running. No changes, and it doesn't need write mode.",
+               "🔍 Scan cluster sekarang?\n\nRead-only — cuma tanya node mana saja yang ada "
+               "dan berapa guest yang jalan. Tidak ada perubahan, tidak butuh write mode.",
+            ),
             reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("Yes, scan", callback_data="srv:discover:yes"),
-                InlineKeyboardButton("Skip", callback_data="srv:discover:no"),
+                InlineKeyboardButton(_t(lang, "Yes, scan", "Ya, scan"), callback_data="srv:discover:yes"),
+                InlineKeyboardButton(_t(lang, "Skip", "Lewati"), callback_data="srv:discover:no"),
             ]]),
         )
         return
@@ -4054,7 +4111,8 @@ async def cmd_server_button(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         if value == "no":
             await _finish_addserver(update, query)
             return
-        await query.edit_message_text("🔍 Scanning… this can take a moment.")
+        await query.edit_message_text(_t(lang, "🔍 Scanning… this can take a moment.",
+                                              "🔍 Scanning… bisa makan waktu sebentar."))
         loop = asyncio.get_running_loop()
         ok, detail, nodes = await loop.run_in_executor(
             None, discover_proxmox, data["host"], data["user"], data["port"])
@@ -4065,117 +4123,147 @@ async def cmd_server_button(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         return
 
     if action == "test":
-        await query.edit_message_text("🔌 Testing the connection…")
+        await query.edit_message_text(_t(lang, "🔌 Testing the connection…", "🔌 Menguji koneksi…"))
         loop = asyncio.get_running_loop()
         ok, detail = await loop.run_in_executor(
             None, test_server_ssh, data["host"], data["user"], data["port"],
             20, data.get("key"))
         if not ok:
             await query.edit_message_text(
-                f"❌ Couldn't connect:\n<pre>{_tg_escape(detail)}</pre>\n\n"
-                "Usually the public key isn't in place yet, or the user/port is off.",
+                _t(lang,
+                   f"❌ Couldn't connect:\n<pre>{_tg_escape(detail)}</pre>\n\n"
+                   "Usually the public key isn't in place yet, or the user/port is off.",
+                   f"❌ Gagal konek:\n<pre>{_tg_escape(detail)}</pre>\n\n"
+                   "Biasanya public key belum terpasang, atau user/port-nya salah.",
+                ),
                 parse_mode="HTML",
                 reply_markup=InlineKeyboardMarkup([[
-                    InlineKeyboardButton("🔁 Test again", callback_data="srv:test:"),
-                    InlineKeyboardButton("✖️ Cancel", callback_data="srv:cancel:"),
+                    InlineKeyboardButton(_t(lang, "🔁 Test again", "🔁 Tes lagi"), callback_data="srv:test:"),
+                    InlineKeyboardButton(_t(lang, "✖️ Cancel", "✖️ Batal"), callback_data="srv:cancel:"),
                 ]]))
             return
         data["probe"] = detail
         if data.get("flavour") == "proxmox":
             state["step"] = "cluster"
             await query.edit_message_text(
-                f"✅ Connected. <code>{_tg_escape(detail)}</code>\n\n"
-                "Does this same key reach <b>every node</b> in the cluster?",
+                _t(lang,
+                   f"✅ Connected. <code>{_tg_escape(detail)}</code>\n\n"
+                   "Does this same key reach <b>every node</b> in the cluster?",
+                   f"✅ Terhubung. <code>{_tg_escape(detail)}</code>\n\n"
+                   "Apakah key yang sama ini bisa menjangkau <b>semua node</b> di cluster?",
+                ),
                 parse_mode="HTML",
                 reply_markup=InlineKeyboardMarkup([[
-                    InlineKeyboardButton("Yes", callback_data="srv:cluster:yes"),
-                    InlineKeyboardButton("No, just this one", callback_data="srv:cluster:no"),
+                    InlineKeyboardButton(_t(lang, "Yes", "Ya"), callback_data="srv:cluster:yes"),
+                    InlineKeyboardButton(_t(lang, "No, just this one", "Tidak, ini saja"), callback_data="srv:cluster:no"),
                 ]]))
             return
         await _finish_addserver(update, query)
         return
 
 
-def _srv_prompt(step: str) -> str:
+def _srv_prompt(step: str, lang: str = "id") -> str:
     return {
-        "name": "➕ <b>Name</b>\n\nA short label for this machine — lowercase, digits, "
-                "<code>-</code> or <code>_</code>.\n\ne.g. <code>pm-cluster</code>\n\n"
-                "Send it as a message. /cancel to stop.",
-        "host": "➕ <b>Address</b>\n\nIP or hostname.\n\n<i>Prefer the raw IP unless you've "
-                "checked what DNS returns — wildcard records pointing at a proxy are common, "
-                "and then you'd be talking to the proxy instead of the machine.</i>",
-        "user": "➕ <b>SSH user</b>\n\ne.g. <code>root</code> or <code>ubuntu</code>",
-        "port": "➕ <b>SSH port</b>\n\nSend <code>22</code> for the default.",
-    }[step]
+        "en": {
+            "name": "➕ <b>Name</b>\n\nA short label for this machine — lowercase, digits, "
+                    "<code>-</code> or <code>_</code>.\n\ne.g. <code>pm-cluster</code>\n\n"
+                    "Send it as a message. /cancel to stop.",
+            "host": "➕ <b>Address</b>\n\nIP or hostname.\n\n<i>Prefer the raw IP unless you've "
+                    "checked what DNS returns — wildcard records pointing at a proxy are common, "
+                    "and then you'd be talking to the proxy instead of the machine.</i>",
+            "user": "➕ <b>SSH user</b>\n\ne.g. <code>root</code> or <code>ubuntu</code>",
+            "port": "➕ <b>SSH port</b>\n\nSend <code>22</code> for the default.",
+        },
+        "id": {
+            "name": "➕ <b>Nama</b>\n\nLabel singkat untuk mesin ini — huruf kecil, angka, "
+                    "<code>-</code> atau <code>_</code>.\n\ncontoh: <code>pm-cluster</code>\n\n"
+                    "Kirim sebagai pesan. /cancel untuk berhenti.",
+            "host": "➕ <b>Alamat</b>\n\nIP atau hostname.\n\n<i>Utamakan IP mentah kecuali sudah "
+                    "dicek apa yang dikembalikan DNS — record wildcard yang mengarah ke proxy itu "
+                    "umum, nanti malah bicara ke proxy-nya, bukan mesinnya.</i>",
+            "user": "➕ <b>User SSH</b>\n\ncontoh: <code>root</code> atau <code>ubuntu</code>",
+            "port": "➕ <b>Port SSH</b>\n\nKirim <code>22</code> untuk default.",
+        },
+    }[lang if lang == "en" else "id"][step]
 
 
 async def _handle_server_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     """Text steps of /addserver. Returns True if the message was consumed."""
     chat_id = update.effective_chat.id
     state = _server_wizard.get(chat_id)
+    lang = _chat_lang(update)
     if state and state["step"] == "authorize":
         text = (update.message.text or "").strip()
         if text.lower().startswith("usekey "):
             name = text.split(None, 1)[1].strip()
             key = Path.home() / ".ssh" / name
             if not key.exists() or not key.with_suffix(".pub").exists():
-                await update.message.reply_text(
-                    f"No keypair named '{name}' on this host. Send just the name, "
-                    "without .pub")
+                await update.message.reply_text(_t(lang,
+                    f"No keypair named '{name}' on this host. Send just the name, without .pub",
+                    f"Tidak ada keypair bernama '{name}' di host ini. Kirim namanya saja, tanpa .pub",
+                ))
                 return True
             state["data"]["key"] = str(key)
-            await update.message.reply_text(
+            await update.message.reply_text(_t(lang,
                 f"🔑 Using <code>{_tg_escape(name)}</code>. Tap Test above.",
-                parse_mode="HTML")
+                f"🔑 Memakai <code>{_tg_escape(name)}</code>. Tap Test di atas.",
+            ), parse_mode="HTML")
             return True
         return False
     if not state or state["step"] not in ("name", "host", "user", "port"):
         return False
     if state["expires"] < _dt.datetime.now().timestamp():
         _server_wizard.pop(chat_id, None)
-        await update.message.reply_text("⌛ That form expired. Run /addserver again.")
+        await update.message.reply_text(_t(lang, "⌛ That form expired. Run /addserver again.",
+                                              "⌛ Form itu sudah kedaluwarsa. Jalankan /addserver lagi."))
         return True
 
     text = (update.message.text or "").strip()
     if text.lower() in ("/cancel", "cancel", "batal"):
         _server_wizard.pop(chat_id, None)
-        await update.message.reply_text("✖️ Cancelled. Nothing was saved.")
+        await update.message.reply_text(_t(lang, "✖️ Cancelled. Nothing was saved.",
+                                              "✖️ Dibatalkan. Tidak ada yang disimpan."))
         return True
 
     step, data = state["step"], state["data"]
     if step == "name":
         if not _NAME_RE.match(text):
-            await update.message.reply_text("Lowercase letters, digits, - and _ only. Try again.")
+            await update.message.reply_text(_t(lang, "Lowercase letters, digits, - and _ only. Try again.",
+                                                  "Huruf kecil, angka, - dan _ saja. Coba lagi."))
             return True
         if any(s["name"] == text for s in _read_servers()):
-            await update.message.reply_text(f"'{text}' already exists. Pick another name.")
+            await update.message.reply_text(_t(lang, f"'{text}' already exists. Pick another name.",
+                                                  f"'{text}' sudah ada. Pilih nama lain."))
             return True
         data["name"] = text
         state["step"] = "host"
-        await update.message.reply_text(_srv_prompt("host"), parse_mode="HTML")
+        await update.message.reply_text(_srv_prompt("host", lang), parse_mode="HTML")
         return True
 
     if step == "host":
         if not _HOST_RE.match(text):
-            await update.message.reply_text("That doesn't look like an IP or hostname. Try again.")
+            await update.message.reply_text(_t(lang, "That doesn't look like an IP or hostname. Try again.",
+                                                  "Itu tidak seperti IP atau hostname. Coba lagi."))
             return True
         data["host"] = text
         state["step"] = "user"
-        await update.message.reply_text(_srv_prompt("user"), parse_mode="HTML")
+        await update.message.reply_text(_srv_prompt("user", lang), parse_mode="HTML")
         return True
 
     if step == "user":
         if not re.match(r"^[a-z_][a-z0-9_-]{0,31}$", text):
-            await update.message.reply_text("That doesn't look like a username. Try again.")
+            await update.message.reply_text(_t(lang, "That doesn't look like a username. Try again.",
+                                                  "Itu tidak seperti username. Coba lagi."))
             return True
         data["user"] = text
         state["step"] = "port"
-        await update.message.reply_text(_srv_prompt("port"), parse_mode="HTML")
+        await update.message.reply_text(_srv_prompt("port", lang), parse_mode="HTML")
         return True
 
     # port -> show the public key and wait for them to install it
     if not text.isdigit() or not (1 <= int(text) <= 65535):
-        await update.message.reply_text("Port must be a number between 1 and 65535.")
+        await update.message.reply_text(_t(lang, "Port must be a number between 1 and 65535.",
+                                              "Port harus angka antara 1 dan 65535."))
         return True
     data["port"] = int(text)
     state["step"] = "authorize"
@@ -4196,18 +4284,28 @@ async def _handle_server_input(update: Update, context: ContextTypes.DEFAULT_TYP
         return True
 
     await update.message.reply_text(
-        f"🔑 <b>Authorise the agent on {_tg_escape(data['host'])}</b>\n\n"
-        "Run this <b>on that machine</b>, as "
-        f"<code>{_tg_escape(data['user'])}</code>:\n\n"
-        f"<pre>mkdir -p ~/.ssh &amp;&amp; echo '{_tg_escape(pubkey)}' &gt;&gt; "
-        "~/.ssh/authorized_keys &amp;&amp; chmod 600 ~/.ssh/authorized_keys</pre>\n\n"
-        "<i>That's the PUBLIC half. I generated the pair here and the private half "
-        "never leaves this box — which is why I don't ask you to paste a key into "
-        "chat.</i>\n\nThen tap Test.",
+        _t(lang,
+           f"🔑 <b>Authorise the agent on {_tg_escape(data['host'])}</b>\n\n"
+           "Run this <b>on that machine</b>, as "
+           f"<code>{_tg_escape(data['user'])}</code>:\n\n"
+           f"<pre>mkdir -p ~/.ssh &amp;&amp; echo '{_tg_escape(pubkey)}' &gt;&gt; "
+           "~/.ssh/authorized_keys &amp;&amp; chmod 600 ~/.ssh/authorized_keys</pre>\n\n"
+           "<i>That's the PUBLIC half. I generated the pair here and the private half "
+           "never leaves this box — which is why I don't ask you to paste a key into "
+           "chat.</i>\n\nThen tap Test.",
+           f"🔑 <b>Otorisasi agent di {_tg_escape(data['host'])}</b>\n\n"
+           "Jalankan ini <b>di mesin itu</b>, sebagai "
+           f"<code>{_tg_escape(data['user'])}</code>:\n\n"
+           f"<pre>mkdir -p ~/.ssh &amp;&amp; echo '{_tg_escape(pubkey)}' &gt;&gt; "
+           "~/.ssh/authorized_keys &amp;&amp; chmod 600 ~/.ssh/authorized_keys</pre>\n\n"
+           "<i>Itu bagian PUBLIC-nya. Pasangannya dibuat di sini dan bagian privat "
+           "tidak pernah keluar dari box ini — makanya saya tidak minta kamu tempel "
+           "key di chat.</i>\n\nLalu tap Test.",
+        ),
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup([[
-            InlineKeyboardButton("🔌 Test connection", callback_data="srv:test:"),
-            InlineKeyboardButton("✖️ Cancel", callback_data="srv:cancel:"),
+            InlineKeyboardButton(_t(lang, "🔌 Test connection", "🔌 Tes koneksi"), callback_data="srv:test:"),
+            InlineKeyboardButton(_t(lang, "✖️ Cancel", "✖️ Batal"), callback_data="srv:cancel:"),
         ]]),
     )
     if others:
@@ -4215,12 +4313,21 @@ async def _handle_server_input(update: Update, context: ContextTypes.DEFAULT_TYP
         # installing a second one. The key itself never moves through chat --
         # you pick a name, and the file stays on this host.
         await update.message.reply_text(
-            "🔑 <i>Already have a key that reaches it?</i> These are on this host:\n"
+            _t(lang,
+               "🔑 <i>Already have a key that reaches it?</i> These are on this host:\n",
+               "🔑 <i>Sudah punya key yang bisa menjangkaunya?</i> Ini yang ada di host ini:\n",
+            )
             + "\n".join(f"  • <code>{_tg_escape(o)}</code>" for o in others[:10])
-            + "\n\nSend <code>usekey &lt;name&gt;</code> to use one instead.\n\n"
-            "⚠️ <i>A host pinned to its own key sits outside read-only mode — "
-            "the agent could change it at any time, without /unlock. Prefer the "
-            "key above unless this machine genuinely needs its own.</i>",
+            + _t(lang,
+                 "\n\nSend <code>usekey &lt;name&gt;</code> to use one instead.\n\n"
+                 "⚠️ <i>A host pinned to its own key sits outside read-only mode — "
+                 "the agent could change it at any time, without /unlock. Prefer the "
+                 "key above unless this machine genuinely needs its own.</i>",
+                 "\n\nKirim <code>usekey &lt;nama&gt;</code> untuk pakai yang itu.\n\n"
+                 "⚠️ <i>Host yang dipatok ke key-nya sendiri berada di luar read-only mode — "
+                 "agent bisa mengubahnya kapan saja, tanpa /unlock. Utamakan key di atas "
+                 "kecuali mesin ini memang perlu key sendiri.</i>",
+            ),
             parse_mode="HTML")
     return True
 
@@ -4237,11 +4344,15 @@ async def _finish_addserver(update: Update, query, discovery: str = "") -> None:
         "added_by": update.effective_user.id,
         "added_at": _dt.datetime.now().strftime("%Y-%m-%d %H:%M"),
     })
+    lang = _chat_lang(update)
     try:
         _rebuild_ssh_config(items)
     except Exception as exc:
         logger.exception("ssh config update failed")
-        await query.edit_message_text(f"⚠️ Saved nothing — couldn't update ~/.ssh/config: {exc}")
+        await query.edit_message_text(_t(lang,
+            f"⚠️ Saved nothing — couldn't update ~/.ssh/config: {exc}",
+            f"⚠️ Tidak ada yang disimpan — gagal update ~/.ssh/config: {exc}",
+        ))
         return
     _write_servers(items)
     logger.warning("SERVER ADDED name=%s host=%s by=%s",
@@ -4256,13 +4367,18 @@ async def _finish_addserver(update: Update, query, discovery: str = "") -> None:
         append_learned([f"Cluster nodes alongside {data['name']}: "
                         f"{', '.join(data['cluster_hosts'][:20])}."])
 
-    msg = (f"✅ <b>{_tg_escape(data['name'])} added.</b>\n\n"
-           f"<code>{_tg_escape(data['user'])}@{_tg_escape(data['host'])}"
+    msg = (_t(lang, f"✅ <b>{_tg_escape(data['name'])} added.</b>\n\n",
+                    f"✅ <b>{_tg_escape(data['name'])} ditambahkan.</b>\n\n")
+           + f"<code>{_tg_escape(data['user'])}@{_tg_escape(data['host'])}"
            f":{data['port']}</code>\n")
     if discovery:
         msg += f"\n<pre>{_tg_escape(discovery)}</pre>\n"
-    msg += ("\nIt's in <code>~/.ssh/config</code> and recorded in the agent's brief, "
-            "so it can reach it from the next message onward.\n\n/servers to review.")
+    msg += _t(lang,
+        "\nIt's in <code>~/.ssh/config</code> and recorded in the agent's brief, "
+        "so it can reach it from the next message onward.\n\n/servers to review.",
+        "\nSudah ada di <code>~/.ssh/config</code> dan tercatat di brief agent, "
+        "jadi bisa dijangkau mulai pesan berikutnya.\n\n/servers untuk melihat lagi.",
+    )
     await query.edit_message_text(msg, parse_mode="HTML")
 
 

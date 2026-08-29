@@ -4,7 +4,7 @@ A lightweight Telegram bridge to **Claude Code** and **Antigravity CLI (agy)**, 
 infrastructure monitoring and investigation -- built to be dramatically cheaper to run
 than a full agent framework, while staying just as capable for real operational work.
 
-> **Status: v0.2b.8 -- early/beta.** Built and battle-tested against a real production
+> **Status: v0.2b.9 -- early/beta.** Built and battle-tested against a real production
 > Proxmox VE cluster over several days of iteration, including a live-fire test of the
 > unlock/PIN/snapshot flow against real infrastructure. Works well; still has known
 > rough edges (see [Known limitations](#known-limitations)).
@@ -416,18 +416,11 @@ once, the first time `/start` shows its setup card; existing deployments fall
 back to `DEFAULT_LANGUAGE` (`id` unless set otherwise in `.env`) until a chat
 picks explicitly.
 
-37 commands are migrated so far, including the whole PIN system and the
-schedule/unlock confirmation cards — everything except `/start`'s own wizard and
-`/addserver`'s wizard, which still reply in whatever language their source
-currently has (mostly Indonesian in this deployment):
-
-`/usemodel`, `/gdrive` (+ its picker button), `/mode`, `/providers`,
-`/agentstatus`, `/status`, `/unlock`, `/lock`, `/new`, `/session`, `/sessions`,
-`/remember`, `/memory`, `/tools`, `/graduate`, `/chatid`, `/registergroup`,
-`/unregistergroup`, `/cancel`, `/learned`, `/forget`, `/servers`,
-`/removeserver`, `/boundaries`, `/addboundary`, `/rmboundary`, `/snapshots`,
-`/schedules`, `/unschedule`, `/setpin` (+ the PIN keypad), `/adopt`, and the
-scheduled-task and write-mode confirmation cards.
+**Every command and flow is migrated** — every reply, every wizard step
+(`/start`'s own setup card, `/addserver`'s step-by-step form), the whole PIN
+system and keypad, and the schedule/unlock confirmation cards all respect
+whichever language the chat picked. Nothing in the bot's own fixed text is
+locked to one language any more.
 
 This is separate from two other things it's easy to conflate: **the agent's own
 answers** already mirror whatever language you write your prompt in, being an LLM
@@ -435,9 +428,8 @@ answers** already mirror whatever language you write your prompt in, being an LL
 (`/help en`, `/help id`, or the button), picked per-message rather than stored per
 chat, and is untouched by `/lang`.
 
-Extending `/lang` to a remaining command follows the same small pattern
-throughout the source: `lang = _chat_lang(update)`, then wrap each reply string
-in `_t(lang, "English", "Indonesian")`.
+The pattern behind it, if it's ever useful again: `lang = _chat_lang(update)`,
+then wrap each reply string in `_t(lang, "English", "Indonesian")`.
 
 ### Write mode
 
