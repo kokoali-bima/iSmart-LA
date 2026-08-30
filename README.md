@@ -4,7 +4,7 @@ A lightweight Telegram bridge to **Claude Code** and **Antigravity CLI (agy)**, 
 infrastructure monitoring and investigation -- built to be dramatically cheaper to run
 than a full agent framework, while staying just as capable for real operational work.
 
-> **Status: v0.2b.14 -- early/beta.** Built and battle-tested against a real production
+> **Status: v0.2b.15 -- early/beta.** Built and battle-tested against a real production
 > Proxmox VE cluster over several days of iteration, including a live-fire test of the
 > unlock/PIN/snapshot flow against real infrastructure. Works well; still has known
 > rough edges (see [Known limitations](#known-limitations)).
@@ -202,6 +202,7 @@ Ollama, say), since something has to translate between protocols.
 | `/unschedule <name>` | owner + DM only | Remove a scheduled task |
 | `/adopt` | owner + DM only | Bring pre-existing cron entries under management |
 | `/setpin` | owner, DM **or group** | Set/change the 6-digit PIN (keypad, never typed in chat) |
+| `/update` | owner/admin + PIN | Check GitHub for a newer version and install it |
 | `/setbrief <one line>` | owner/admin | Say what this agent looks after (also the 4th item on `/start`) |
 | `/boundaries` | **0 tokens** | What the agent must never do |
 | `/addboundary <rule>` | owner/admin | Add a hard boundary — run it bare for an explanation of what that means |
@@ -420,6 +421,35 @@ needs no Google Cloud project of your own) is being retired sometime in 2026 and
 can occasionally hit a shared rate limit under global load (rclone retries with
 backoff automatically). If it stops working, the fix is creating your own
 `client_id` — see rclone's docs linked above.
+
+### Updating (`/update`)
+
+`/update` compares this deployment against the repository and, after a PIN,
+fast-forwards to the newer version and restarts. It also mentions a new version
+on its own — checked when you send a message, at most once every six hours,
+never on a timer, and never twice for the same version.
+
+What it refuses to do matters more than what it does:
+
+- **It will not run at all unless the deployment is a `git clone`.** A copy
+  installed by moving files has no remote to compare against, and `/update`
+  says exactly that instead of guessing.
+- **It will not discard local commits.** If this copy has work the repository
+  does not, it reports the divergence and changes nothing. Sorting that out by
+  hand is better than throwing away whatever those commits were.
+- **It will not ship a build that does not parse.** The new code is
+  compile-checked before the restart; if it fails, the checkout is reset to the
+  previous commit. Without that, systemd would restart the service into the
+  same crash every five seconds.
+
+The confirmation comes from the process that comes *back*, not the one that
+died — which is the only way to show the new version actually starts. Your
+`.env`, briefs, sessions, PIN and registered servers are untracked by git and
+are never touched.
+
+It needs a PIN because it replaces the code the bot runs, which is a strictly
+larger capability than `/unlock` (that only widens an SSH credential for a few
+minutes).
 
 ### Per-chat language (`/lang`)
 

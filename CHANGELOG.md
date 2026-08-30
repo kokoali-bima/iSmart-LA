@@ -1,5 +1,40 @@
 # Changelog
 
+## v0.2b.15 -- `/update`: check GitHub, see what changed, install it from chat
+
+`/update` shows the running version against the repository's, lists the commits
+in between, and after a PIN fast-forwards and restarts. A new version also
+announces itself: checked when you send a message, at most once every six hours,
+never on a timer, and never twice for the same version -- bounded automation with
+a real trigger, not the background poller this project refuses to have.
+
+The refusals are the interesting part, and each has a test:
+
+- **Not a git clone?** It says so and stops. A deployment installed by copying
+  files has no remote; guessing would be worse than admitting it. (VM175 is
+  exactly this case today.)
+- **Local commits?** It reports the divergence and changes nothing rather than
+  fast-forwarding over somebody's deliberate work.
+- **New build does not compile?** Checked before the restart, and the checkout
+  is reset to the previous commit if it fails -- otherwise systemd restarts the
+  service into the same crash every five seconds. Verified by pushing a
+  deliberately broken commit and confirming HEAD came back untouched.
+
+PIN-gated, because this replaces the code the bot itself runs -- a strictly
+larger capability than `/unlock`, which only widens an SSH credential for
+minutes. And the confirmation is sent by the process that comes *back*, not the
+one about to die: a message sent before restarting proves nothing about whether
+the new version starts.
+
+Bilingual from the first commit rather than retrofitted, per the lesson of the
+v0.2b.6-10 series.
+
+31/31 new tests, run against real git repositories built per case -- nothing
+mocked at the git layer, so fast-forward, up-to-date, diverged, broken-build and
+not-a-checkout all behave as git actually behaves. All eight earlier suites
+(246 tests) re-run with no regressions.
+
+
 ## v0.2b.14 -- the installer asks two questions; /addboundary explains itself
 
 **Install is down to two questions: the bot token and your Telegram user ID.**

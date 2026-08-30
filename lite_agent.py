@@ -1255,6 +1255,113 @@ def set_brief_role(role: str) -> None:
     logger.warning("environment brief role set: %s", role)
 
 
+# --------------------------------------------------------------------------
+# Self-update
+# --------------------------------------------------------------------------
+SERVICE_NAME = os.environ.get("SERVICE_NAME", "lite-agent")
+UPDATE_BRANCH = os.environ.get("UPDATE_BRANCH", "master")
+UPDATE_CHECK_INTERVAL_HOURS = int(os.environ.get("UPDATE_CHECK_INTERVAL_HOURS", "6"))
+UPDATE_STATE_FILE = BASE_DIR / "update_state.json"
+# Written just before the restart, read once by the process that comes back --
+# the only honest way to report "the new version is running".
+UPDATE_ANNOUNCE_FILE = BASE_DIR / "update_announce.json"
+
+
+def _git(*args: str, timeout: int = 60) -> tuple[bool, str]:
+    """Run git inside the install dir. Never raises."""
+    try:
+        r = subprocess.run(["git", "-C", str(BASE_DIR), *args],
+                           capture_output=True, text=True, timeout=timeout)
+    except Exception as exc:  # git missing, timeout, anything
+        return False, str(exc)
+    return r.returncode == 0, (r.stdout.strip() or r.stderr.strip())
+
+
+def is_git_checkout() -> bool:
+    ok, out = _git("rev-parse", "--is-inside-work-tree")
+    return ok and out == "true"
+
+
+def current_version() -> str:
+    ok, out = _git("describe", "--tags", "--always")
+    return out if ok else "unknown"
+
+
+def check_for_update() -> dict:
+    """Ask the remote what it has. Costs no model tokens -- pure git.
+
+    Returns a dict rather than a tuple because callers care about different
+    parts of it: {"ok", "has_update", "current", "latest", "behind", "detail"}
+    """
+    if not is_git_checkout():
+        return {"ok": False, "has_update": False, "current": current_version(),
+                "latest": "", "behind": 0, "detail": "not-a-checkout"}
+    ok, err = _git("fetch", "--tags", "--quiet", "origin", UPDATE_BRANCH, timeout=120)
+    if not ok:
+        return {"ok": False, "has_update": False, "current": current_version(),
+                "latest": "", "behind": 0, "detail": err[:300]}
+    _, local = _git("rev-parse", "HEAD")
+    remote_ok, remote = _git("rev-parse", f"origin/{UPDATE_BRANCH}")
+    if not remote_ok:
+        return {"ok": False, "has_update": False, "current": current_version(),
+                "latest": "", "behind": 0, "detail": remote[:300]}
+    if local == remote:
+        cur = current_version()
+        return {"ok": True, "has_update": False, "current": cur, "latest": cur,
+                "behind": 0, "detail": ""}
+    # Only a fast-forward is offered. Local commits on top of the deployment
+    # are somebody's deliberate change; silently discarding them would be the
+    # worst thing this feature could do.
+    ff, _ = _git("merge-base", "--is-ancestor", "HEAD", f"origin/{UPDATE_BRANCH}")
+    _, latest = _git("describe", "--tags", "--always", f"origin/{UPDATE_BRANCH}")
+    _, count = _git("rev-list", "--count", f"HEAD..origin/{UPDATE_BRANCH}")
+    return {"ok": True, "has_update": True, "current": current_version(),
+            "latest": latest, "behind": int(count) if count.isdigit() else 0,
+            "detail": "" if ff else "diverged"}
+
+
+def update_changelog(limit: int = 12) -> str:
+    """One line per incoming commit, so the operator can see what they'd get."""
+    ok, out = _git("log", "--oneline", "--no-decorate", f"-{limit}",
+                   f"HEAD..origin/{UPDATE_BRANCH}")
+    return out if ok else ""
+
+
+def apply_update() -> tuple[bool, str, str]:
+    """Fast-forward, then prove the result at least parses.
+
+    Returns (ok, previous_commit, detail). On a build that does not compile the
+    checkout is rolled straight back, because the alternative is a service that
+    systemd restarts into the same crash every five seconds.
+    """
+    _, before = _git("rev-parse", "HEAD")
+    ok, out = _git("merge", "--ff-only", f"origin/{UPDATE_BRANCH}", timeout=180)
+    if not ok:
+        return False, before, out[:400]
+    check = subprocess.run(
+        [sys.executable, "-m", "py_compile", str(Path(__file__).resolve())],
+        capture_output=True, text=True,
+    )
+    if check.returncode != 0:
+        _git("reset", "--hard", before)
+        logger.error("update rolled back -- new code does not compile: %s", check.stderr[:400])
+        return False, before, "the new version does not compile; rolled back"
+    return True, before, out[:400]
+
+
+def _read_update_state() -> dict:
+    if UPDATE_STATE_FILE.exists():
+        try:
+            return json.loads(UPDATE_STATE_FILE.read_text())
+        except Exception:
+            logger.warning("update_state.json unreadable", exc_info=True)
+    return {}
+
+
+def _write_update_state(d: dict) -> None:
+    UPDATE_STATE_FILE.write_text(json.dumps(d, indent=2))
+
+
 WIZARD_STATE_FILE = BASE_DIR / "setup_state.json"
 # chat_id -> {"step": ..., "login": LoginHandle, "expires": ts}
 _wizard: dict[int, dict] = {}
@@ -3112,6 +3219,123 @@ async def _handle_wizard_input(update: Update, context: ContextTypes.DEFAULT_TYP
     return True
 
 
+def _update_card(lang: str, info: dict) -> tuple[str, Optional[InlineKeyboardMarkup]]:
+    """Shared by /update and the automatic notice, so both read identically."""
+    if not info["ok"] and info["detail"] == "not-a-checkout":
+        return _t(lang,
+            "\U0001f4e6 <b>This deployment cannot update itself.</b>\n\n"
+            "It was installed by copying files, not with <code>git clone</code>, so "
+            "there is no remote to compare against.\n\n"
+            f"Running: <b>{_tg_escape(info['current'])}</b>\n\n"
+            "<i>To enable updates, re-deploy it as a git clone of the repository -- "
+            "your .env, briefs and saved state are not tracked by git and would be "
+            "kept.</i>",
+
+            "\U0001f4e6 <b>Deployment ini tidak bisa update sendiri.</b>\n\n"
+            "Dipasang dengan menyalin file, bukan <code>git clone</code>, jadi tidak ada "
+            "remote untuk dibandingkan.\n\n"
+            f"Sedang jalan: <b>{_tg_escape(info['current'])}</b>\n\n"
+            "<i>Supaya bisa update, pasang ulang sebagai git clone dari repository -- "
+            ".env, brief, dan state tersimpan tidak dilacak git, jadi tetap aman.</i>",
+        ), None
+
+    if not info["ok"]:
+        return _t(lang,
+            f"\u26a0\ufe0f Couldn't reach the repository:\n<pre>{_tg_escape(info['detail'])}</pre>",
+            f"\u26a0\ufe0f Tidak bisa menghubungi repository:\n<pre>{_tg_escape(info['detail'])}</pre>",
+        ), None
+
+    if not info["has_update"]:
+        return _t(lang,
+            f"\u2705 <b>Already up to date.</b>\n\nRunning <b>{_tg_escape(info['current'])}</b>.",
+            f"\u2705 <b>Sudah versi terbaru.</b>\n\nSedang jalan <b>{_tg_escape(info['current'])}</b>.",
+        ), None
+
+    if info["detail"] == "diverged":
+        return _t(lang,
+            f"\u26a0\ufe0f <b>Local changes would be lost.</b>\n\n"
+            f"This copy has commits the repository does not, so it cannot be "
+            f"fast-forwarded to <b>{_tg_escape(info['latest'])}</b>.\n\n"
+            "<i>Nothing was changed. Sort it out on the host -- refusing is safer than "
+            "throwing away whatever those commits were.</i>",
+
+            f"\u26a0\ufe0f <b>Perubahan lokal bisa hilang.</b>\n\n"
+            f"Salinan ini punya commit yang tidak ada di repository, jadi tidak bisa "
+            f"di-fast-forward ke <b>{_tg_escape(info['latest'])}</b>.\n\n"
+            "<i>Tidak ada yang diubah. Selesaikan dulu di host -- menolak lebih aman "
+            "daripada membuang commit itu begitu saja.</i>",
+        ), None
+
+    changes = update_changelog()
+    body = f"\n\n<pre>{_tg_escape(changes)}</pre>" if changes else ""
+    n = info["behind"]
+    text = _t(lang,
+        f"\U0001f4e6 <b>An update is available.</b>\n\n"
+        f"Running:  <b>{_tg_escape(info['current'])}</b>\n"
+        f"Latest:   <b>{_tg_escape(info['latest'])}</b>\n"
+        f"{n} commit(s) behind.{body}\n\n"
+        "Updating pulls the new code, checks it compiles, and restarts the bot. "
+        "It confirms here once the new version is actually running.",
+
+        f"\U0001f4e6 <b>Ada update tersedia.</b>\n\n"
+        f"Sekarang: <b>{_tg_escape(info['current'])}</b>\n"
+        f"Terbaru:  <b>{_tg_escape(info['latest'])}</b>\n"
+        f"Tertinggal {n} commit.{body}\n\n"
+        "Update akan menarik kode baru, memastikan bisa dikompilasi, lalu restart bot. "
+        "Konfirmasinya muncul di sini begitu versi baru benar-benar jalan.",
+    )
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton(_t(lang, "\u2b07\ufe0f Update now", "\u2b07\ufe0f Update sekarang"),
+                             callback_data="upd:yes"),
+        InlineKeyboardButton(_t(lang, "\u2716\ufe0f Not now", "\u2716\ufe0f Nanti saja"),
+                             callback_data="upd:no"),
+    ]])
+    return text, kb
+
+
+async def cmd_update(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show what this deployment runs vs what the repository has."""
+    if not await _may_authorize_group_action(update, context):
+        return
+    lang = _chat_lang(update)
+    await update.message.reply_text(_t(lang, "\U0001f50e Checking\u2026", "\U0001f50e Mengecek\u2026"))
+    info = await asyncio.get_running_loop().run_in_executor(None, check_for_update)
+    st = _read_update_state()
+    st["last_check"] = _dt.datetime.now().timestamp()
+    if info.get("latest"):
+        st["seen_version"] = info["latest"]
+    _write_update_state(st)
+    text, kb = _update_card(lang, info)
+    await update.message.reply_text(text, parse_mode="HTML", reply_markup=kb)
+
+
+async def cmd_update_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    lang = _chat_lang(update)
+    if not await _may_authorize_group_action(update, context):
+        await query.answer(_t(lang, "Not permitted.", "Tidak diizinkan."), show_alert=True)
+        return
+    await query.answer()
+    choice = query.data.split(":", 1)[1]
+    if choice == "no":
+        await query.edit_message_text(_t(lang,
+            "\u2716\ufe0f Left as is. Run /update whenever you want it.",
+            "\u2716\ufe0f Dibiarkan. Jalankan /update kapan pun mau.",
+        ))
+        return
+    # Replacing the code the bot runs is a bigger capability than /unlock, which
+    # only widens an SSH credential for minutes. A tap from a signed-in device
+    # is not enough on its own.
+    await query.edit_message_text(_t(lang,
+        "\U0001f4e6 Updating \u2014 confirm with your PIN.",
+        "\U0001f4e6 Update \u2014 konfirmasi dengan PIN.",
+    ))
+    await request_pin(update, "update", {}, _t(lang,
+        "\U0001f4e6 Confirm updating this bot.",
+        "\U0001f4e6 Konfirmasi update bot ini.",
+    ))
+
+
 async def cmd_setbrief(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Say what this agent looks after, without going through /start."""
     if not _may_run_setup(update):
@@ -3206,6 +3430,7 @@ Every reply ends with a "— by ..." tag. If it's ever NOT "{TIERS[0]['label']}"
 /unschedule <name> — remove a scheduled task
 /adopt — bring pre-existing cron entries under management
 /setpin — set/change the 6-digit PIN (entered on a keypad, never typed in chat)
+/update — check GitHub for a newer version and install it (PIN)
 /setbrief <what it looks after> — set the one-line environment brief
 /boundaries — what the agent must never do (0 tokens)
 /addboundary <rule> — add a rule the agent may NEVER break (run it alone to see what that means)
@@ -3261,6 +3486,7 @@ Setiap balasan diakhiri tanda "— by ...". Kalau tandanya BUKAN "{TIERS[0]['lab
 /unschedule <nama> — hapus satu task terjadwal
 /adopt — bawa cron lama ke dalam kelolaan bot
 /setpin — atur/ganti PIN 6 angka (lewat keypad, tidak pernah diketik di chat)
+/update — cek versi terbaru di GitHub dan pasang (pakai PIN)
 /setbrief <yang diurus> — atur brief lingkungan satu baris
 /boundaries — apa yang tidak boleh dilakukan agent (NOL token)
 /addboundary <aturan> — tambah aturan yang TIDAK BOLEH dilanggar agent (ketik sendirian untuk lihat penjelasannya)
@@ -3856,6 +4082,41 @@ async def _pin_verified(update: Update, context: ContextTypes.DEFAULT_TYPE,
             f"<code>{_tg_escape(item['when'])}</code>.\n"
             f"Lihat /schedules, hapus dengan /unschedule {_tg_escape(item['name'])}.",
         ), parse_mode="HTML")
+        return
+
+    if action == "update":
+        await query.edit_message_text(_t(lang,
+            "\U0001f4e6 Pulling the new version\u2026",
+            "\U0001f4e6 Menarik versi baru\u2026",
+        ))
+        loop = asyncio.get_running_loop()
+        ok, before, detail = await loop.run_in_executor(None, apply_update)
+        if not ok:
+            await query.edit_message_text(_t(lang,
+                f"\u26a0\ufe0f Update failed, nothing changed:\n<pre>{_tg_escape(detail)}</pre>",
+                f"\u26a0\ufe0f Update gagal, tidak ada yang berubah:\n<pre>{_tg_escape(detail)}</pre>",
+            ), parse_mode="HTML")
+            return
+        new_version = current_version()
+        # Hand the confirmation to the process that comes back, so what the
+        # operator sees is proof the new build actually starts.
+        try:
+            UPDATE_ANNOUNCE_FILE.write_text(json.dumps({
+                "chat_id": update.effective_chat.id,
+                "lang": lang,
+                "from": before[:12],
+                "to": new_version,
+            }))
+        except OSError:
+            logger.warning("could not write the post-update announcement", exc_info=True)
+        await query.edit_message_text(_t(lang,
+            f"\u2705 Updated to <b>{_tg_escape(new_version)}</b>. Restarting\u2026",
+            f"\u2705 Terupdate ke <b>{_tg_escape(new_version)}</b>. Restart\u2026",
+        ), parse_mode="HTML")
+        logger.warning("UPDATE applied %s -> %s, restarting", before[:12], new_version)
+        # --no-block: this process lives inside the unit systemd is about to
+        # stop, so a blocking restart would kill the very command issuing it.
+        subprocess.Popen(["sudo", "-n", "systemctl", "--no-block", "restart", SERVICE_NAME])
         return
 
     if action == "unlock":
@@ -5057,6 +5318,40 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     await _run_turn(update, context, text)
 
 
+async def _maybe_notify_update(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Tell the operator once when the repository moves ahead.
+
+    Deliberately NOT a timer. It piggybacks on a real message, runs at most
+    once every UPDATE_CHECK_INTERVAL_HOURS, costs no model tokens, and stays
+    quiet about a version it has already mentioned. That is bounded automation
+    with a clear trigger, not a background process deciding things on its own.
+    """
+    try:
+        if not is_git_checkout():
+            return
+        st = _read_update_state()
+        now = _dt.datetime.now().timestamp()
+        if now - st.get("last_check", 0) < UPDATE_CHECK_INTERVAL_HOURS * 3600:
+            return
+        if not await _may_authorize_group_action(update, context):
+            return
+        info = await asyncio.get_running_loop().run_in_executor(None, check_for_update)
+        st["last_check"] = now
+        _write_update_state(st)
+        if not (info["ok"] and info["has_update"]):
+            return
+        if st.get("seen_version") == info["latest"]:
+            return  # already mentioned this one; do not nag
+        st["seen_version"] = info["latest"]
+        _write_update_state(st)
+        lang = _chat_lang(update)
+        card, kb = _update_card(lang, info)
+        await _msg(update).reply_text(card, parse_mode="HTML", reply_markup=kb)
+    except Exception:
+        # An update check must never be the reason a normal turn fails.
+        logger.warning("update check failed", exc_info=True)
+
+
 async def _run_turn(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
     """One agent turn, start to finish.
 
@@ -5167,6 +5462,8 @@ async def _run_turn(update: Update, context: ContextTypes.DEFAULT_TYPE, text: st
                 except Exception:
                     logger.exception("even the failure notice couldn't be delivered (chat=%s)", chat_id)
 
+    await _maybe_notify_update(update, context)
+
     # Refused by the node guard? Offer to unlock (snapshotting first if the
     # operator wants) and re-run. Nothing is guessed from the wording of the
     # request -- the guard already decided; we are only reacting to it.
@@ -5231,7 +5528,35 @@ def main() -> None:
             "and fill it in.", GEMINI_PROMPT_FILE,
         )
 
-    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    async def _announce_update(application) -> None:
+        """One shot, on startup, only if an update just restarted us."""
+        if not UPDATE_ANNOUNCE_FILE.exists():
+            return
+        try:
+            info = json.loads(UPDATE_ANNOUNCE_FILE.read_text())
+        except Exception:
+            logger.warning("update_announce.json unreadable", exc_info=True)
+            UPDATE_ANNOUNCE_FILE.unlink(missing_ok=True)
+            return
+        UPDATE_ANNOUNCE_FILE.unlink(missing_ok=True)
+        lang = info.get("lang", DEFAULT_LANGUAGE)
+        try:
+            await application.bot.send_message(
+                chat_id=info["chat_id"],
+                text=_t(lang,
+                    f"\u2705 <b>Back up on {_tg_escape(str(info.get('to', '?')))}.</b>\n\n"
+                    f"<i>Was {_tg_escape(str(info.get('from', '?')))}. Everything else -- your "
+                    "settings, briefs, sessions and PIN -- is untouched.</i>",
+                    f"\u2705 <b>Sudah jalan lagi di {_tg_escape(str(info.get('to', '?')))}.</b>\n\n"
+                    f"<i>Sebelumnya {_tg_escape(str(info.get('from', '?')))}. Sisanya -- setting, "
+                    "brief, sesi, dan PIN -- tidak tersentuh.</i>",
+                ),
+                parse_mode="HTML",
+            )
+        except Exception:
+            logger.warning("could not deliver the post-update notice", exc_info=True)
+
+    app = Application.builder().token(TELEGRAM_BOT_TOKEN).post_init(_announce_update).build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("cancel", cmd_cancel))
     app.add_handler(CallbackQueryHandler(cmd_setup_button, pattern="^setup:"))
@@ -5252,6 +5577,8 @@ def main() -> None:
     app.add_handler(CommandHandler("setpin", cmd_setpin))
     app.add_handler(CallbackQueryHandler(cmd_pin_key, pattern="^pin:"))
     app.add_handler(CommandHandler("boundaries", cmd_boundaries))
+    app.add_handler(CommandHandler("update", cmd_update))
+    app.add_handler(CallbackQueryHandler(cmd_update_button, pattern="^upd:"))
     app.add_handler(CommandHandler("setbrief", cmd_setbrief))
     app.add_handler(CommandHandler("addboundary", cmd_addboundary))
     app.add_handler(CommandHandler("rmboundary", cmd_rmboundary))
