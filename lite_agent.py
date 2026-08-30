@@ -3548,15 +3548,49 @@ _HELP_LANG_KEYBOARD = InlineKeyboardMarkup(
 _HELP_LANG_PROMPT = "Pilih bahasa / Choose a language:"
 
 
+TELEGRAM_MESSAGE_LIMIT = 4096
+
+
+def _split_for_telegram(text: str, limit: int = TELEGRAM_MESSAGE_LIMIT) -> list[str]:
+    """Split text into <= limit-char chunks for sending as separate messages.
+
+    HELP_TEXT_EN/ID passed this limit during this project's own growth --
+    a real /help tap in production came back "Message_too_long" from Telegram,
+    not a bug in the content, just more of it than one message can hold. This
+    keeps growing content from silently breaking delivery again: it cuts at
+    the last blank line (paragraph break) at or before the limit when one
+    exists, falling back to the last plain newline, so a cut lands between
+    sections rather than mid-sentence -- and, since every section in this
+    file's help text opens and closes its own Markdown markers, mid-paragraph
+    rather than mid-entity.
+    """
+    if len(text) <= limit:
+        return [text]
+    chunks: list[str] = []
+    while len(text) > limit:
+        cut = text.rfind("\n\n", 0, limit)
+        if cut == -1:
+            cut = text.rfind("\n", 0, limit)
+        if cut == -1:
+            cut = limit
+        chunks.append(text[:cut].rstrip("\n"))
+        text = text[cut:].lstrip("\n")
+    if text:
+        chunks.append(text)
+    return chunks
+
+
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _authorized(update):
         return
     arg = (context.args[0].lower() if context.args else "").strip()
     if arg in ("id", "indonesia", "indonesian"):
-        await update.message.reply_text(HELP_TEXT_ID, parse_mode="Markdown")
+        for chunk in _split_for_telegram(HELP_TEXT_ID):
+            await update.message.reply_text(chunk, parse_mode="Markdown")
         return
     if arg in ("en", "english"):
-        await update.message.reply_text(HELP_TEXT_EN, parse_mode="Markdown")
+        for chunk in _split_for_telegram(HELP_TEXT_EN):
+            await update.message.reply_text(chunk, parse_mode="Markdown")
         return
     await update.message.reply_text(_HELP_LANG_PROMPT, reply_markup=_HELP_LANG_KEYBOARD)
 
@@ -3569,7 +3603,13 @@ async def cmd_help_lang_chosen(update: Update, context: ContextTypes.DEFAULT_TYP
         return
     text = HELP_TEXT_ID if query.data == "help_id" else HELP_TEXT_EN
     await query.answer()
-    await query.edit_message_text(text, parse_mode="Markdown")
+    chunks = _split_for_telegram(text)
+    # An edit can only ever hold ONE message's worth of text -- the language
+    # picker's own message becomes the first chunk, and the rest (if any)
+    # follow as new messages, since a single message can't be split in place.
+    await query.edit_message_text(chunks[0], parse_mode="Markdown")
+    for chunk in chunks[1:]:
+        await context.bot.send_message(chat_id=update.effective_chat.id, text=chunk, parse_mode="Markdown")
 
 
 def _learned_facts() -> list[str]:

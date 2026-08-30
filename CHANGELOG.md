@@ -1,5 +1,40 @@
 # Changelog
 
+## v0.2b.24 -- `/help` crashed with Message_too_long
+
+Real production error, in a fresh group right after `/registergroup`: tap a
+language on the `/help` picker, get "Something went wrong processing that."
+The actual exception, from the log: `telegram.error.BadRequest:
+Message_too_long`. `HELP_TEXT_EN`/`HELP_TEXT_ID` grew past Telegram's 4096
+character limit somewhere across this project's own additions (`/usemodel`,
+multi-account Drive, `/lang`, `/update`, `/setbrief`, the Group Privacy
+paragraph) -- currently 4755 and 4819 chars -- and every send site handed the
+whole string to Telegram in one call: the language-picker buttons, and
+`/help en` / `/help id` typed directly (same bug, not yet hit live).
+
+Added `_split_for_telegram()`, used at all three send sites. Cuts at the last
+paragraph break (blank line) at or before the limit, falling back to a plain
+newline, so a cut lands between sections rather than mid-sentence -- and,
+since every section here opens and closes its own Markdown markers, between
+entities rather than through one (a mid-entity cut would trade one Telegram
+rejection for another, "can't parse entities"). The button-tap path edits the
+picker message with the first chunk and sends the rest as follow-up messages,
+since an edit can only ever hold one message's worth of text.
+
+Fixed for future growth too, not just today's overrun -- the split runs
+regardless of how long the text is, so the next feature added to `/help`
+can't reintroduce this same failure by making it 6000 characters instead of
+4800.
+
+16/16 new tests (`dev/test_help_split.py`) against the REAL current
+HELP_TEXT_EN/ID content -- every chunk fits the limit, nothing is lost or
+reordered, and (checked explicitly, since a naive split could easily do this)
+every chunk's Markdown stays balanced. Verified with an actual live send
+through the real bot token to a real chat -- not just the local checks --
+confirming Telegram accepts every chunk in both languages. All nine earlier
+suites (243 tests) re-run with no regressions; 259 total.
+
+
 ## v0.2b.23 -- v0.2b.22 pointed the wrong way: default Privacy Mode is usually right
 
 Corrected within the hour, from a direct question: v0.2b.22 framed turning
