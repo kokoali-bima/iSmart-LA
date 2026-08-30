@@ -1,5 +1,42 @@
 # Changelog
 
+## v0.2b.25 -- /update's PIN dead-ended in a group for an already-vetted admin
+
+Reported live: a group admin ran `/update`, reached the PIN keypad (its own
+entry gate already trusts a registered group's admin, same as /addserver),
+then entering the PIN itself was refused with "only in a private DM" --
+someone the bot had already decided to trust, seconds earlier, hit a wall
+with no security actually gained by it.
+
+Root cause: `cmd_pin_key` decided "who may touch the keypad" from a
+hardcoded tuple (`"schedule_install", "unlock", "unlock_and_resume"`) that
+was never updated when `addserver` and `update` were added, and separately
+decided "where may this be confirmed" from `PIN_ACTIONS_ALLOWED_IN_GROUP` --
+two lists that were supposed to describe the same thing and had drifted
+apart. `update` passed the first (group-eligible, via `_may_authorize_group_action`,
+same as `/addserver`) but wasn't in the second, so it failed one check after
+passing the other moments before.
+
+Both checks now read from one set. `addserver` and `update` are added to it
+-- neither reveals anything sensitive when confirmed in a group (addserver
+starts a form the admin is filling in themselves; update just applies code
+already published to the repo). `rmboundary` is added too, per an explicit
+follow-up decision: if `/addboundary` is already usable by a group admin,
+removing one under the same admin-plus-PIN gate is the consistent call.
+Anything not deliberately reviewed for this still falls back to
+owner-AND-private-DM -- stricter than owner alone, so a future action added
+without a decision made about it can't silently open up to a group nobody
+meant to include, even for the owner.
+
+11/11 new tests (`dev/test_pin_group.py`): all three now-fixed actions
+succeed for a plain (non-owner) registered-group admin, all three still
+refuse a non-admin group member, and a stand-in "unreviewed action" proves
+the strict owner-AND-DM fallback holds -- including for the owner themselves,
+who is correctly told WHY (not just "not permitted") when they try it from a
+group instead. All ten earlier suites (259 tests) re-run with no
+regressions; 270 total.
+
+
 ## v0.2b.24 -- `/help` crashed with Message_too_long
 
 Real production error, in a fresh group right after `/registergroup`: tap a

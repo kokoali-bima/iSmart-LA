@@ -475,13 +475,19 @@ PIN_ENTRY_TTL_SECONDS = 180        # a half-finished entry expires on its own
 # token -> {action, payload, digits, attempts, expires, chat_id}
 _pin_sessions: dict[str, dict] = {}
 # PIN flows that are safe to run in a group: the digits ride in callback_data,
-# so a group only ever sees "somebody is entering a PIN", never the PIN. The
-# actions NOT listed here (opening write access, installing an unattended job)
-# stay private-DM-only -- a group is exactly where input this deployment does
-# not vet arrives, so it is not the place to authorise production changes.
+# so a group only ever sees "somebody is entering a PIN", never the PIN. Kept
+# in step with each action's OWN entry gate (_may_run_setup /
+# _may_authorize_group_action) -- if that gate already trusts a registered
+# group's admin (or the owner, from anywhere) to REACH the PIN prompt for an
+# action, excluding it here only dead-ends someone already vetted moments
+# earlier, with no security gained: they saw the prompt, they know the action
+# exists, and the digits are still hidden in callback_data either way. A
+# FUTURE action with a narrower gate (owner-only, full stop) belongs left out
+# of this set until that is deliberately decided -- being unlisted here falls
+# back to owner-AND-private-DM, the strict default (see cmd_pin_key).
 PIN_ACTIONS_ALLOWED_IN_GROUP = frozenset({
     "new_pin_capture", "new_pin_confirm", "change_pin_start", "schedule_install",
-    "unlock", "unlock_and_resume",
+    "unlock", "unlock_and_resume", "addserver", "update", "rmboundary",
 })
 _pin_lockout_until: float = 0.0
 
@@ -3992,10 +3998,15 @@ async def cmd_pin_key(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await query.answer(_t(lang, "This PIN entry expired — start again.",
                                    "PIN ini sudah kedaluwarsa — mulai lagi."), show_alert=True)
         return
-    # Who may drive the keypad depends on the action: most stay owner-only,
-    # but a registered group's own admin may complete a schedule they were
-    # just shown -- the same trust level /addserver already grants them.
-    if session["action"] in ("schedule_install", "unlock", "unlock_and_resume"):
+    # Who may drive the keypad depends on the action: a registered group's own
+    # admin may complete anything in PIN_ACTIONS_ALLOWED_IN_GROUP -- everything
+    # else stays owner-only. This used to be its own hardcoded tuple here,
+    # separate from PIN_ACTIONS_ALLOWED_IN_GROUP below, and the two drifted
+    # apart: an action could be group-eligible by one list and not the other,
+    # which is exactly what let /update reach the keypad for a group admin and
+    # then dead-end at "only in a private DM" on the very next check. One set
+    # now answers both questions.
+    if session["action"] in PIN_ACTIONS_ALLOWED_IN_GROUP:
         may_touch = await _may_authorize_group_action(update, context)
     else:
         may_touch = _is_owner(update)
@@ -4003,6 +4014,10 @@ async def cmd_pin_key(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await query.answer(_t(lang, "Not permitted.", "Tidak diizinkan."), show_alert=True)
         return
     # ...but the action decides whether this is an acceptable PLACE to do it.
+    # Only reachable for an owner outside PIN_ACTIONS_ALLOWED_IN_GROUP now (a
+    # group admin already stopped at the check above) -- kept as its own step
+    # so that case gets told WHY, rather than a bare "not permitted" that
+    # would be actively misleading for someone who really is the owner.
     if (session["action"] not in PIN_ACTIONS_ALLOWED_IN_GROUP
             and not _is_trusted_origin(update)):
         await query.answer(_t(lang,
