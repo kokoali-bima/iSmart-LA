@@ -1,5 +1,30 @@
 # Changelog
 
+## v0.2b.23 -- v0.2b.22 pointed the wrong way: default Privacy Mode is usually right
+
+Corrected within the hour, from a direct question: v0.2b.22 framed turning
+Group Privacy off as "the real fix" -- but `handle_message` has no
+mention/reply gate of its own. With Privacy Mode off, every plain message in
+a registered group reaches `_run_turn` and gets a model reply, unconditionally
+-- for a team's everyday group chat, that is the bot answering things nobody
+asked it, spending this deployment's shared subscription quota on every
+message.
+
+Privacy Mode ON (Telegram's default, unchanged) is what most groups actually
+want: the bot only ever sees a command, an `@mention`, or a reply to its own
+message -- ordinary chatter stays invisible to it, and invisible costs
+nothing. Turning it off is the right call for a narrower case -- a live-chat
+/ support-portal bot that is meant to answer every message -- not the
+recommended default v0.2b.22 made it sound like.
+
+`/help` (both languages) and the README's Group access section now present
+Privacy Mode ON as the usual choice, explain what turning it off actually
+costs (every message it then sees gets answered), and no longer suggest
+switching it off as a one-time fix everyone should apply.
+
+All nine suites (243 tests) re-run with no regressions.
+
+
 ## v0.2b.22 -- /help promised a Group Privacy fix it never actually gave
 
 Found answering "how do I add this bot to a group": the README's Group access

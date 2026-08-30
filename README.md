@@ -4,7 +4,7 @@ A lightweight Telegram bridge to **Claude Code** and **Antigravity CLI (agy)**, 
 infrastructure monitoring and investigation -- built to be dramatically cheaper to run
 than a full agent framework, while staying just as capable for real operational work.
 
-> **Status: v0.2b.22 -- early/beta.** Built and battle-tested against a real production
+> **Status: v0.2b.23 -- early/beta.** Built and battle-tested against a real production
 > Proxmox VE cluster over several days of iteration, including a live-fire test of the
 > unlock/PIN/snapshot flow against real infrastructure. Works well; still has known
 > rough edges (see [Known limitations](#known-limitations)).
@@ -540,12 +540,19 @@ whole Telegram group use it without whitelisting each member:
 
 1. Invite the bot to the group.
 2. Someone in `ALLOWED_USER_IDS` runs `/registergroup` inside that group.
-3. Turn off the bot's Telegram **Privacy Mode** -- ON by default for every new bot,
-   it hides normal group chat from a bot entirely, so without this step it only ever
-   sees messages that start with `/`. One-time fix: message **@BotFather** →
-   `/mybots` → this bot → *Bot Settings* → *Group Privacy* → *Turn off*.
 
-That's it -- takes effect immediately, no restart. Only accounts in the original
+That's it -- takes effect immediately, no restart. With nothing else changed, the
+bot only ever *sees* a command, an `@botname` mention, or a reply to one of its own
+messages -- Telegram's **Privacy Mode**, ON by default for every new bot. Everyday
+group chatter stays invisible to it, and invisible costs nothing: **this is what
+you want for most groups**, so the bot answers when asked and stays out of the
+conversation otherwise. Turning Privacy Mode off (**@BotFather** → `/mybots` →
+this bot → *Bot Settings* → *Group Privacy* → *Turn off*) makes it read and
+reply to every message like a full participant -- worth it only for a group that
+actually wants that, since every message it then answers spends this
+deployment's shared subscription quota.
+
+Only accounts in the original
 `ALLOWED_USER_IDS` list can register (or unregister) a group; being authorized via an
 already-registered group is deliberately **not** enough to grant a new one, so trust
 can't cascade sideways from one group to another. See `/help` in-chat for the
