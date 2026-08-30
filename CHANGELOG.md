@@ -1,5 +1,37 @@
 # Changelog
 
+## v0.2b.18 -- pve-ro-guard split pipelines on every '|', including quoted ones
+
+Found while investigating a downed VM on the itbutler cluster: a perfectly
+ordinary read-only command --
+`journalctl -b -1 --no-pager | grep -i "142\|shutdown\|power"` -- was refused.
+The guard's pipeline splitter was `IFS='|' read -ra SEGMENTS <<< "$CMD"`,
+which breaks on every `|` character in the raw string, including ones the
+caller quoted as literal data (a grep alternation pattern, an `awk -F'|'`
+field separator). The mangled fragments don't match any allowed verb, so a
+safe command gets refused for a reason that has nothing to do with what it
+does.
+
+Not a security hole either way: the allowlist stayed closed either way (the
+segments are only used for judgement, never for what actually executes), so
+the only failure mode was false refusals, never false approvals.
+
+Replaced the splitter with a quote-aware one that only treats an unquoted `|`
+as a pipeline boundary, tracking single/double-quote state and honoring
+backslash escapes inside double quotes. Also explicitly denies `||` (chains
+commands the same as `;`/`&`, and survives the metacharacter scan since a
+bare `|` has to, for piping) rather than relying on the empty segment it
+happened to leave behind under the old splitter.
+
+New test suite at `dev/test_pve_ro_guard.sh`, run against the guard script
+directly (no Proxmox node needed) -- 23/23 pass, including the exact command
+that was refused and a full pass of the chaining/redirect/write cases the
+guard exists to block. Deployed to all 7 itbutler cluster nodes (pm2-pm6,
+pm-bk, SRV-SA-01), each backed up first and verified with both a
+previously-broken command (now allowed) and a chaining attempt (still
+denied) before moving on to the next.
+
+
 ## v0.2b.17 -- tools/registry.json was runtime data tracked as if it were source
 
 Found while converting VM175 to a git checkout for /update: its live

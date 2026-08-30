@@ -56,8 +56,52 @@ case "$SCRUBBED" in
   *';'*|*'&'*|*'`'*|*'$('*|*'>'*|*'<'*|*$'\n'*) deny ;;
 esac
 
+# Split into pipeline segments WITHOUT breaking on a '|' the caller quoted as
+# data rather than meant as a pipe -- `grep -E "a|b"` or `awk -F'|'` are both
+# ordinary read-only commands. The naive `IFS='|' read -ra ... <<< "$CMD"` this
+# replaced split those mid-argument too, turning one legitimate segment into
+# several garbage ones that don't match any allowed verb -- a real read-only
+# command refused for a reason that has nothing to do with what it does.
+# Quote-tracking here only decides what gets JUDGED; $CMD itself, unmodified,
+# is still what actually runs at the bottom, so a parsing gap here can make
+# this refuse a safe command it shouldn't, never approve one it shouldn't.
+split_pipeline() {
+  local s="$1" cur="" ch state=none i=0 len=${#1}
+  SEGMENTS=()
+  while [ "$i" -lt "$len" ]; do
+    ch="${s:i:1}"
+    case "$state" in
+      none)
+        case "$ch" in
+          "'") state=squote; cur+="$ch" ;;
+          '"') state=dquote; cur+="$ch" ;;
+          '|') SEGMENTS+=("$cur"); cur="" ;;
+          *) cur+="$ch" ;;
+        esac ;;
+      squote)
+        cur+="$ch"
+        [ "$ch" = "'" ] && state=none ;;
+      dquote)
+        cur+="$ch"
+        if [ "$ch" = '\' ] && [ $((i + 1)) -lt "$len" ]; then
+          i=$((i + 1)); cur+="${s:i:1}"
+        elif [ "$ch" = '"' ]; then
+          state=none
+        fi ;;
+    esac
+    i=$((i + 1))
+  done
+  SEGMENTS+=("$cur")
+}
+
+# `||` chains commands same as `;`/`&`, and it survives the metacharacter scan
+# above (a bare '|' has to, for piping) -- refuse it explicitly rather than
+# relying on the empty segment it happens to leave behind.
+case "$SCRUBBED" in *'||'*) deny ;; esac
+
 # Every segment of a pipeline must independently be an allowed read-only verb.
-IFS='|' read -ra SEGMENTS <<< "$CMD"
+declare -a SEGMENTS
+split_pipeline "$CMD"
 for seg in "${SEGMENTS[@]}"; do
   # shellcheck disable=SC2086
   set -- $seg
