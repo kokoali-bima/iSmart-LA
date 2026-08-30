@@ -4,7 +4,7 @@ A lightweight Telegram bridge to **Claude Code** and **Antigravity CLI (agy)**, 
 infrastructure monitoring and investigation -- built to be dramatically cheaper to run
 than a full agent framework, while staying just as capable for real operational work.
 
-> **Status: v0.2b.21 -- early/beta.** Built and battle-tested against a real production
+> **Status: v0.2b.22 -- early/beta.** Built and battle-tested against a real production
 > Proxmox VE cluster over several days of iteration, including a live-fire test of the
 > unlock/PIN/snapshot flow against real infrastructure. Works well; still has known
 > rough edges (see [Known limitations](#known-limitations)).
@@ -540,13 +540,16 @@ whole Telegram group use it without whitelisting each member:
 
 1. Invite the bot to the group.
 2. Someone in `ALLOWED_USER_IDS` runs `/registergroup` inside that group.
+3. Turn off the bot's Telegram **Privacy Mode** -- ON by default for every new bot,
+   it hides normal group chat from a bot entirely, so without this step it only ever
+   sees messages that start with `/`. One-time fix: message **@BotFather** →
+   `/mybots` → this bot → *Bot Settings* → *Group Privacy* → *Turn off*.
 
 That's it -- takes effect immediately, no restart. Only accounts in the original
 `ALLOWED_USER_IDS` list can register (or unregister) a group; being authorized via an
 already-registered group is deliberately **not** enough to grant a new one, so trust
 can't cascade sideways from one group to another. See `/help` in-chat for the
-member-facing explanation (Telegram's own group privacy setting also matters here --
-covered there).
+member-facing explanation.
 
 ### Why automatic *learning* but not automatic *memory*?
 

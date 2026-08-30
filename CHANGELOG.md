@@ -1,5 +1,25 @@
 # Changelog
 
+## v0.2b.22 -- /help promised a Group Privacy fix it never actually gave
+
+Found answering "how do I add this bot to a group": the README's Group access
+section pointed to `/help` for "Telegram's own group privacy setting", but
+`/help`'s group section only described the SYMPTOM (bot answers commands, not
+plain messages) and a per-message workaround (mention or reply) -- never the
+actual one-time fix. A new group would need every message prefixed or the
+bot @mentioned forever, which defeats the point of adding a conversational
+agent to a group at all.
+
+Both now say plainly what Privacy Mode is (on by default for every new bot,
+hides normal group chat entirely), keep the mention/reply workaround, and add
+the real fix: @BotFather -> /mybots -> the bot -> Bot Settings -> Group
+Privacy -> Turn off. Added to `/help` (both languages) and to the README's
+own Group access steps, which no longer just defers to `/help` for content
+that wasn't actually there.
+
+All nine suites (243 tests) re-run with no regressions.
+
+
 ## v0.2b.21 -- apply_update() trusted a stale local ref instead of fetching
 
 Found while deploying v0.2b.20 itself: `apply_update()` fast-forwards to

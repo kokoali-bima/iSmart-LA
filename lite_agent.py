@@ -3476,7 +3476,7 @@ Every reply ends with a "— by ..." tag. If it's ever NOT "{TIERS[0]['label']}"
 
 *Using it in a Telegram Group*
 If this group has been registered by an admin (check with `/chatid`), EVERY member can give the bot commands automatically -- no per-person whitelist needed.
-1. If the bot only responds to *commands* (`/status` etc), not plain messages -- mention it (`@botname ...`) or reply to one of its messages to make sure it's seen (that's Telegram's own default setting, not a limitation on our end).
+1. If the bot only responds to *commands* (`/status` etc), not plain messages, that's Telegram's own Privacy Mode -- ON by default for every new bot, it hides normal group chat from a bot entirely. Mentioning it (`@botname ...`) or replying to one of its messages works around it message by message, but the real fix (recommended, one-time): message @BotFather → `/mybots` → this bot → *Bot Settings* → *Group Privacy* → *Turn off*. Then it hears every message in a registered group like a real participant, same as in a private DM.
 2. Sessions (`/new`, `/session`) in this group are *separate* from each member's private DM -- safely isolated. But `/remember` is *GLOBAL* across every chat including this group -- if someone remembers a fact here, everyone here (and in every other chat with this bot) can see it via `/memory`.
 3. This group doesn't have access yet? An admin just needs to type `/registergroup` here -- takes effect immediately, no restart needed. (`/unregistergroup` to revoke it again.)
 
@@ -3532,7 +3532,7 @@ Setiap balasan diakhiri tanda "— by ...". Kalau tandanya BUKAN "{TIERS[0]['lab
 
 *Memakainya di Grup Telegram*
 Kalau grup ini sudah didaftarkan admin (cek dengan `/chatid`), SEMUA anggota otomatis bisa kasih perintah ke bot -- tidak perlu whitelist per orang.
-1. Kalau bot cuma merespon *perintah* (`/status` dll), bukan pesan biasa -- mention botnya (`@namabot ...`) atau reply salah satu pesannya supaya pasti terlihat (ini pengaturan default Telegram sendiri, bukan keterbatasan dari sisi kita).
+1. Kalau bot cuma merespon *perintah* (`/status` dll), bukan pesan biasa, itu Privacy Mode bawaan Telegram -- default AKTIF untuk setiap bot baru, jadi chat grup biasa memang disembunyikan dari bot. Mention (`@namabot ...`) atau reply salah satu pesannya bisa jadi solusi sementara per pesan, tapi perbaikan sebenarnya (disarankan, cukup sekali): chat @BotFather → `/mybots` → pilih bot ini → *Bot Settings* → *Group Privacy* → *Turn off*. Setelah itu bot dengar semua pesan di grup yang terdaftar, sama seperti di DM pribadi.
 2. Sesi (`/new`, `/session`) di grup ini *terpisah* dari DM pribadi masing-masing anggota -- aman terisolasi. Tapi `/remember` bersifat *GLOBAL* di semua chat termasuk grup ini -- kalau seseorang me-remember fakta di sini, semua orang di sini (dan di semua chat lain dengan bot ini) bisa melihatnya lewat `/memory`.
 3. Grup ini belum punya akses? Admin tinggal ketik `/registergroup` di sini -- langsung aktif, tanpa perlu restart. (`/unregistergroup` untuk mencabutnya lagi.)
 
