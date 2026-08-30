@@ -19,3 +19,18 @@ __pycache__/
 # OS cruft
 .DS_Store
 Thumbs.db
+
+# Runtime state. None of this belongs in the repository -- and pin.json in
+# particular holds the PIN's salt and hash, which a stray `git add -A` on a
+# clone-based deployment would otherwise commit.
+pin.json
+servers.json
+schedules.json
+snapshots.json
+setup_state.json
+model_overrides.json
+chat_language.json
+gdrive_room_accounts.json
+update_state.json
+update_announce.json
+*.log

@@ -1,5 +1,24 @@
 # Changelog
 
+## v0.2b.16 -- runtime state was not gitignored, including pin.json
+
+Found immediately after shipping `/update`, by asking what a clone-based
+deployment's `git status` would actually look like. Ten runtime files were
+untracked but not ignored -- so they showed up as noise, and a single
+`git add -A` on the server would have committed them. `pin.json` is the one
+that matters: it holds the PIN's salt and hash.
+
+Now ignored: `pin.json`, `servers.json`, `schedules.json`, `snapshots.json`,
+`setup_state.json`, `model_overrides.json`, `chat_language.json`,
+`gdrive_room_accounts.json`, `update_state.json`, `update_announce.json`, and
+`*.log`. Verified that none of them were ever actually committed -- the gap was
+closed before it was hit.
+
+This only became reachable when deployments started being git clones, which
+`/update` requires; the older copy-the-files deployments had no repository to
+commit into.
+
+
 ## v0.2b.15 -- `/update`: check GitHub, see what changed, install it from chat
 
 `/update` shows the running version against the repository's, lists the commits
