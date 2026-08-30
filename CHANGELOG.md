@@ -1,5 +1,30 @@
 # Changelog
 
+## v0.2b.21 -- apply_update() trusted a stale local ref instead of fetching
+
+Found while deploying v0.2b.20 itself: `apply_update()` fast-forwards to
+`origin/<branch>`, but never fetched -- it relied on `origin/<branch>`
+already being current from a `check_for_update()` call made earlier (that's
+what builds the /update card). Called on its own, with no fetch in the same
+process first, it silently fast-forwards to whatever was fetched last, which
+can be a version behind the one that's actually latest. On a real deployment
+this landed a "successful" update one full version short of what had just
+been pushed, with no error -- the exact kind of miss this feature exists to
+prevent when it's replacing the bot's own code.
+
+apply_update() now fetches for itself before merging, so it's correct
+whether or not something fetched recently, and safe to call on its own (as
+distinct from a live Telegram /update tap, where check_for_update() always
+runs moments before, but which is exactly how this feature is scripted for
+verification).
+
+New test builds a real deployment, does one fetch, then pushes a further
+commit to the remote with no second fetch in between -- exactly the gap that
+produced the miss -- and confirms apply_update() lands on the true latest
+regardless. 33/33 in that suite (up from 31), all nine suites (243 tests
+total) re-run with no regressions.
+
+
 ## v0.2b.20 -- /start's card never said how to come back for the rest
 
 Reported directly from a real setup run: complete one item on the /start

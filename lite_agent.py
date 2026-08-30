@@ -1333,7 +1333,15 @@ def apply_update() -> tuple[bool, str, str]:
     Returns (ok, previous_commit, detail). On a build that does not compile the
     checkout is rolled straight back, because the alternative is a service that
     systemd restarts into the same crash every five seconds.
+
+    Fetches for itself rather than trusting `origin/<branch>` to already be
+    current -- the /update card is built from a fetch in check_for_update(),
+    but time passes between the operator seeing that card and tapping the
+    button, and this is also callable on its own (e.g. scripted). Without its
+    own fetch, a stale local origin/<branch> ref would silently fast-forward
+    to whatever was fetched last, not what is actually latest right now.
     """
+    _git("fetch", "--tags", "--quiet", "origin", UPDATE_BRANCH, timeout=120)
     _, before = _git("rev-parse", "HEAD")
     ok, out = _git("merge", "--ff-only", f"origin/{UPDATE_BRANCH}", timeout=180)
     if not ok:
