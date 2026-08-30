@@ -4,20 +4,24 @@
 #
 # Interactive setup for a fresh deployment. Designed to be run directly on a
 # Debian/Ubuntu VM with a real terminal (SSH is fine, as long as you have a
-# real TTY -- the agy/9Router OAuth login steps need one).
+# real TTY -- the agy OAuth sign-in step needs one).
 #
-# The environment brief (SOUL.md / GEMINI.md) is generated for you: step 8 runs
+# The environment brief (SOUL.md / GEMINI.md) is generated for you: step 6 runs
 # bootstrap.py, which asks a few plain-language questions about what this agent
 # should look after and writes both briefs from your answers. Nothing about it
 # is Proxmox-specific -- describe any environment you like.
 #
+# Scope is deliberately small: system deps, a venv, both CLIs, the bot token,
+# the brief, and a systemd service. Everything needing a browser or a human
+# decision -- signing in to Gemini and Claude, setting the PIN -- happens in
+# Telegram via /start instead, where the operator already is.
+#
 # What this script does NOT do for you (by design -- see README):
 #   - Provide access to whatever you want this agent to manage. Set up your own
 #     SSH key + ~/.ssh/config (or kubeconfig, etc) before or after running this.
-#   - Complete OAuth logins for you. It walks you through the Antigravity sign-in
-#     (URL to open, code to paste back) and, if installing 9Router
-#     fresh, points you at its dashboard -- both need a human to click
-#     through a real login flow.
+#   - Complete OAuth logins for you. It offers the Antigravity sign-in here
+#     (URL to open, code to paste back) as a convenience, but skipping it is
+#     fine -- /start in Telegram does both provider sign-ins properly.
 # ==============================================================================
 set -euo pipefail
 
@@ -48,7 +52,7 @@ warn "For most setups, create a dedicated non-root user first and re-run as that
 fi
 
 # ------------------------------------------------------------------------------
-say "Step 1/8 -- System dependencies"
+say "Step 1/7 -- System dependencies"
 # ------------------------------------------------------------------------------
 if command -v apt-get >/dev/null 2>&1; then
   NEEDED_PKGS="python3 python3-venv curl git tmux jq openssh-client"
@@ -77,7 +81,7 @@ ask "Press Enter once you've confirmed these are installed... " _dummy
 fi
 
 # ------------------------------------------------------------------------------
-say "Step 2/8 -- Python virtual environment"
+say "Step 2/7 -- Python virtual environment"
 # ------------------------------------------------------------------------------
 if [ ! -d "$INSTALL_DIR/venv" ]; then
 python3 -m venv "$INSTALL_DIR/venv"
@@ -90,7 +94,7 @@ fi
 ok "Python dependencies installed."
 
 # ------------------------------------------------------------------------------
-say "Step 3/8 -- AI providers"
+say "Step 3/7 -- AI providers"
 # ------------------------------------------------------------------------------
 AGY_BIN_PATH="$HOME/.local/bin/agy"
 
@@ -153,42 +157,7 @@ print(f"Updated {path}")
 PYEOF
 
 # ------------------------------------------------------------------------------
-say "Step 4/8 -- 9Router (Claude side gateway)"
-# ------------------------------------------------------------------------------
-ask "Do you already have a 9Router instance running that this agent should use? [y/N] " HAVE_9ROUTER
-if [[ "${HAVE_9ROUTER:-}" =~ ^[Yy]$ ]]; then
-ask "9Router base URL (e.g. http://127.0.0.1:20128): " ANTHROPIC_BASE_URL_INPUT
-ask "9Router API key: " ANTHROPIC_API_KEY_INPUT
-echo ""
-ok "Using existing 9Router at ${ANTHROPIC_BASE_URL_INPUT}."
-warn "Make sure Claude Code is logged in on 9Router's own dashboard (Providers -> Claude"
-warn "Code -> OAuth) -- this installer cannot do that step for you."
-else
-say "Installing 9Router locally..."
-if ! command -v node >/dev/null 2>&1; then
-    warn "Node.js not found. 9Router requires it -- installing via NodeSource (LTS)..."
-    curl -fsSL https://deb.nodesource.com/setup_lts.x | sudo -E bash -
-    sudo apt-get install -y nodejs
-fi
-  sudo npm install -g 9router
-say "Starting 9Router (pm2 recommended for persistence across reboots)..."
-if ! command -v pm2 >/dev/null 2>&1; then
-    sudo npm install -g pm2
-fi
-  pm2 start 9router --name 9router -- --skip-update || pm2 restart 9router
-  pm2 save
-echo ""
-warn "9Router is now running, but it still needs manual setup via its own dashboard:"
-warn "  1. Open the 9Router dashboard (default: http://<this-server-ip>:20128)"
-warn "  2. Providers -> add & log in to Claude Code (OAuth) and Antigravity (OAuth)"
-warn "  3. Note the API key 9Router gives you for its native /v1/messages endpoint"
-  ANTHROPIC_BASE_URL_INPUT="http://127.0.0.1:20128"
-ask "Paste the 9Router API key once you've completed the dashboard setup above: " ANTHROPIC_API_KEY_INPUT
-fi
-
-
-# ------------------------------------------------------------------------------
-say "Step 5/8 -- Telegram bot"
+say "Step 4/7 -- Telegram bot"
 # ------------------------------------------------------------------------------
 echo "Create a bot with @BotFather on Telegram if you haven't already (/newbot)."
 ask "Telegram bot token: " TELEGRAM_BOT_TOKEN_INPUT
@@ -197,7 +166,7 @@ echo "bot after install and send it /chatid (works even before you're authorized
 ask "Your Telegram user ID (admin -- required, this account can grant group access): " ADMIN_ID_INPUT
 
 # ------------------------------------------------------------------------------
-say "Step 6/8 -- Write .env"
+say "Step 5/7 -- Write .env"
 # ------------------------------------------------------------------------------
 ENV_FILE="$INSTALL_DIR/.env"
 cat > "$ENV_FILE" <<EOF
@@ -205,24 +174,25 @@ TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN_INPUT}
 ALLOWED_USER_IDS=${ADMIN_ID_INPUT}
 ALLOWED_GROUP_IDS=
 
-ANTHROPIC_BASE_URL=${ANTHROPIC_BASE_URL_INPUT}
-ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY_INPUT}
-CLAUDE_MODEL_PRIMARY=cc/claude-haiku-4-5-20251001
-CLAUDE_MODEL_FALLBACK=cc/claude-sonnet-5
-
 AGY_BIN=${AGY_BIN_PATH}
-AGY_MODEL_PRIMARY=gemini-3.7-flash-medium
-AGY_MODEL_FALLBACK=gemini-3.1-pro-low
 
-# The fallback chain, tried left to right: provider:model:label.
-# Reorder, drop an entry, or swap a model here -- no code change needed.
-TIERS=agy:gemini-3.7-flash-medium:mini,agy:gemini-3.1-pro-low:mini pro,claude:cc/claude-haiku-4-5-20251001:dede iku,claude:cc/claude-sonnet-5:dede nnet
+# Everything else has a working default in lite_agent.py -- the models, the
+# 4-tier fallback chain, the allowed tools. Set them here ONLY to override.
+# See .env.example for the full list with explanations.
+#
+# Both CLIs sign in to their own subscription directly (that's what /start
+# does), so no gateway is needed. To route Claude through one anyway, set
+# BOTH of these -- leaving either unset keeps the direct sign-in, and the
+# variables are actively stripped from the CLI's environment so an inherited
+# shell value can't silently redirect traffic:
+# ANTHROPIC_BASE_URL=
+# ANTHROPIC_API_KEY=
 EOF
 chmod 600 "$ENV_FILE"
 ok ".env written and locked down (chmod 600)."
 
 # ------------------------------------------------------------------------------
-say "Step 7/8 -- Environment brief (SOUL.md / GEMINI.md)"
+say "Step 6/7 -- Environment brief (SOUL.md / GEMINI.md)"
 # ------------------------------------------------------------------------------
 # This is the one genuinely per-deployment part of the whole system: what the
 # agent is looking after, how it reaches it, and what it must never touch.
@@ -247,7 +217,7 @@ fi
 fi
 
 # ------------------------------------------------------------------------------
-say "Step 8/8 -- systemd service"
+say "Step 7/7 -- systemd service"
 # ------------------------------------------------------------------------------
 SERVICE_FILE="/etc/systemd/system/lite-agent.service"
 sed \

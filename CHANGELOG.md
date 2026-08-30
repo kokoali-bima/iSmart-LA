@@ -1,5 +1,34 @@
 # Changelog
 
+## v0.2b.11 -- installer fixed: it still installed 9Router and wrote broken model IDs
+
+Found by actually deploying to a fresh server following our own documented
+Quickstart, rather than by reading the code. Three things the v0.2b.0 9Router
+removal never reached:
+
+- **`install.sh` step 4/8 still installed 9Router**, pulling in Node.js via
+  NodeSource, npm and pm2 with it, and then asked for a gateway API key -- all
+  mandatory, with no skip path. Exactly the four dependencies v0.2b.0 claimed
+  to have removed. Step deleted; the installer is 7 steps now.
+- **The `.env` it wrote was functionally broken**: `CLAUDE_MODEL_PRIMARY=cc/claude-haiku-4-5-20251001`
+  and a `TIERS` line with the same `cc/` prefixes. That prefix is 9Router's own
+  provider tag -- against Claude Code's direct sign-in a `cc/`-prefixed model ID
+  simply 404s. A fresh install following the README would have produced a bot
+  whose Claude tiers could never answer. It also wrote `ANTHROPIC_BASE_URL` /
+  `ANTHROPIC_API_KEY` unconditionally, which is what *switches* the bot to
+  gateway mode. Now writes a minimal `.env` and lets the (correct) code defaults
+  stand.
+- **`.env.example` had both bugs too**, defaulting `ANTHROPIC_BASE_URL` to
+  9Router's `http://127.0.0.1:20128` and the same `cc/` model IDs.
+
+Separately, `.env.example` claimed to document "every setting" while missing ten
+of them -- including `TIERS`, the single most important knob (`/providers` tells
+you to edit it) and the entire write-mode family (`SSH_*_KEY`,
+`WRITE_MODE_*_MINUTES`), plus `DEFAULT_LANGUAGE`, `GDRIVE_ROOT`, `CLAUDE_BIN`
+and `RCLONE_BIN`. All 24 settings the code actually reads are now documented,
+verified by diffing `os.environ.get(...)` against the file.
+
+
 ## v0.2b.10 -- audit sweep closes six gaps the per-command migration missed
 
 Requested verification pass after v0.2b.9 claimed the `/lang` migration
