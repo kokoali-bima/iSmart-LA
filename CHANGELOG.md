@@ -1,5 +1,29 @@
 # Changelog
 
+## v0.2b.20 -- /start's card never said how to come back for the rest
+
+Reported directly from a real setup run: complete one item on the /start
+card (e.g. Gemini sign-in), and the confirmation just says "done" -- nothing
+tells you to send /start again to see the other three. First-time sign-in
+success already had that hint; four other completion messages didn't:
+the "already signed in" branch, the PIN-set confirmation, and both places
+the environment brief gets recorded (the wizard's own brief step, and the
+standalone /setbrief command).
+
+Deliberately not a bigger fix: no "back to menu" button, no persistent nav.
+Just a line telling the operator to send /start again -- each setup item is
+its own short-lived flow, not a multi-step form with state to preserve
+between them, so a nav system would be solving a problem that doesn't exist.
+The incomplete /start card itself now says this convention once, up front,
+rather than leaving it to be inferred.
+
+7/7 new checks pass for the parts driven as real calls (the incomplete card's
+own text, both /setbrief paths, the wizard's brief step) in both languages;
+the PIN-confirm and already-signed-in messages (heavy to drive without tmux
+mocking) verified by direct source inspection. All nine earlier suites
+(241 tests) re-run with no regressions.
+
+
 ## v0.2b.19 -- install.sh reinstalled Claude Code on every non-interactive re-run
 
 Found while re-running install.sh against a real server that already had

@@ -1436,8 +1436,12 @@ def _wizard_text(lang: str = "id") -> str:
                               "\nSemuanya sudah diatur. Tinggal chat biasa saja."))
     else:
         lines.append(_t(lang,
-            "\nTap anything above to set it up. You can stop and come back later.",
-            "\nTap salah satu di atas untuk mengaturnya. Bisa berhenti dan lanjut nanti.",
+            "\nTap anything above to set it up. You can stop and come back later -- "
+            "each one is done separately, so after finishing one, send /start again "
+            "to continue with what's left.",
+            "\nTap salah satu di atas untuk mengaturnya. Bisa berhenti dan lanjut nanti -- "
+            "tiap bagian diatur terpisah, jadi setelah satu selesai, kirim /start lagi "
+            "untuk lanjut ke yang belum.",
         ))
     return "\n".join(lines)
 
@@ -3083,8 +3087,9 @@ async def _begin_cli_login(update: Update, query, provider: str) -> None:
         handle.kill()
         if LoginHandle.already_done(screen):
             _mark_setup(provider, update.effective_user.id)
-            await query.edit_message_text(_t(lang, f"✅ {human} is already signed in.",
-                                                  f"✅ {human} sudah sign-in."))
+            await query.edit_message_text(_t(lang,
+                f"✅ {human} is already signed in.\n\nRun /start to see what's left.",
+                f"✅ {human} sudah sign-in.\n\nJalankan /start untuk lihat sisanya."))
             return
         await query.edit_message_text(_t(lang,
             f"⚠️ Couldn't find a sign-in URL for {human}. Last output:\n\n"
@@ -3152,11 +3157,13 @@ async def _handle_wizard_input(update: Update, context: ContextTypes.DEFAULT_TYP
         await update.message.reply_text(_t(lang,
             f"\u2705 <b>Recorded.</b> This agent looks after: <b>{_tg_escape(role)}</b>\n\n"
             "Next: /addserver to give it a machine to reach, and /addboundary for "
-            "anything it must never touch.\n\n"
+            "anything it must never touch. Run /start if anything else still needs "
+            "setting up.\n\n"
             "<i>Takes effect on the next new conversation -- /new applies it now.</i>",
             f"\u2705 <b>Tercatat.</b> Agent ini mengurus: <b>{_tg_escape(role)}</b>\n\n"
             "Berikutnya: /addserver untuk memberi mesin yang bisa dijangkau, dan "
-            "/addboundary untuk hal yang tidak boleh disentuh.\n\n"
+            "/addboundary untuk hal yang tidak boleh disentuh. Jalankan /start kalau "
+            "masih ada yang perlu diatur.\n\n"
             "<i>Berlaku di percakapan baru berikutnya -- /new untuk langsung terapkan.</i>",
         ), parse_mode="HTML")
         return True
@@ -3372,8 +3379,10 @@ async def cmd_setbrief(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     _mark_setup("brief", update.effective_user.id)
     await update.message.reply_text(_t(lang,
         f"\u2705 <b>Recorded.</b> This agent looks after: <b>{_tg_escape(role)}</b>\n\n"
+        "Run /start if anything else still needs setting up.\n\n"
         "<i>Takes effect on the next new conversation -- /new applies it now.</i>",
         f"\u2705 <b>Tercatat.</b> Agent ini mengurus: <b>{_tg_escape(role)}</b>\n\n"
+        "Jalankan /start kalau masih ada yang perlu diatur.\n\n"
         "<i>Berlaku di percakapan baru berikutnya -- /new untuk langsung terapkan.</i>",
     ), parse_mode="HTML")
 
@@ -4035,9 +4044,11 @@ async def _pin_capture(update: Update, query, session: dict, token: str, entered
     set_pin(entered)
     await query.edit_message_text(_t(lang,
         "✅ PIN set. It now guards scheduled tasks and /unlock.\n"
-        "It is stored only as a salted hash, and it is never typed into the chat.",
+        "It is stored only as a salted hash, and it is never typed into the chat.\n\n"
+        "Run /start to see what's left.",
         "✅ PIN tersimpan. Sekarang menjaga task terjadwal dan /unlock.\n"
-        "Disimpan hanya sebagai hash yang di-salt, dan tidak pernah diketik di chat.",
+        "Disimpan hanya sebagai hash yang di-salt, dan tidak pernah diketik di chat.\n\n"
+        "Jalankan /start untuk lihat sisanya.",
     ))
 
 
