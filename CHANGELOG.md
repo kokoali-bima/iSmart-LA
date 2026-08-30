@@ -1,5 +1,34 @@
 # Changelog
 
+## v0.2b.19 -- install.sh reinstalled Claude Code on every non-interactive re-run
+
+Found while re-running install.sh against a real server that already had
+Claude Code installed, testing the documented Quickstart end to end.
+Reinstalled anyway.
+
+The check was `command -v claude`, which depends on the script's own PATH
+already including `~/.local/bin` -- and it doesn't yet at that point in the
+script (the `export PATH=...` that adds it happens further down, after this
+check). In an interactive login shell PATH is usually already set up from a
+previous install, masking the bug; in a fresh non-interactive SSH session (or
+any CI/automation invocation) it isn't, so the check always fails and the
+installer always re-downloads and reinstalls Claude Code, even when it's
+already there. agy never had this problem -- its check was already an
+absolute path test (`[ -x "$HOME/.local/bin/agy" ]`), not `command -v`.
+
+Claude's check now mirrors agy's: absolute path first, `command -v` kept only
+as a fallback for a Claude installed somewhere else entirely (e.g. via a
+package manager). Verified against the real binary on a live server -- with
+PATH deliberately restricted to exclude `~/.local/bin` (the exact
+precondition), `command -v claude` fails as expected while the new absolute
+check finds it -- and by re-running install.sh itself twice in a row, second
+run skipping the reinstall.
+
+Harmless in effect (the reinstall was idempotent, always ended up correct)
+but wasteful, and it stood in the way of testing this same Quickstart
+repeatedly without noise.
+
+
 ## v0.2b.18 -- pve-ro-guard split pipelines on every '|', including quoted ones
 
 Found while investigating a downed VM on the itbutler cluster: a perfectly

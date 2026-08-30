@@ -93,13 +93,20 @@ ok "Python dependencies installed."
 say "Step 3/7 -- AI providers"
 # ------------------------------------------------------------------------------
 AGY_BIN_PATH="$HOME/.local/bin/agy"
-# Resolved after the installs below, and recorded as an ABSOLUTE path: the
-# systemd unit gets a minimal PATH that excludes ~/.local/bin, so a bare
-# "claude" never resolves there and both Claude tiers would fail to launch.
-CLAUDE_BIN_PATH=""
+# Recorded as an ABSOLUTE path throughout: the systemd unit gets a minimal
+# PATH that excludes ~/.local/bin, so a bare "claude" never resolves there and
+# both Claude tiers would fail to launch.
+CLAUDE_BIN_PATH="$HOME/.local/bin/claude"
 
-if command -v claude >/dev/null 2>&1; then
-    ok "Claude Code CLI already installed ($(claude --version 2>/dev/null || echo 'version unknown'))."
+# Checked by absolute path first, same as agy just below -- NOT `command -v`
+# alone. This script's own PATH does not include ~/.local/bin yet (that export
+# happens further down), so on a non-interactive re-run against a server that
+# already has Claude installed, `command -v claude` doesn't find it and the
+# installer runs again for no reason. `command -v` stays as a fallback, for a
+# Claude installed somewhere else entirely (a package manager, say) where this
+# default path wouldn't apply.
+if [ -x "$CLAUDE_BIN_PATH" ] || command -v claude >/dev/null 2>&1; then
+    ok "Claude Code CLI already installed ($("$CLAUDE_BIN_PATH" --version 2>/dev/null || claude --version 2>/dev/null || echo 'version unknown'))."
 else
     say "Installing Claude Code CLI (native installer)..."
     _cli_tmp="$(mktemp)"
