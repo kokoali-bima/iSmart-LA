@@ -6,15 +6,14 @@
 # Debian/Ubuntu VM with a real terminal (SSH is fine, as long as you have a
 # real TTY -- the agy OAuth sign-in step needs one).
 #
-# The environment brief (SOUL.md / GEMINI.md) is generated for you: step 6 runs
-# bootstrap.py, which asks a few plain-language questions about what this agent
-# should look after and writes both briefs from your answers. Nothing about it
-# is Proxmox-specific -- describe any environment you like.
+# It asks exactly two things: your Telegram bot token, and your Telegram user ID.
+# Nothing else genuinely needs a terminal, so nothing else is asked here.
 #
-# Scope is deliberately small: system deps, a venv, both CLIs, the bot token,
-# the brief, and a systemd service. Everything needing a browser or a human
-# decision -- signing in to Gemini and Claude, setting the PIN -- happens in
-# Telegram via /start instead, where the operator already is.
+# Everything that needs a browser, a decision, or knowledge of your environment
+# happens in Telegram via /start, where the operator already is: signing in to
+# Gemini and to Claude, setting the PIN, and saying what this agent looks after.
+# Machines it may reach come from /addserver, and what it must never touch from
+# /addboundary -- both changeable later without touching the server.
 #
 # What this script does NOT do for you (by design -- see README):
 #   - Provide access to whatever you want this agent to manage. Set up your own
@@ -55,28 +54,25 @@ fi
 say "Step 1/7 -- System dependencies"
 # ------------------------------------------------------------------------------
 if command -v apt-get >/dev/null 2>&1; then
-  NEEDED_PKGS="python3 python3-venv curl git tmux jq openssh-client"
+  # wkhtmltopdf is here rather than behind a prompt: the brief tells the agent to
+  # deliver PDF/JPEG reports, so a missing renderer is a broken feature, not a
+  # preference worth interrupting the install for.
+  NEEDED_PKGS="python3 python3-venv curl git tmux jq openssh-client wkhtmltopdf"
   MISSING=""
   for p in $NEEDED_PKGS; do
     dpkg -s "$p" >/dev/null 2>&1 || MISSING="$MISSING $p"
   done
 if [ -n "$MISSING" ]; then
     say "Installing missing packages:${MISSING}"
-    sudo apt-get update -y
-    sudo apt-get install -y $MISSING
+    sudo DEBIAN_FRONTEND=noninteractive apt-get update -y
+    sudo DEBIAN_FRONTEND=noninteractive apt-get install -y $MISSING </dev/null
 else
     ok "All required system packages already present."
-fi
-if ! command -v wkhtmltopdf >/dev/null 2>&1; then
-    ask "Install wkhtmltopdf too? Needed only if you want PDF (not just HTML) reports. [y/N] " INSTALL_PDF
-    if [[ "${INSTALL_PDF:-}" =~ ^[Yy]$ ]]; then
-      sudo apt-get install -y wkhtmltopdf
-    fi
 fi
 else
 warn "Non-apt system detected. Please make sure these are installed manually:"
 warn "  python3 (3.10+), python3-venv, curl, git, tmux, jq, an ssh client"
-warn "  (optional) wkhtmltopdf, if you want PDF report generation"
+warn "  wkhtmltopdf (used for PDF/JPEG report delivery)"
 ask "Press Enter once you've confirmed these are installed... " _dummy
 fi
 
@@ -106,32 +102,25 @@ if command -v claude >/dev/null 2>&1; then
     ok "Claude Code CLI already installed ($(claude --version 2>/dev/null || echo 'version unknown'))."
 else
     say "Installing Claude Code CLI (native installer)..."
-    curl -fsSL https://claude.ai/install.sh | bash \
+    _cli_tmp="$(mktemp)"
+    curl -fsSL https://claude.ai/install.sh -o "$_cli_tmp" \
+      && bash "$_cli_tmp" </dev/null \
       || warn "Automatic install failed -- install manually: https://docs.claude.com/en/docs/claude-code"
+    rm -f "$_cli_tmp"
 fi
 
 if [ -x "$AGY_BIN_PATH" ]; then
     ok "agy already installed ($("$AGY_BIN_PATH" --version 2>/dev/null || echo 'version unknown'))."
 else
     say "Installing Antigravity CLI..."
-    curl -fsSL https://antigravity.google/cli/install.sh | bash
+    _cli_tmp="$(mktemp)"
+    curl -fsSL https://antigravity.google/cli/install.sh -o "$_cli_tmp"
+    bash "$_cli_tmp" </dev/null
+    rm -f "$_cli_tmp"
 fi
 export PATH="$HOME/.local/bin:$PATH"
 CLAUDE_BIN_PATH="$(command -v claude || true)"
 [ -n "$CLAUDE_BIN_PATH" ] || CLAUDE_BIN_PATH="$HOME/.local/bin/claude"
-
-echo ""
-say "Signing in to Antigravity."
-echo "  You'll get a URL to open, then paste back the code it gives you."
-echo "  ${DIM}(This drives agy's own login screen for you, so it doesn't take over"
-echo "  the terminal mid-install. Skip it and run tools/agy_login.py later.)${RESET}"
-ask "Press Enter to sign in now, or type 's' to skip: " AGY_LOGIN_CHOICE
-if [ "${AGY_LOGIN_CHOICE:-}" = "s" ]; then
-    warn "Skipped. Run ${CYAN}python3 $INSTALL_DIR/tools/agy_login.py${RESET} before starting the service."
-else
-    python3 "$INSTALL_DIR/tools/agy_login.py" --agy "$AGY_BIN_PATH" \
-      || warn "Sign-in didn't complete. Re-run: python3 $INSTALL_DIR/tools/agy_login.py"
-fi
 
 mkdir -p "$HOME/.gemini/antigravity-cli"
   AGY_SETTINGS="$HOME/.gemini/antigravity-cli/settings.json"
@@ -201,27 +190,13 @@ ok ".env written and locked down (chmod 600)."
 # ------------------------------------------------------------------------------
 say "Step 6/7 -- Environment brief (SOUL.md / GEMINI.md)"
 # ------------------------------------------------------------------------------
-# This is the one genuinely per-deployment part of the whole system: what the
-# agent is looking after, how it reaches it, and what it must never touch.
-# bootstrap.py asks a handful of plain-language questions and writes both briefs,
-# so a new server needs no hand-authored config. It is NOT Proxmox-specific --
-# describe whatever you want the agent to look after.
-if [ -f "$INSTALL_DIR/SOUL.md" ] && [ -f "$INSTALL_DIR/GEMINI.md" ]; then
-ok "SOUL.md and GEMINI.md already present -- leaving them alone."
-echo "     (Re-run ${CYAN}python3 bootstrap.py${RESET} any time to regenerate them.)"
-else
-echo "The agent needs to be told what it's looking after. The next few questions"
-echo "generate that brief for you -- plain sentences are fine."
-echo ""
-if "$INSTALL_DIR/venv/bin/python3" "$INSTALL_DIR/bootstrap.py"; then
-    ok "Environment brief written."
-else
-    warn "Bootstrap skipped or cancelled -- falling back to blank templates."
-    [ -f "$INSTALL_DIR/SOUL.md" ] || cp "$INSTALL_DIR/SOUL.md.template" "$INSTALL_DIR/SOUL.md"
-    [ -f "$INSTALL_DIR/GEMINI.md" ] || cp "$INSTALL_DIR/GEMINI.md.template" "$INSTALL_DIR/GEMINI.md"
-    warn "You must fill in SOUL.md and GEMINI.md by hand before the bot is useful."
-fi
-fi
+# Deliberately NOT asked here. What this agent looks after is set from /start in
+# Telegram (or /setbrief), how it reaches machines comes from /addserver, and what
+# it must never touch from /addboundary -- all three where the operator already is,
+# and all three changeable later without touching the server.
+[ -f "$INSTALL_DIR/SOUL.md" ]   || cp "$INSTALL_DIR/SOUL.md.template"   "$INSTALL_DIR/SOUL.md"
+[ -f "$INSTALL_DIR/GEMINI.md" ] || cp "$INSTALL_DIR/GEMINI.md.template" "$INSTALL_DIR/GEMINI.md"
+ok "Briefs in place. /start will ask what this agent looks after."
 
 # ------------------------------------------------------------------------------
 say "Step 7/7 -- systemd service"
@@ -236,19 +211,15 @@ sudo systemctl daemon-reload
 ok "systemd unit installed at ${SERVICE_FILE}."
 
 echo ""
-echo "${BOLD}${GREEN}Setup mostly done.${RESET} Before starting the service:"
+echo "${BOLD}${GREEN}Done.${RESET} Start it:"
 echo ""
-echo "  1. ${BOLD}Review SOUL.md / GEMINI.md${RESET} -- especially the HARD BOUNDARIES section."
-echo "     Only the part below the LEARNED_ZONE marker is ever written automatically;"
-echo "     everything above it is yours. See examples/proxmox/ for a worked reference."
-echo "  2. ${BOLD}Set up access${RESET} from this machine to whatever you want the agent to"
-echo "     manage (SSH key + ~/.ssh/config, kubeconfig, etc), matching what you"
-echo "     described during the brief step."
-echo "  3. If you skipped the Antigravity sign-in above, run:"
-echo "     ${CYAN}python3 ${INSTALL_DIR}/tools/agy_login.py${RESET}"
-echo ""
-echo "Then start it:"
 echo "  ${CYAN}sudo systemctl enable --now lite-agent${RESET}"
 echo "  ${CYAN}journalctl -u lite-agent -f${RESET}   (watch logs)"
 echo ""
-echo "Once running, message your bot /help on Telegram for the full command list."
+echo "${BOLD}Then open Telegram and send your bot /start.${RESET} Everything left is there:"
+echo "  - sign in to Gemini and to Claude (a URL to open, a code to paste back)"
+echo "  - set the 6-digit PIN"
+echo "  - say what this agent looks after"
+echo ""
+echo "After that: ${CYAN}/addserver${RESET} to give it a machine it may reach, and"
+echo "${CYAN}/addboundary${RESET} for anything it must never touch. ${CYAN}/help${RESET} lists everything."

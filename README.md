@@ -4,7 +4,7 @@ A lightweight Telegram bridge to **Claude Code** and **Antigravity CLI (agy)**, 
 infrastructure monitoring and investigation -- built to be dramatically cheaper to run
 than a full agent framework, while staying just as capable for real operational work.
 
-> **Status: v0.2b.11 -- early/beta.** Built and battle-tested against a real production
+> **Status: v0.2b.14 -- early/beta.** Built and battle-tested against a real production
 > Proxmox VE cluster over several days of iteration, including a live-fire test of the
 > unlock/PIN/snapshot flow against real infrastructure. Works well; still has known
 > rough edges (see [Known limitations](#known-limitations)).
@@ -103,14 +103,18 @@ cd lite-agent
 ./install.sh
 ```
 
-The installer's job is small on purpose: system dependencies, a Python venv, both
-CLIs, your Telegram bot token, the environment brief, and a systemd service. That's
-it — enough to get the bot answering.
+**It asks exactly two questions:** your Telegram bot token, and your Telegram user
+ID. Everything else it does without asking — system dependencies, a Python venv,
+both CLIs, and a systemd service.
 
 **Everything else happens in Telegram.** Send `/start` and a setup card walks through
-what's left: signing in to Gemini, signing in to Claude, and setting the PIN. Each
-sign-in is a URL to open and a code to paste back; you can stop halfway and come back.
-`/start` again any time to see what's still outstanding or change something.
+what's left: signing in to Gemini, signing in to Claude, setting the PIN, and saying
+what this agent looks after. Each sign-in is a URL to open and a code to paste back;
+you can stop halfway and come back. `/start` again any time to see what's still
+outstanding or change something.
+
+Then `/addserver` gives it a machine it may reach, and `/addboundary` records
+anything it must never touch. Both are changeable later without touching the server.
 
 That split is deliberate. Anything needing a browser or a decision belongs where the
 operator already is, not in a terminal session they have to keep open.
@@ -125,9 +129,18 @@ same way.
 
 The one genuinely per-deployment thing is what the agent is looking after, how it
 reaches it, and what it must never touch. That lives in `SOUL.md` (Claude's brief)
-and `GEMINI.md` (agy's). You don't hand-author them:
-[`bootstrap.py`](./bootstrap.py) asks a few plain-language questions during install
-and writes both. Re-run it any time to start over.
+and `GEMINI.md` (agy's). You don't hand-author them, and none of it is asked during
+install — all three come from Telegram:
+
+| | |
+|---|---|
+| **what it looks after** | the fourth item on `/start`'s setup card, or `/setbrief <one line>` |
+| **how it reaches machines** | `/addserver`, which also installs the agent's own key |
+| **what it must never touch** | `/addboundary` (run it bare for an explanation) |
+
+[`bootstrap.py`](./bootstrap.py) is still there for anyone who prefers answering a
+longer set of questions in a terminal — run it by hand any time to regenerate both
+briefs from scratch. The installer no longer calls it.
 
 From then on the brief maintains itself. Both files are split in two by a marker:
 
@@ -189,8 +202,9 @@ Ollama, say), since something has to translate between protocols.
 | `/unschedule <name>` | owner + DM only | Remove a scheduled task |
 | `/adopt` | owner + DM only | Bring pre-existing cron entries under management |
 | `/setpin` | owner, DM **or group** | Set/change the 6-digit PIN (keypad, never typed in chat) |
+| `/setbrief <one line>` | owner/admin | Say what this agent looks after (also the 4th item on `/start`) |
 | `/boundaries` | **0 tokens** | What the agent must never do |
-| `/addboundary <rule>` | owner/admin | Add a hard boundary |
+| `/addboundary <rule>` | owner/admin | Add a hard boundary — run it bare for an explanation of what that means |
 | `/rmboundary <n>` | owner/admin + PIN | Remove one |
 | `/snapshots` | **0 tokens** | Snapshots taken before changes |
 | `/cancel` | free | Abort a multi-step form (/start, /addserver) |

@@ -1206,6 +1206,55 @@ def _snapshot_hosts(node: Optional[str]) -> list[str]:
     return hosts or ([node] if node else [])
 
 
+# The shipped templates carry these until somebody says what this deployment
+# actually looks after. Their presence is what /start reports as "not set up
+# yet" -- no extra state file needed, the brief itself is the source of truth.
+BRIEF_PLACEHOLDER = "[YOUR ORGANIZATION / PROJECT NAME]"
+# Matches the role wherever it already sits, so the brief can be CHANGED and not
+# just filled in once -- the setup card offers "Change" on a completed item, and
+# a button that silently does nothing is worse than no button.
+_BRIEF_ROLE_RE = re.compile(r"^(.*?assistant for )(.+?)(\.)", re.MULTILINE)
+_BRIEF_ENV_RE = re.compile(r"^## Environment:.*$", re.MULTILINE)
+
+
+def brief_configured() -> bool:
+    """Has anyone said what this agent is looking after yet?"""
+    for path in (SYSTEM_PROMPT_FILE, GEMINI_PROMPT_FILE):
+        try:
+            if BRIEF_PLACEHOLDER in path.read_text(encoding="utf-8"):
+                return False
+        except OSError:
+            return False
+    return True
+
+
+def set_brief_role(role: str) -> None:
+    """Set (or change) what this deployment looks after, in both briefs.
+
+    Rewrites two things only: the role in the opening sentence and the
+    "## Environment:" heading. Everything else in the protected zone -- the
+    hard boundaries above all -- is passed through byte for byte, the same rule
+    append_learned() follows for the half it does not own.
+    """
+    role = " ".join(role.split()).rstrip(".")
+    for path in (SYSTEM_PROMPT_FILE, GEMINI_PROMPT_FILE):
+        if not path.exists():
+            continue
+        text = path.read_text(encoding="utf-8")
+        if BRIEF_PLACEHOLDER in text:
+            text = text.replace(BRIEF_PLACEHOLDER, role)
+        else:
+            text, n = _BRIEF_ROLE_RE.subn(
+                lambda m: f"{m.group(1)}{role}{m.group(3)}", text, count=1)
+            if not n:
+                logger.warning(
+                    "%s has no recognisable role sentence -- only the Environment "
+                    "heading was updated", path.name)
+        text = _BRIEF_ENV_RE.sub(f"## Environment: {role}", text, count=1)
+        path.write_text(text, encoding="utf-8")
+    logger.warning("environment brief role set: %s", role)
+
+
 WIZARD_STATE_FILE = BASE_DIR / "setup_state.json"
 # chat_id -> {"step": ..., "login": LoginHandle, "expires": ts}
 _wizard: dict[int, dict] = {}
@@ -1257,12 +1306,13 @@ def setup_summary() -> list[tuple[str, bool, str]]:
         ("Claude Code", claude_signed_in(),
          "gateway configured" if USE_GATEWAY else "the fallback tiers -- dede iku / dede nnet"),
         ("Security PIN", pin_is_set(), "guards changes to production and scheduled tasks"),
+        ("Environment brief", brief_configured(), "what this agent looks after"),
     ]
 
 
 def _wizard_keyboard(state: dict, lang: str = "id") -> InlineKeyboardMarkup:
     rows = []
-    for key, (label, done, _) in zip(("agy", "claude", "pin"), setup_summary()):
+    for key, (label, done, _) in zip(("agy", "claude", "pin", "brief"), setup_summary()):
         mark = "✅" if done else "⬜"
         verb = _t(lang, "Change", "Ganti") if done else _t(lang, "Set up", "Atur")
         rows.append([InlineKeyboardButton(f"{mark} {verb} {label}", callback_data=f"setup:{key}")])
@@ -2863,6 +2913,31 @@ async def cmd_setup_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 "🔢 Mengganti PIN. Konfirmasi dulu PIN yang SEKARANG.",
             ))
         return
+    if what == "brief":
+        _wizard[update.effective_chat.id] = {
+            "step": "await_brief",
+            "expires": _dt.datetime.now().timestamp() + WIZARD_TTL_SECONDS,
+        }
+        await query.edit_message_text(_t(lang,
+            "\U0001f5fa <b>What should this agent look after?</b>\n\n"
+            "One plain sentence is enough -- it goes into the agent's brief as-is.\n\n"
+            "e.g. <code>a 7-node Proxmox cluster</code>\n"
+            "e.g. <code>our Kubernetes staging cluster</code>\n"
+            "e.g. <code>a fleet of 20 Ubuntu web servers</code>\n\n"
+            "Send it as your next message. /cancel to stop.\n\n"
+            "<i>How it reaches those machines comes later, from /addserver. What it must "
+            "never touch comes from /addboundary.</i>",
+
+            "\U0001f5fa <b>Agent ini mengurus apa?</b>\n\n"
+            "Satu kalimat biasa sudah cukup -- langsung masuk ke brief agent apa adanya.\n\n"
+            "contoh: <code>cluster Proxmox 7 node</code>\n"
+            "contoh: <code>cluster Kubernetes staging kami</code>\n"
+            "contoh: <code>20 server web Ubuntu</code>\n\n"
+            "Kirim sebagai pesan berikutnya. /cancel untuk batal.\n\n"
+            "<i>Cara menjangkau mesinnya diatur belakangan lewat /addserver. Apa yang tidak "
+            "boleh disentuh lewat /addboundary.</i>",
+        ), parse_mode="HTML")
+        return
     if what in ("agy", "claude"):
         await _begin_cli_login(update, query, what)
         return
@@ -2946,6 +3021,39 @@ async def _handle_wizard_input(update: Update, context: ContextTypes.DEFAULT_TYP
     if not state:
         return False
     lang = _chat_lang(update)
+
+    if state.get("step") == "await_brief":
+        _wizard.pop(chat_id, None)
+        if state["expires"] < _dt.datetime.now().timestamp():
+            await update.message.reply_text(_t(lang,
+                "\u231b That expired. Run /start again.",
+                "\u231b Sudah kedaluwarsa. Jalankan /start lagi.",
+            ))
+            return True
+        role = (update.message.text or "").strip()
+        if role.lower() in ("/cancel", "cancel", "batal"):
+            await update.message.reply_text(_t(lang, "\u2716\ufe0f Cancelled.", "\u2716\ufe0f Dibatalkan."))
+            return True
+        if len(role) < 3:
+            await update.message.reply_text(_t(lang,
+                "That is too short to be useful. Run /start and try again.",
+                "Terlalu pendek untuk berguna. Jalankan /start dan coba lagi.",
+            ))
+            return True
+        set_brief_role(role)
+        _mark_setup("brief", update.effective_user.id)
+        await update.message.reply_text(_t(lang,
+            f"\u2705 <b>Recorded.</b> This agent looks after: <b>{_tg_escape(role)}</b>\n\n"
+            "Next: /addserver to give it a machine to reach, and /addboundary for "
+            "anything it must never touch.\n\n"
+            "<i>Takes effect on the next new conversation -- /new applies it now.</i>",
+            f"\u2705 <b>Tercatat.</b> Agent ini mengurus: <b>{_tg_escape(role)}</b>\n\n"
+            "Berikutnya: /addserver untuk memberi mesin yang bisa dijangkau, dan "
+            "/addboundary untuk hal yang tidak boleh disentuh.\n\n"
+            "<i>Berlaku di percakapan baru berikutnya -- /new untuk langsung terapkan.</i>",
+        ), parse_mode="HTML")
+        return True
+
     if state["expires"] < _dt.datetime.now().timestamp():
         _wizard.pop(chat_id, None)
         state["handle"].kill()
@@ -3004,6 +3112,48 @@ async def _handle_wizard_input(update: Update, context: ContextTypes.DEFAULT_TYP
     return True
 
 
+async def cmd_setbrief(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Say what this agent looks after, without going through /start."""
+    if not _may_run_setup(update):
+        return
+    lang = _chat_lang(update)
+    if not _is_owner(update) and not await _is_group_admin(update, context):
+        return await update.message.reply_text(_t(lang,
+            "\U0001f512 Bot owner or a group admin only.",
+            "\U0001f512 Cuma pemilik bot atau admin grup.",
+        ))
+    role = " ".join(context.args).strip() if context.args else ""
+    if len(role) < 3:
+        current = ""
+        if brief_configured():
+            try:
+                first = SYSTEM_PROMPT_FILE.read_text(encoding="utf-8").split("\n", 1)[0]
+                current = _t(lang, f"\n\nRight now: {first.strip()}", f"\n\nSekarang: {first.strip()}")
+            except OSError:
+                pass
+        return await update.message.reply_text(_t(lang,
+            "\U0001f5fa <b>What should this agent look after?</b>\n\n"
+            "<code>/setbrief a 7-node Proxmox cluster</code>\n"
+            "<code>/setbrief our Kubernetes staging cluster</code>\n\n"
+            "<i>How it reaches those machines comes from /addserver; what it must never "
+            "touch comes from /addboundary.</i>" + current,
+
+            "\U0001f5fa <b>Agent ini mengurus apa?</b>\n\n"
+            "<code>/setbrief cluster Proxmox 7 node</code>\n"
+            "<code>/setbrief cluster Kubernetes staging kami</code>\n\n"
+            "<i>Cara menjangkau mesinnya dari /addserver; apa yang tidak boleh disentuh "
+            "dari /addboundary.</i>" + current,
+        ), parse_mode="HTML")
+    set_brief_role(role)
+    _mark_setup("brief", update.effective_user.id)
+    await update.message.reply_text(_t(lang,
+        f"\u2705 <b>Recorded.</b> This agent looks after: <b>{_tg_escape(role)}</b>\n\n"
+        "<i>Takes effect on the next new conversation -- /new applies it now.</i>",
+        f"\u2705 <b>Tercatat.</b> Agent ini mengurus: <b>{_tg_escape(role)}</b>\n\n"
+        "<i>Berlaku di percakapan baru berikutnya -- /new untuk langsung terapkan.</i>",
+    ), parse_mode="HTML")
+
+
 async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _authorized(update):
         return
@@ -3056,8 +3206,10 @@ Every reply ends with a "— by ..." tag. If it's ever NOT "{TIERS[0]['label']}"
 /unschedule <name> — remove a scheduled task
 /adopt — bring pre-existing cron entries under management
 /setpin — set/change the 6-digit PIN (entered on a keypad, never typed in chat)
+/setbrief <what it looks after> — set the one-line environment brief
 /boundaries — what the agent must never do (0 tokens)
-/addboundary <rule> — add one   /rmboundary <n> — remove one (PIN)
+/addboundary <rule> — add a rule the agent may NEVER break (run it alone to see what that means)
+/rmboundary <n> — remove one (PIN)
 /snapshots — snapshots taken before changes (0 tokens)
 /servers — machines the agent may reach (0 tokens)
 /addserver — register a new machine, step by step
@@ -3109,8 +3261,10 @@ Setiap balasan diakhiri tanda "— by ...". Kalau tandanya BUKAN "{TIERS[0]['lab
 /unschedule <nama> — hapus satu task terjadwal
 /adopt — bawa cron lama ke dalam kelolaan bot
 /setpin — atur/ganti PIN 6 angka (lewat keypad, tidak pernah diketik di chat)
+/setbrief <yang diurus> — atur brief lingkungan satu baris
 /boundaries — apa yang tidak boleh dilakukan agent (NOL token)
-/addboundary <aturan> — tambah   /rmboundary <n> — hapus (pakai PIN)
+/addboundary <aturan> — tambah aturan yang TIDAK BOLEH dilanggar agent (ketik sendirian untuk lihat penjelasannya)
+/rmboundary <n> — hapus satu (pakai PIN)
 /snapshots — snapshot yang diambil sebelum perubahan (NOL token)
 /servers — daftar mesin yang boleh diakses agent (NOL token)
 /addserver — daftarkan mesin baru, langkah demi langkah
@@ -4465,14 +4619,28 @@ async def cmd_boundaries(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     items = read_boundaries()
     if not items:
         return await update.message.reply_text(_t(lang,
-            "🚧 <b>No hard boundaries set.</b>\n\nNothing is currently marked off-limits. "
-            "Add the first with <code>/addboundary &lt;rule&gt;</code>.\n\n"
-            "<i>These are what stop a misunderstanding from becoming an incident — "
-            "the agent is told it may never do them, whatever it is asked.</i>",
-            "🚧 <b>Belum ada hard boundary.</b>\n\nTidak ada yang ditandai terlarang saat ini. "
-            "Tambahkan yang pertama dengan <code>/addboundary &lt;aturan&gt;</code>.\n\n"
-            "<i>Ini yang mencegah kesalahpahaman jadi insiden — agent diberitahu tidak boleh "
-            "melakukannya, apa pun yang diminta.</i>",
+            "🚧 <b>No hard boundaries set.</b>\n\n"
+            "A hard boundary is something the agent must <b>never</b> do on its own, "
+            "however it is asked. It has real shell and SSH access, so this is the short "
+            "list of things where a misunderstanding would become an incident.\n\n"
+            "Whatever you write is copied into the agent's brief word for word, and the "
+            "agent can never edit or remove it.\n\n"
+            "For example:\n"
+            '  <code>/addboundary The VM "prod-db" -- never stop or restart it</code>\n'
+            "  <code>/addboundary Never delete or resize a disk without asking</code>\n\n"
+            "<i>Nothing is off-limits until you add one.</i>",
+
+            "🚧 <b>Belum ada hard boundary.</b>\n\n"
+            "Hard boundary itu hal yang <b>tidak boleh</b> dilakukan agent atas inisiatif "
+            "sendiri, bagaimanapun cara memintanya. Agent ini punya akses shell dan SSH "
+            "sungguhan, jadi ini daftar pendek hal-hal yang kalau salah paham bisa jadi "
+            "insiden.\n\n"
+            "Apa pun yang Anda tulis disalin apa adanya ke brief agent, dan agent tidak "
+            "akan pernah bisa mengubah atau menghapusnya.\n\n"
+            "Contoh:\n"
+            '  <code>/addboundary VM "prod-db" -- jangan pernah dimatikan atau direstart</code>\n'
+            "  <code>/addboundary Jangan hapus atau resize disk tanpa tanya dulu</code>\n\n"
+            "<i>Selama belum ada yang ditambahkan, tidak ada yang dianggap terlarang.</i>",
         ), parse_mode="HTML")
     lines = [_t(lang, f"🚧 <b>Hard boundaries ({len(items)})</b>", f"🚧 <b>Hard boundary ({len(items)})</b>"), ""]
     lines += [f"{i}. {_tg_escape(x)}" for i, x in enumerate(items, 1)]
@@ -4492,12 +4660,40 @@ async def cmd_addboundary(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     rule = " ".join(context.args).strip() if context.args else ""
     if len(rule) < 8:
         return await update.message.reply_text(_t(lang,
-            "Usage: /addboundary <rule>\n\n"
-            'e.g. /addboundary The VM "prod-db" — never stop or restart it\n\n'
-            "Be specific: a vague rule is one the agent has to interpret.",
-            "Pakai: /addboundary <aturan>\n\n"
-            'contoh: /addboundary VM "prod-db" — jangan pernah dihentikan atau restart\n\n'
-            "Spesifik ya: aturan yang samar cuma bikin agent menerjemahkan sendiri.",
+            "\U0001f6a7 What is a hard boundary?\n\n"
+            "A line the agent must never cross on its own -- however the request is "
+            "worded, and even if someone asks it to. It has real shell and SSH access, "
+            "so this is your short list of things where a misunderstanding would become "
+            "an incident.\n\n"
+            "Your words are copied into the agent's brief verbatim, and the agent can "
+            "never edit or remove them. Only you can, from here.\n\n"
+            "Usage:  /addboundary <rule>\n\n"
+            "Good examples -- name the exact thing:\n"
+            '  /addboundary The VM "prod-db" -- never stop, restart or change it\n'
+            "  /addboundary Never restart any Elasticsearch node, for any reason\n"
+            "  /addboundary Never delete or resize a disk without asking first\n"
+            "  /addboundary Never change firewall rules on the gateway\n\n"
+            "Avoid vague ones like \"be careful with production\" -- the agent then has "
+            "to interpret what you meant, and removing that interpretation is the whole "
+            "point of a boundary.\n\n"
+            "/boundaries shows what is already set. /rmboundary <n> removes one (PIN).",
+
+            "\U0001f6a7 Apa itu hard boundary?\n\n"
+            "Garis yang tidak boleh dilewati agent atas inisiatif sendiri -- bagaimanapun "
+            "permintaannya ditulis, bahkan kalau ada yang menyuruhnya. Agent ini punya "
+            "akses shell dan SSH sungguhan, jadi ini daftar pendek hal-hal yang kalau "
+            "salah paham bisa jadi insiden.\n\n"
+            "Kalimat Anda disalin apa adanya ke brief agent, dan agent tidak akan pernah "
+            "bisa mengubah atau menghapusnya. Hanya Anda, dari sini.\n\n"
+            "Pakai:  /addboundary <aturan>\n\n"
+            "Contoh yang baik -- sebut bendanya dengan jelas:\n"
+            '  /addboundary VM "prod-db" -- jangan pernah dimatikan, direstart, atau diubah\n'
+            "  /addboundary Jangan pernah restart node Elasticsearch, apa pun alasannya\n"
+            "  /addboundary Jangan hapus atau resize disk tanpa tanya dulu\n"
+            "  /addboundary Jangan ubah aturan firewall di gateway\n\n"
+            "Hindari yang samar seperti \"hati-hati sama production\" -- agent jadi harus "
+            "menebak maksud Anda, padahal menghilangkan tebakan itulah gunanya boundary.\n\n"
+            "/boundaries untuk lihat yang sudah ada. /rmboundary <n> untuk hapus (pakai PIN).",
         ))
     items = read_boundaries()
     if rule in items:
@@ -5056,6 +5252,7 @@ def main() -> None:
     app.add_handler(CommandHandler("setpin", cmd_setpin))
     app.add_handler(CallbackQueryHandler(cmd_pin_key, pattern="^pin:"))
     app.add_handler(CommandHandler("boundaries", cmd_boundaries))
+    app.add_handler(CommandHandler("setbrief", cmd_setbrief))
     app.add_handler(CommandHandler("addboundary", cmd_addboundary))
     app.add_handler(CommandHandler("rmboundary", cmd_rmboundary))
     app.add_handler(CommandHandler("snapshots", cmd_snapshots))

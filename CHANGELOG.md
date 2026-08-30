@@ -1,5 +1,91 @@
 # Changelog
 
+## v0.2b.14 -- the installer asks two questions; /addboundary explains itself
+
+**Install is down to two questions: the bot token and your Telegram user ID.**
+Everything else moved to where the operator already is. Removed from the
+terminal: the wkhtmltopdf prompt (now just installed with the other packages --
+the brief tells the agent to deliver PDF/JPEG reports, so a missing renderer is
+a broken feature, not a preference), the Antigravity sign-in prompt (`/start`
+does both sign-ins properly), and the whole `bootstrap.py` step.
+
+That last one was the real blocker. bootstrap.py asked five questions, but four
+already had dedicated Telegram commands -- access is `/addserver`, boundaries
+and "anything else needing approval" are `/addboundary`, quirks are just
+`LEARN:` facts. Only "what should this agent look after?" had no home in chat,
+which is the sole reason an interactive Python script still had to run during
+install. So it became the fourth item on the `/start` setup card, alongside the
+two sign-ins and the PIN, plus a `/setbrief` command for people who would
+rather type than tap.
+
+**`/addboundary` now explains what a hard boundary is.** It was one line and one
+example, which assumed the reader already knew the term -- for the single most
+safety-relevant thing a non-technical operator can set. It now says what it
+means, why it exists (the agent has real shell and SSH access; this is the short
+list where a misunderstanding becomes an incident), that the words are copied
+into the brief verbatim and the agent can never edit them, four concrete
+examples, and why "be careful with production" is worse than useless. Same for
+the empty state of `/boundaries`, which is where most people meet the idea first.
+
+**Fixed while testing the above:** `set_brief_role()` only replaced the template
+placeholder, so it worked once and then silently did nothing -- while the setup
+card cheerfully offers "Change" on a completed item. It now rewrites the role
+wherever it already sits.
+
+**Also fixed:** `curl | bash` for both CLI installers inherited the installer's
+stdin and read ahead over it, swallowing the answers to the prompts below. Under
+`set -e` the script then died at the token prompt without printing anything.
+Both installers are now fetched to a temp file and run with stdin closed. (The
+first attempt at this redirected stdin on the pipe itself, which hands bash an
+empty script -- `curl | bash` passes the script *through* stdin. Caught in the
+container test.)
+
+Verified end to end in a clean Ubuntu 24.04 container: two answers, seven steps,
+zero bootstrap questions, and a `.env` carrying both `AGY_BIN` and `CLAUDE_BIN`.
+36/36 new tests for the brief and boundary work; all seven earlier suites
+(210 tests) re-run with no regressions.
+
+
+## v0.2b.13 -- both Claude tiers could never launch under systemd
+
+The service unit gets systemd's minimal PATH, which does not include
+~/.local/bin -- where both CLI installers put their binaries. `AGY_BIN`
+survived only because install.sh already recorded it absolutely; `CLAUDE_BIN`
+falls back to the bare string "claude", which resolves in an interactive shell
+and never under systemd. So on a by-the-book install, tiers 3 and 4 of the
+fallback chain could not start at all, and only after both Gemini tiers had
+already failed would anyone find out.
+
+Caught on the new server before starting the service, with
+`systemd-run --pipe /bin/sh -c 'command -v claude'` returning NOTFOUND.
+install.sh now resolves claude's real path and records `CLAUDE_BIN=<absolute>`
+alongside `AGY_BIN`, and the unit template sets `PATH` explicitly so anything
+the agent shells out to by bare name resolves the way it does interactively.
+
+
+## v0.2b.12 -- fresh installs shipped a brief missing three whole features
+
+bootstrap.py generated the environment brief from its OWN embedded template,
+which was never updated as features landed. `SOUL.md.template` had all five
+agent conventions; the generated brief had two. Every install that ran
+bootstrap -- the normal path, since install.sh called it -- produced an agent
+that could not use `NEEDS_WRITE:` (so the read-only wall never triggers and the
+unlock card never appears), `SCHEDULE:` (no scheduled tasks) or `GDRIVE:` (no
+Drive uploads). The correct template was reached only in the FAILURE path, when
+bootstrap was skipped and install.sh fell back to copying it; success produced
+the worse artifact.
+
+Separately, in both templates the whole "When you are blocked by read-only
+mode" section sat BELOW the LEARNED_ZONE marker -- a zone `append_learned()`
+and `cmd_forget()` rewrite, keeping only lines starting with "- " and
+discarding everything else. Proven by running the real `append_learned()`
+against the pre-fix template: one call, and the NEEDS_WRITE instruction was
+gone from both briefs. Moved into the protected half.
+
+`examples/proxmox/*.example` have no marker at all, which is fine and
+documented: `_split_zones()` treats a marker-less brief as entirely protected.
+
+
 ## v0.2b.11 -- installer fixed: it still installed 9Router and wrote broken model IDs
 
 Found by actually deploying to a fresh server following our own documented
