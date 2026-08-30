@@ -34,3 +34,4 @@ gdrive_room_accounts.json
 update_state.json
 update_announce.json
 *.log
+tools/registry.json

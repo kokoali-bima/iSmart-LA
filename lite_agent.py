@@ -187,7 +187,7 @@ Required steps, in order:
    - Prints output that is ALREADY computed and sorted (percentages, rankings), concise -- not raw JSON dumps.
    - Exits non-zero with a clear stderr message on failure.
 3. Test-run the script once to prove the output is correct.
-4. Register it in `tools/registry.json`: add one entry to the "tools" array with name, script, usage, description, and "answers" (a list of question phrasings it covers).
+4. Register it in `tools/registry.json` -- create the file if it does not exist yet (see `tools/registry.json.example` for the shape), then add one entry to the "tools" array with name, script, usage, description, and "answers" (a list of question phrasings it covers).
 5. Close with one example invocation.
 """
 

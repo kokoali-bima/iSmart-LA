@@ -1,5 +1,26 @@
 # Changelog
 
+## v0.2b.17 -- tools/registry.json was runtime data tracked as if it were source
+
+Found while converting VM175 to a git checkout for /update: its live
+`tools/registry.json` held a real graduated skill (`cluster-snapshot`, created
+by an actual `/graduate` on production use), while the repo tracked the same
+path as an empty starter template. Same class of bug as v0.2b.16 -- runtime
+state living where git could touch it -- except this one is worse in kind: it
+was already committed, so any `/update` on a deployment that had graduated a
+skill risked a merge conflict (git protects against overwriting local changes,
+so worst case is a failed update, not silent data loss -- but "your graduated
+skills can block updating" is still a real problem).
+
+`tools/registry.json` is now gitignored, like the other runtime json files.
+The starter shape lives at `tools/registry.json.example` instead, referenced
+from `/graduate`'s own instructions to the model (create the file from the
+example if it does not exist yet). `tools/list_tools.py` already treated a
+missing registry.json as empty, so no code change was needed there.
+
+241/241 tests (all nine suites) re-run with no regressions.
+
+
 ## v0.2b.16 -- runtime state was not gitignored, including pin.json
 
 Found immediately after shipping `/update`, by asking what a clone-based
