@@ -97,6 +97,10 @@ ok "Python dependencies installed."
 say "Step 3/7 -- AI providers"
 # ------------------------------------------------------------------------------
 AGY_BIN_PATH="$HOME/.local/bin/agy"
+# Resolved after the installs below, and recorded as an ABSOLUTE path: the
+# systemd unit gets a minimal PATH that excludes ~/.local/bin, so a bare
+# "claude" never resolves there and both Claude tiers would fail to launch.
+CLAUDE_BIN_PATH=""
 
 if command -v claude >/dev/null 2>&1; then
     ok "Claude Code CLI already installed ($(claude --version 2>/dev/null || echo 'version unknown'))."
@@ -113,6 +117,8 @@ else
     curl -fsSL https://antigravity.google/cli/install.sh | bash
 fi
 export PATH="$HOME/.local/bin:$PATH"
+CLAUDE_BIN_PATH="$(command -v claude || true)"
+[ -n "$CLAUDE_BIN_PATH" ] || CLAUDE_BIN_PATH="$HOME/.local/bin/claude"
 
 echo ""
 say "Signing in to Antigravity."
@@ -175,6 +181,7 @@ ALLOWED_USER_IDS=${ADMIN_ID_INPUT}
 ALLOWED_GROUP_IDS=
 
 AGY_BIN=${AGY_BIN_PATH}
+CLAUDE_BIN=${CLAUDE_BIN_PATH}
 
 # Everything else has a working default in lite_agent.py -- the models, the
 # 4-tier fallback chain, the allowed tools. Set them here ONLY to override.
@@ -223,6 +230,7 @@ SERVICE_FILE="/etc/systemd/system/lite-agent.service"
 sed \
   -e "s|__INSTALL_USER__|${INSTALL_USER}|g" \
   -e "s|__INSTALL_DIR__|${INSTALL_DIR}|g" \
+  -e "s|__INSTALL_HOME__|${HOME}|g" \
   "$INSTALL_DIR/systemd/lite-agent.service.template" | sudo tee "$SERVICE_FILE" >/dev/null
 sudo systemctl daemon-reload
 ok "systemd unit installed at ${SERVICE_FILE}."

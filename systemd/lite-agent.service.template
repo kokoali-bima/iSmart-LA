@@ -7,6 +7,9 @@ Type=simple
 User=__INSTALL_USER__
 WorkingDirectory=__INSTALL_DIR__
 EnvironmentFile=__INSTALL_DIR__/.env
+# systemd's default PATH excludes ~/.local/bin, where both CLIs install.
+# Without this, anything invoking them by bare name fails to launch.
+Environment=PATH=__INSTALL_HOME__/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 ExecStart=__INSTALL_DIR__/venv/bin/python __INSTALL_DIR__/lite_agent.py
 Restart=on-failure
 RestartSec=5
