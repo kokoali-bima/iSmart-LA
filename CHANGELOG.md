@@ -1,5 +1,32 @@
 # Changelog
 
+## v0.2b.35 -- /logout could leave /start showing green forever
+
+Reported directly: "seharusnya ketika sudah logout dari gemini/claude status
+di menu /start tidak hijau lagi" (the status should stop showing green after
+logout) -- and it wasn't, no matter how many times /logout ran. Confirmed on
+the live server: `setup_state.json` still had `"agy"` marked done from
+hours earlier, while no OAuth token file existed at all.
+
+Root cause: `logout_agy()`/`logout_claude()` only cleared the stale flag
+*after* successfully removing a real credential -- if there was nothing to
+remove (exactly the state a session that died on its own leaves behind, the
+whole reason /logout exists), the function returned "already signed out"
+before ever reaching `_unmark_setup()`. Confirmed live, directly: called
+`logout_agy()` against the exact broken state and watched it return without
+touching the flag.
+
+Both functions now clear the flag unconditionally, before any early return --
+whether there was a real credential to remove or not, /logout should always
+leave `/start` telling the truth afterward.
+
+18/18 tests in `dev/test_logout.py` (up from 15): two new cases reproducing
+the exact reported scenario for each provider (the flag set, no live
+credential present) and confirming the flag is gone afterward either way.
+All fifteen earlier suites (365 tests) re-run with no regressions; 380
+total.
+
+
 ## v0.2b.34 -- the actual root cause: the OAuth URL was silently truncated
 
 The real one, found only after v0.2b.30, v0.2b.32, and v0.2b.33 had each

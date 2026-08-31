@@ -1571,21 +1571,40 @@ def logout_agy() -> bool:
     """Remove agy's stored OAuth token, forcing a genuinely fresh sign-in next
     time. Only that one file -- settings.json (the permissions written at
     install), conversation history, and everything else under
-    ~/.gemini/antigravity-cli is left alone. Returns False if there was
-    nothing to remove (already signed out)."""
+    ~/.gemini/antigravity-cli is left alone.
+
+    The stale setup_state.json flag is cleared UNCONDITIONALLY, not only when
+    a token file was actually found -- found live: a token file can already
+    be gone (the session died on its own, which is exactly the scenario
+    /logout exists to recover from) while the flag is still set, and an
+    earlier version of this function returned before ever reaching
+    _unmark_setup() in precisely that case, leaving /start showing green no
+    matter how many times /logout was run.
+
+    Returns whether a token file was actually removed -- purely informational
+    for the caller's wording ("logged out" vs "already signed out"), not a
+    signal of whether anything needed fixing.
+    """
     token_file = Path.home() / ".gemini" / "antigravity-cli" / "antigravity-oauth-token"
-    if not token_file.exists():
-        return False
-    token_file.unlink()
+    had_token = token_file.exists()
+    if had_token:
+        token_file.unlink()
+        logger.warning("agy logged out (OAuth token removed) by request")
     _unmark_setup("agy")
-    logger.warning("agy logged out (OAuth token removed) by request")
-    return True
+    return had_token
 
 
 async def logout_claude() -> tuple[bool, str]:
     """`claude auth logout` is a real, documented subcommand -- unlike login,
-    it needs no TTY, so a plain subprocess call is enough."""
+    it needs no TTY, so a plain subprocess call is enough.
+
+    The stale setup_state.json flag is cleared even when claude_signed_in()
+    already says signed out -- same reasoning as logout_agy(): the flag can
+    outlive the actual session, and clearing it is the one thing /logout must
+    always do regardless of what else there was (or wasn't) to clean up.
+    """
     if not claude_signed_in():
+        _unmark_setup("claude")
         return False, ""
     try:
         proc = await asyncio.get_running_loop().run_in_executor(

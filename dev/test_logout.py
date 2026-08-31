@@ -67,6 +67,19 @@ async def main():
           "already signed out" in q_a1.edit_message_text.call_args[0][0].lower()
           or "sudah logout" in q_a1.edit_message_text.call_args[0][0].lower())
 
+    # --- THE real bug reported live: setup_state says "agy" done, but no
+    # token file exists (the session died on its own -- exactly what /logout
+    # exists to recover from). An earlier version returned before ever
+    # clearing the stale flag in precisely this case, so /start kept
+    # showing green no matter how many times /logout ran. ---
+    mod._mark_setup("agy", OWNER)
+    check("setup: 'agy' flag set with no token file present (the exact bug scenario)",
+          "agy" in mod._setup_state())
+    u_a1b, q_a1b = qupd("logout:agy")
+    await mod.cmd_logout_button(u_a1b, ctx())
+    check("logout still clears the stale flag even when there was no token file to remove",
+          "agy" not in mod._setup_state())
+
     # --- Gemini: a real token file exists -> removed, flag cleared, told to /start ---
     token_dir = scratch / ".gemini" / "antigravity-cli"
     token_dir.mkdir(parents=True)
@@ -106,6 +119,17 @@ async def main():
             check("claude logout confirms success",
                   "logged out" in q_cl.edit_message_text.call_args[0][0].lower()
                   or "sudah logout" in q_cl.edit_message_text.call_args[0][0].lower())
+
+    # --- Claude: the same stale-flag bug, mirrored -- claude_signed_in() (a
+    # LIVE check) already says signed out, but the setup_state flag is still
+    # set from earlier. Must be cleared here too, not just when the live
+    # subcommand actually runs. ---
+    mod._mark_setup("claude", OWNER)
+    with patch.object(mod, "claude_signed_in", return_value=False):
+        u_cl3, q_cl3 = qupd("logout:claude")
+        await mod.cmd_logout_button(u_cl3, ctx())
+        check("claude logout clears the stale flag even when claude_signed_in() already says False",
+              "claude" not in mod._setup_state())
 
     # --- Claude: the subcommand fails -> surfaced, not swallowed ---
     with patch.object(mod.subprocess, "run") as run_mock2:
