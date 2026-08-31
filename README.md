@@ -4,7 +4,7 @@ A lightweight Telegram bridge to **Claude Code** and **Antigravity CLI (agy)**, 
 infrastructure monitoring and investigation -- built to be dramatically cheaper to run
 than a full agent framework, while staying just as capable for real operational work.
 
-> **Status: v0.2b.26 -- early/beta.** Built and battle-tested against a real production
+> **Status: v0.2b.28 -- early/beta.** Built and battle-tested against a real production
 > Proxmox VE cluster over several days of iteration, including a live-fire test of the
 > unlock/PIN/snapshot flow against real infrastructure. Works well; still has known
 > rough edges (see [Known limitations](#known-limitations)).
@@ -557,6 +557,12 @@ Only accounts in the original
 already-registered group is deliberately **not** enough to grant a new one, so trust
 can't cascade sideways from one group to another. See `/help` in-chat for the
 member-facing explanation.
+
+**Multiple companies sharing one deployment** don't have to share a PIN either:
+`/setgrouppin` (that group's own admin, or the owner) gives a registered group its
+own PIN, used instead of the owner's when confirming something from inside it.
+The owner's own PIN keeps working everywhere regardless, as a master credential.
+`/rmgrouppin` removes a group's own PIN again, falling back to the owner's.
 
 ### Why automatic *learning* but not automatic *memory*?
 

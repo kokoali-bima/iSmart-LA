@@ -101,6 +101,17 @@ async def main():
     texts1 = [c.args[0] for c in upd1.message.reply_text.call_args_list if c.args]
     check("first hit: the notice IS sent", any("Gemini" in t and "logout" in t for t in texts1))
 
+    # The whole point of a live screenshot: /start kept showing a green check
+    # after this exact failure, because agy_signed_in() falls back to a
+    # setup_state.json flag that a real failure never used to clear.
+    mod._mark_setup("agy", 111)
+    check("setup: agy WAS marked done", "agy" in mod._setup_state())
+    check("agy_signed_in() reports True from the stale flag alone",
+          mod.agy_signed_in() is True)
+    await run_turn_with([REAL_REAUTH_LINE])
+    check("a live reauth failure clears the stale 'agy' setup flag",
+          "agy" not in mod._setup_state())
+
     upd2 = await run_turn_with([REAL_REAUTH_LINE])
     texts2 = [c.args[0] for c in upd2.message.reply_text.call_args_list if c.args]
     check("second hit within the cooldown: NOT sent again (no spam)",

@@ -1,5 +1,59 @@
 # Changelog
 
+## v0.2b.28 -- per-group PINs
+
+Each registered group can now have its own PIN, separate from the owner's --
+confirming `/addserver`, `/update`, `/rmboundary` etc. from inside a group
+uses that group's own PIN if it has set one (`/setgrouppin`, admin or
+owner). The owner's personal PIN is still a master credential that works
+everywhere -- DM, and every group, on top of (never instead of) whatever
+that group has set. A group with none of its own falls back to the owner's,
+exactly like every group did before this existed, so nothing regresses for
+anyone who never sets one up.
+
+Motivation: multiple companies/teams sharing one deployment (bscloud is
+already headed this way) means their admins should not have to share the
+owner's own secret just to confirm something in their own group. Deciding
+who may SET a group's PIN was the one real fork in the design -- landed on
+"that group's own admin, not owner-only," matching the trust level already
+granted for reaching the PIN prompt in the first place (v0.2b.25).
+
+`pin.json` now holds `{"owner": {...}|None, "groups": {chat_id: {...}}}`
+instead of one flat `{salt,hash}`; a file from before this feature is read
+transparently as the owner's PIN, no migration step required. `/rmgrouppin`
+removes a group's own PIN (no PIN needed to do that -- it only ever narrows
+access back to the owner's, never widens it). `verify_pin()` checks a
+group's own PIN first, then always the owner's, both constant-time.
+
+35/35 new tests (`dev/test_group_pin.py`): cross-group isolation (group A's
+PIN must not work in group B), the fallback and override behavior, full
+/setgrouppin and /rmgrouppin flows through the real keypad handlers,
+permission gating (a plain member, an unregistered group), and backward
+compatibility with an old flat pin.json. All twelve earlier suites (282
+tests) re-run with no regressions; 317 total.
+
+
+## v0.2b.27 -- /start kept showing Gemini as signed in after a proven failure
+
+Follow-up to v0.2b.26, found from a live screenshot: the reauth notice fired
+correctly ("Gemini is signed out"), but running /start right after still
+showed "✅ Antigravity (Gemini) sudah sign-in." -- as if nothing had
+happened. Confusing on its own, and worse: tapping "Change Gemini" to fix it
+already works completely through Telegram (`cmd_setup_button` starts a real
+OAuth attempt unconditionally, the checkmark was never a gate), so the only
+actual bug was the status lying about needing it in the first place.
+
+Root cause: `agy_signed_in()` falls back to a `setup_state.json` flag
+written once, the first time /start's sign-in ever reported success -- and
+never re-validates it. A live re-auth failure now clears that flag
+immediately (unconditionally, not gated by the notice's own spam cooldown),
+so /start's card goes back to showing the truth right away.
+
+2 new tests extending `dev/test_reauth_notice.py`: a stale flag reads as
+signed-in on its own, and a live failure clears it. All eleven earlier
+suites (270 tests) re-run with no regressions; 282 total.
+
+
 ## v0.2b.26 -- a dead Gemini session was invisible until someone happened to notice
 
 Found live: bscloud's Antigravity (Gemini) sign-in had quietly died -- every

@@ -488,39 +488,129 @@ _pin_sessions: dict[str, dict] = {}
 PIN_ACTIONS_ALLOWED_IN_GROUP = frozenset({
     "new_pin_capture", "new_pin_confirm", "change_pin_start", "schedule_install",
     "unlock", "unlock_and_resume", "addserver", "update", "rmboundary",
+    "new_group_pin_capture", "new_group_pin_confirm", "change_group_pin_start",
 })
 _pin_lockout_until: float = 0.0
 
 
-def pin_is_set() -> bool:
-    return PIN_FILE.exists()
+# --------------------------------------------------------------------------
+# PIN storage: one owner PIN (works everywhere -- DM, and every group, as a
+# master credential), plus an optional PIN per registered group that only
+# applies inside that specific group. A group with none of its own falls back
+# to the owner's, exactly like before this existed -- nothing regresses for a
+# group that hasn't set one up.
+#
+# pin.json holds {"owner": {salt,hash}|None, "groups": {chat_id: {salt,hash,
+# set_by,set_at}}}. A file from before this feature existed is the flat
+# {"salt":...,"hash":...} shape -- read transparently as the owner's PIN, no
+# migration step required.
+# --------------------------------------------------------------------------
+
+def _pin_store() -> dict:
+    if not PIN_FILE.exists():
+        return {"owner": None, "groups": {}}
+    try:
+        data = json.loads(PIN_FILE.read_text())
+    except Exception:
+        logger.error("pin.json unreadable -- treating as empty", exc_info=True)
+        return {"owner": None, "groups": {}}
+    if "owner" in data or "groups" in data:
+        data.setdefault("owner", None)
+        data.setdefault("groups", {})
+        return data
+    return {"owner": data, "groups": {}}  # pre-group-PIN flat format
 
 
-def set_pin(pin: str) -> None:
-    salt = os.urandom(16)
-    digest = hashlib.scrypt(pin.encode(), salt=salt, n=16384, r=8, p=1, dklen=32)
-    PIN_FILE.write_text(json.dumps({"salt": salt.hex(), "hash": digest.hex()}))
+def _save_pin_store(store: dict) -> None:
+    PIN_FILE.write_text(json.dumps(store, indent=2))
     try:
         PIN_FILE.chmod(0o600)
     except OSError:
         pass
-    logger.warning("PIN was set/changed")
 
 
-def verify_pin(pin: str) -> bool:
-    if not pin_is_set():
+def _hash_pin(pin: str, salt: bytes) -> bytes:
+    return hashlib.scrypt(pin.encode(), salt=salt, n=16384, r=8, p=1, dklen=32)
+
+
+def pin_is_set(chat_id: Optional[int] = None) -> bool:
+    """Whether a PIN exists that would gate an action from this chat: that
+    group's own, if it has one, or (always) the owner's."""
+    store = _pin_store()
+    if chat_id is not None and str(chat_id) in store["groups"]:
+        return True
+    return store["owner"] is not None
+
+
+def group_pin_is_set(chat_id: int) -> bool:
+    return str(chat_id) in _pin_store()["groups"]
+
+
+def set_pin(pin: str) -> None:
+    """The owner's PIN -- works everywhere, as the master credential."""
+    store = _pin_store()
+    salt = os.urandom(16)
+    store["owner"] = {"salt": salt.hex(), "hash": _hash_pin(pin, salt).hex()}
+    _save_pin_store(store)
+    logger.warning("owner PIN was set/changed")
+
+
+def set_group_pin(chat_id: int, pin: str, by: int) -> None:
+    """A specific group's own PIN -- applies only inside that group, on top
+    of (never instead of) the owner's, which still works there too."""
+    store = _pin_store()
+    salt = os.urandom(16)
+    store["groups"][str(chat_id)] = {
+        "salt": salt.hex(), "hash": _hash_pin(pin, salt).hex(),
+        "set_by": by, "set_at": _dt.datetime.now().strftime("%Y-%m-%d %H:%M"),
+    }
+    _save_pin_store(store)
+    logger.warning("group PIN set/changed for chat=%s by=%s", chat_id, by)
+
+
+def remove_group_pin(chat_id: int) -> bool:
+    """Drop a group's own PIN. That group falls back to the owner's -- it is
+    never left with no PIN at all as long as the owner has one."""
+    store = _pin_store()
+    if str(chat_id) not in store["groups"]:
         return False
-    try:
-        data = json.loads(PIN_FILE.read_text())
-        salt = bytes.fromhex(data["salt"])
-        expected = bytes.fromhex(data["hash"])
-    except Exception:
-        logger.error("pin.json unreadable -- refusing to verify", exc_info=True)
+    del store["groups"][str(chat_id)]
+    _save_pin_store(store)
+    logger.warning("group PIN removed for chat=%s", chat_id)
+    return True
+
+
+def verify_pin(pin: str, chat_id: Optional[int] = None) -> bool:
+    """True if `pin` matches whatever legitimately applies here: that group's
+    own PIN if this chat has one, OR (always, everywhere) the owner's -- a
+    group with none of its own simply has only the owner's to match, same as
+    before per-group PINs existed."""
+    store = _pin_store()
+    candidates = []
+    if chat_id is not None:
+        entry = store["groups"].get(str(chat_id))
+        if entry is not None:
+            candidates.append(entry)
+    if store["owner"] is not None:
+        candidates.append(store["owner"])
+    if not candidates:
         return False
-    digest = hashlib.scrypt(pin.encode(), salt=salt, n=16384, r=8, p=1, dklen=32)
-    # Constant-time: a length/short-circuit difference is a timing oracle, and
-    # six digits is a small enough space that it would matter.
-    return hmac.compare_digest(digest, expected)
+    # Constant-time per candidate: a length/short-circuit difference is a
+    # timing oracle, and six digits is a small enough space that it matters.
+    # Checked against every candidate rather than short-circuiting the loop
+    # on the exception path so the two-PIN case doesn't leak which slot (if
+    # either) is even configured via a timing difference of its own.
+    ok = False
+    for entry in candidates:
+        try:
+            salt = bytes.fromhex(entry["salt"])
+            expected = bytes.fromhex(entry["hash"])
+        except Exception:
+            logger.error("pin.json entry unreadable -- refusing to verify", exc_info=True)
+            continue
+        digest = _hash_pin(pin, salt)
+        ok = ok or hmac.compare_digest(digest, expected)
+    return ok
 
 
 def pin_locked_out() -> int:
@@ -1395,6 +1485,19 @@ def _mark_setup(key: str, by: Optional[int] = None) -> None:
     st = _setup_state()
     st[key] = {"done_at": _dt.datetime.now().strftime("%Y-%m-%d %H:%M"), "by": by}
     WIZARD_STATE_FILE.write_text(json.dumps(st, indent=2))
+
+
+def _unmark_setup(key: str) -> None:
+    """Undo _mark_setup -- for when something PROVES a prior success no
+    longer holds (a live re-auth failure, not just the absence of evidence).
+    Without this, /start's card keeps showing a green check forever once one
+    sign-in ever succeeded once, since agy_signed_in() falls back to this
+    exact flag when the filesystem check finds nothing (see its own
+    docstring) -- the operator has no way to tell a real re-login is needed."""
+    st = _setup_state()
+    if key in st:
+        del st[key]
+        WIZARD_STATE_FILE.write_text(json.dumps(st, indent=2))
 
 
 def agy_signed_in() -> bool:
@@ -3482,7 +3585,9 @@ Every reply ends with a "— by ..." tag. If it's ever NOT "{TIERS[0]['label']}"
 /schedules — everything that runs on a timer, and what it does (0 tokens)
 /unschedule <name> — remove a scheduled task
 /adopt — bring pre-existing cron entries under management
-/setpin — set/change the 6-digit PIN (entered on a keypad, never typed in chat)
+/setpin — set/change the OWNER's PIN, works everywhere (entered on a keypad, never typed in chat)
+/setgrouppin — set/change THIS group's own PIN (owner or this group's admin, run inside the group)
+/rmgrouppin — remove this group's own PIN, falls back to the owner's (owner or this group's admin)
 /update — check GitHub for a newer version and install it (PIN)
 /setbrief <what it looks after> — set the one-line environment brief
 /boundaries — what the agent must never do (0 tokens)
@@ -3515,6 +3620,7 @@ If this group has been registered by an admin (check with `/chatid`), EVERY memb
 1. By default the bot only sees *commands* (`/status` etc), a mention (`@botname ...`), or a reply to one of its own messages -- that's Telegram's Privacy Mode, ON for every new bot, and it hides everyday chat from the bot entirely. **For most groups this is what you want**: no token spent unless someone actually asked it something. Turning Privacy Mode off (@BotFather → `/mybots` → this bot → *Bot Settings* → *Group Privacy* → *Turn off*) makes it read -- and reply to -- every message like a full participant; only do that for a group that genuinely wants it that involved, since every message it now answers spends this deployment's shared subscription quota.
 2. Sessions (`/new`, `/session`) in this group are *separate* from each member's private DM -- safely isolated. But `/remember` is *GLOBAL* across every chat including this group -- if someone remembers a fact here, everyone here (and in every other chat with this bot) can see it via `/memory`.
 3. This group doesn't have access yet? An admin just needs to type `/registergroup` here -- takes effect immediately, no restart needed. (`/unregistergroup` to revoke it again.)
+4. Confirming with a PIN (`/addserver`, `/update`, etc) here uses this group's OWN PIN if it has one (`/setgrouppin`), so different companies sharing one bot don't need to share a secret -- the owner's personal PIN always works too, everywhere, as a master credential.
 
 {_HELP_CREDITS}"""
 
@@ -3538,7 +3644,9 @@ Setiap balasan diakhiri tanda "— by ...". Kalau tandanya BUKAN "{TIERS[0]['lab
 /schedules — semua yang jalan terjadwal, dan isinya apa (NOL token)
 /unschedule <nama> — hapus satu task terjadwal
 /adopt — bawa cron lama ke dalam kelolaan bot
-/setpin — atur/ganti PIN 6 angka (lewat keypad, tidak pernah diketik di chat)
+/setpin — atur/ganti PIN OWNER, berlaku di mana pun (lewat keypad, tidak pernah diketik di chat)
+/setgrouppin — atur/ganti PIN milik grup INI (owner atau admin grup ini, jalankan di dalam grupnya)
+/rmgrouppin — hapus PIN grup ini, kembali pakai PIN owner (owner atau admin grup ini)
 /update — cek versi terbaru di GitHub dan pasang (pakai PIN)
 /setbrief <yang diurus> — atur brief lingkungan satu baris
 /boundaries — apa yang tidak boleh dilakukan agent (NOL token)
@@ -3571,6 +3679,7 @@ Kalau grup ini sudah didaftarkan admin (cek dengan `/chatid`), SEMUA anggota oto
 1. Secara default bot cuma melihat *perintah* (`/status` dll), mention (`@namabot ...`), atau reply ke salah satu pesannya -- itu Privacy Mode bawaan Telegram, AKTIF untuk setiap bot baru, dan itu menyembunyikan chat sehari-hari dari bot sepenuhnya. **Untuk kebanyakan grup, ini yang Anda mau**: nol token terpakai kecuali memang ada yang bertanya. Mematikan Privacy Mode (chat @BotFather → `/mybots` → pilih bot ini → *Bot Settings* → *Group Privacy* → *Turn off*) bikin bot membaca -- dan membalas -- setiap pesan layaknya anggota penuh; lakukan itu hanya untuk grup yang memang ingin bot seaktif itu, karena tiap pesan yang dijawabnya memakai kuota subscription bersama deployment ini.
 2. Sesi (`/new`, `/session`) di grup ini *terpisah* dari DM pribadi masing-masing anggota -- aman terisolasi. Tapi `/remember` bersifat *GLOBAL* di semua chat termasuk grup ini -- kalau seseorang me-remember fakta di sini, semua orang di sini (dan di semua chat lain dengan bot ini) bisa melihatnya lewat `/memory`.
 3. Grup ini belum punya akses? Admin tinggal ketik `/registergroup` di sini -- langsung aktif, tanpa perlu restart. (`/unregistergroup` untuk mencabutnya lagi.)
+4. Konfirmasi pakai PIN (`/addserver`, `/update`, dll) di sini memakai PIN milik grup INI kalau sudah diatur (`/setgrouppin`), jadi beberapa perusahaan yang berbagi satu bot tidak perlu berbagi rahasia yang sama -- PIN pribadi owner tetap berlaku di mana pun, sebagai kredensial utama.
 
 {_HELP_CREDITS}"""
 
@@ -3981,12 +4090,14 @@ async def request_pin(update: Update, action: str, payload: dict, prompt: str) -
     runs once the PIN checks out, in _pin_verified().
     """
     lang = _chat_lang(update)
-    if not pin_is_set():
+    if not pin_is_set(update.effective_chat.id):
         await update.effective_message.reply_text(_t(lang,
             "🔢 No PIN is set yet, so sensitive actions are blocked.\n"
-            "Set one first with /setpin (owner, private DM).",
+            "Set the owner PIN with /setpin (owner, private DM), or -- if this "
+            "is a registered group -- its own with /setgrouppin.",
             "🔢 PIN belum diatur, jadi aksi sensitif diblokir.\n"
-            "Atur dulu dengan /setpin (owner, DM pribadi).",
+            "Atur PIN owner dengan /setpin (owner, DM pribadi), atau -- kalau "
+            "ini grup terdaftar -- PIN grupnya sendiri dengan /setgrouppin.",
         ))
         return
     left = pin_locked_out()
@@ -4084,11 +4195,12 @@ async def cmd_pin_key(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     session["digits"] = ""
 
     # Choosing a NEW pin has nothing to verify against yet.
-    if session["action"] in ("new_pin_capture", "new_pin_confirm"):
+    if session["action"] in ("new_pin_capture", "new_pin_confirm",
+                              "new_group_pin_capture", "new_group_pin_confirm"):
         await _pin_capture(update, query, session, token, entered)
         return
 
-    if not verify_pin(entered):
+    if not verify_pin(entered, session["chat_id"]):
         session["attempts"] = session.get("attempts", 0) + 1
         if session["attempts"] >= PIN_MAX_ATTEMPTS:
             _pin_sessions.pop(token, None)
@@ -4115,11 +4227,20 @@ async def cmd_pin_key(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 async def _pin_capture(update: Update, query, session: dict, token: str, entered: str) -> None:
     """Two-step entry for a new PIN: type it, then type it again. A mistyped PIN
-    that locks you out of your own production changes is a bad afternoon."""
+    that locks you out of your own production changes is a bad afternoon.
+
+    Shared by the owner's PIN (/setpin) and a specific group's own
+    (/setgrouppin) -- same two-step shape, different destination for the
+    result once both entries match.
+    """
     lang = _chat_lang(update)
-    if session["action"] == "new_pin_capture":
+    is_group = session["action"] in ("new_group_pin_capture", "new_group_pin_confirm")
+    capture_action = "new_group_pin_capture" if is_group else "new_pin_capture"
+    confirm_action = "new_group_pin_confirm" if is_group else "new_pin_confirm"
+
+    if session["action"] == capture_action:
         _pin_sessions.pop(token, None)
-        confirm_token = _new_pin_session("new_pin_confirm", {"first": entered},
+        confirm_token = _new_pin_session(confirm_action, {"first": entered},
                                          update.effective_chat.id)
         await query.edit_message_text(_t(lang,
             f"🔢 Enter the same {PIN_LENGTH} digits again to confirm:\n{_pin_masked(0)}",
@@ -4130,10 +4251,26 @@ async def _pin_capture(update: Update, query, session: dict, token: str, entered
     _pin_sessions.pop(token, None)
     if entered != session["payload"]["first"]:
         await query.edit_message_text(_t(lang,
-            "❌ The two entries didn't match. Run /setpin again.",
-            "❌ Dua isian tidak sama. Ulangi /setpin.",
+            f"❌ The two entries didn't match. Run /{'setgrouppin' if is_group else 'setpin'} again.",
+            f"❌ Dua isian tidak sama. Ulangi /{'setgrouppin' if is_group else 'setpin'}.",
         ))
         return
+
+    if is_group:
+        chat = update.effective_chat
+        set_group_pin(session["chat_id"], entered, update.effective_user.id)
+        await query.edit_message_text(_t(lang,
+            f"✅ PIN set for <b>{_tg_escape(chat.title or session['chat_id'])}</b>. It now "
+            "guards sensitive actions confirmed from this group specifically -- the "
+            "owner's own PIN still works here too, as a master credential.\n\n"
+            "It is stored only as a salted hash, and it is never typed into the chat.",
+            f"✅ PIN tersimpan untuk <b>{_tg_escape(chat.title or session['chat_id'])}</b>. "
+            "Sekarang menjaga aksi sensitif yang dikonfirmasi dari grup ini secara "
+            "khusus -- PIN owner tetap berlaku di sini juga, sebagai kredensial utama.\n\n"
+            "Disimpan hanya sebagai hash yang di-salt, dan tidak pernah diketik di chat.",
+        ), parse_mode="HTML")
+        return
+
     set_pin(entered)
     await query.edit_message_text(_t(lang,
         "✅ PIN set. It now guards scheduled tasks and /unlock.\n"
@@ -4152,6 +4289,10 @@ async def _pin_verified(update: Update, context: ContextTypes.DEFAULT_TYPE,
 
     if action == "change_pin_start":
         await _begin_new_pin(update, query)
+        return
+
+    if action == "change_group_pin_start":
+        await _begin_new_group_pin(update, query)
         return
 
     if action == "unlock_and_resume":
@@ -4272,7 +4413,9 @@ async def _begin_new_pin(update: Update, query=None) -> None:
 
 
 async def cmd_setpin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Set or change the PIN.
+    """Set or change the OWNER's PIN -- the master credential that works
+    everywhere: DM, and every group, on top of (never instead of) that
+    group's own if it has set one.
 
     Works in a group as well as a DM: the digits ride in callback_data, so a
     group sees a keypad and a row of dots, never the PIN. Changing an existing
@@ -4291,6 +4434,105 @@ async def cmd_setpin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         ))
         return
     await _begin_new_pin(update)
+
+
+async def _begin_new_group_pin(update: Update, query=None) -> None:
+    token = _new_pin_session("new_group_pin_capture", {}, update.effective_chat.id)
+    lang = _chat_lang(update)
+    text = (
+        _t(lang, f"🔢 Choose this group's new {PIN_LENGTH}-digit PIN.\n",
+                 f"🔢 Pilih PIN baru {PIN_LENGTH} digit untuk grup ini.\n")
+        + _t(lang,
+             "Avoid birthdays and 123456. Your digits stay private (they never "
+             "become a message), but the group can see someone is setting a "
+             "PIN right now.\n",
+             "Hindari tanggal lahir dan 123456. Digitnya tetap privat (tidak "
+             "pernah jadi pesan), tapi grup bisa lihat ada yang sedang "
+             "mengatur PIN sekarang.\n",
+        )
+        + f"{_pin_masked(0)}"
+    )
+    kb = _pin_keyboard(token, 0)
+    if query is not None:
+        await query.edit_message_text(text, reply_markup=kb)
+    else:
+        await update.effective_message.reply_text(text, reply_markup=kb)
+
+
+async def cmd_setgrouppin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Set or change THIS group's own PIN -- separate from the owner's, and
+    only usable to confirm actions from inside this specific group. The
+    owner's own PIN keeps working here too, as a master credential; this is
+    additive, not a replacement.
+    """
+    lang = _chat_lang(update)
+    chat = update.effective_chat
+    if not chat or chat.type == "private":
+        await update.effective_message.reply_text(_t(lang,
+            "This command is for a group -- run it inside the group you "
+            "want to give its own PIN.",
+            "Command ini buat grup -- jalankan di dalam grup yang mau "
+            "diberi PIN sendiri.",
+        ))
+        return
+    if chat.id not in ALLOWED_GROUP_IDS:
+        await update.effective_message.reply_text(_t(lang,
+            "This group isn't registered yet -- run /registergroup first.",
+            "Grup ini belum terdaftar -- jalankan /registergroup dulu.",
+        ))
+        return
+    if not _is_owner(update) and not await _is_group_admin(update, context):
+        await update.effective_message.reply_text(_t(lang,
+            "🔒 Bot owner or a group admin only.",
+            "🔒 Cuma pemilik bot atau admin grup.",
+        ))
+        return
+    if group_pin_is_set(chat.id):
+        await request_pin(update, "change_group_pin_start", {}, _t(lang,
+            "🔢 Changing this group's PIN. First, confirm the CURRENT one "
+            "(this group's own, or the owner's).",
+            "🔢 Mengganti PIN grup ini. Konfirmasi dulu PIN yang SEKARANG "
+            "(punya grup ini, atau punya owner).",
+        ))
+        return
+    await _begin_new_group_pin(update)
+
+
+async def cmd_rmgrouppin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Remove this group's own PIN. The group is never left unprotected by
+    this -- it falls back to the owner's, exactly like a group that never set
+    one of its own. No PIN confirmation needed to remove one: this only ever
+    narrows who can confirm sensitive actions here back down to whoever knows
+    the owner's PIN, never widens it.
+    """
+    lang = _chat_lang(update)
+    chat = update.effective_chat
+    if not chat or chat.type == "private":
+        await update.effective_message.reply_text(_t(lang,
+            "This command is for a group -- run it inside the group whose "
+            "own PIN you want to remove.",
+            "Command ini buat grup -- jalankan di dalam grup yang PIN-nya "
+            "mau dihapus.",
+        ))
+        return
+    if not _is_owner(update) and not await _is_group_admin(update, context):
+        await update.effective_message.reply_text(_t(lang,
+            "🔒 Bot owner or a group admin only.",
+            "🔒 Cuma pemilik bot atau admin grup.",
+        ))
+        return
+    if not remove_group_pin(chat.id):
+        await update.effective_message.reply_text(_t(lang,
+            "This group doesn't have its own PIN set.",
+            "Grup ini belum punya PIN sendiri.",
+        ))
+        return
+    await update.effective_message.reply_text(_t(lang,
+        "✅ This group's own PIN is removed. Sensitive actions here now "
+        "need the owner's PIN, same as a group that never set one.",
+        "✅ PIN grup ini sudah dihapus. Aksi sensitif di sini sekarang "
+        "butuh PIN owner, sama seperti grup yang belum pernah punya PIN sendiri.",
+    ))
 
 
 async def offer_schedules(update: Update, proposals: list[dict]) -> None:
@@ -4534,7 +4776,7 @@ async def cmd_addserver(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await update.message.reply_text(_t(lang, "🔒 Bot owner or a group admin only.",
                                               "🔒 Cuma pemilik bot atau admin grup."))
         return
-    if pin_is_set():
+    if pin_is_set(update.effective_chat.id):
         await request_pin(update, "addserver", {}, _t(lang, "➕ Adding a server.", "➕ Menambah server."))
     else:
         # Nothing to verify against yet. Say so plainly instead of pretending
@@ -5093,7 +5335,7 @@ async def cmd_rmboundary(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             f"Pakai: /rmboundary <nomor>\nLihat di /boundaries ({len(items)} tercatat).",
         ))
     target = items[int(arg) - 1]
-    if pin_is_set():
+    if pin_is_set(update.effective_chat.id):
         await request_pin(update, "rmboundary", {"rule": target}, _t(lang,
             f"🚧 Removing a boundary:\n\n<i>{_tg_escape(target)}</i>",
             f"🚧 Menghapus boundary:\n\n<i>{_tg_escape(target)}</i>",
@@ -5487,6 +5729,14 @@ async def _run_turn(update: Update, context: ContextTypes.DEFAULT_TYPE, text: st
     # THIS reply, so say something rather than let every future turn quietly
     # cost more until someone happens to notice on their own.
     if _agy_attempt_needs_reauth(attempts):
+        # Unconditional, NOT gated by the notice cooldown below: a live
+        # failure just proved the earlier success no longer holds, so /start's
+        # card should stop claiming otherwise right away, not up to an hour
+        # from now -- agy_signed_in() falls back to this exact flag once the
+        # filesystem check finds nothing (its own docstring says so), which is
+        # exactly how it kept showing a green check through the whole outage
+        # that led to this feature existing.
+        _unmark_setup("agy")
         global _agy_reauth_last_notice
         now = _dt.datetime.now().timestamp()
         if now - _agy_reauth_last_notice > AGY_REAUTH_NOTICE_COOLDOWN_HOURS * 3600:
@@ -5707,6 +5957,8 @@ def main() -> None:
     app.add_handler(CommandHandler("remember", cmd_remember))
     app.add_handler(CommandHandler("memory", cmd_memory))
     app.add_handler(CommandHandler("setpin", cmd_setpin))
+    app.add_handler(CommandHandler("setgrouppin", cmd_setgrouppin))
+    app.add_handler(CommandHandler("rmgrouppin", cmd_rmgrouppin))
     app.add_handler(CallbackQueryHandler(cmd_pin_key, pattern="^pin:"))
     app.add_handler(CommandHandler("boundaries", cmd_boundaries))
     app.add_handler(CommandHandler("update", cmd_update))
