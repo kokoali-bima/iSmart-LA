@@ -4,7 +4,7 @@ A lightweight Telegram bridge to **Claude Code** and **Antigravity CLI (agy)**, 
 infrastructure monitoring and investigation -- built to be dramatically cheaper to run
 than a full agent framework, while staying just as capable for real operational work.
 
-> **Status: v0.2b.36 -- early/beta.** Built and battle-tested against a real production
+> **Status: v0.2b.37 -- early/beta.** Built and battle-tested against a real production
 > Proxmox VE cluster over several days of iteration, including a live-fire test of the
 > unlock/PIN/snapshot flow against real infrastructure. Works well; still has known
 > rough edges (see [Known limitations](#known-limitations)).
@@ -546,15 +546,23 @@ whole Telegram group use it without whitelisting each member:
 2. Someone in `ALLOWED_USER_IDS` runs `/registergroup` inside that group.
 
 That's it -- takes effect immediately, no restart. With nothing else changed, the
-bot only ever *sees* a command, an `@botname` mention, or a reply to one of its own
-messages -- Telegram's **Privacy Mode**, ON by default for every new bot. Everyday
-group chatter stays invisible to it, and invisible costs nothing: **this is what
-you want for most groups**, so the bot answers when asked and stays out of the
-conversation otherwise. Turning Privacy Mode off (**@BotFather** → `/mybots` →
-this bot → *Bot Settings* → *Group Privacy* → *Turn off*) makes it read and
-reply to every message like a full participant -- worth it only for a group that
-actually wants that, since every message it then answers spends this
-deployment's shared subscription quota.
+bot only ever *sees* a command or a reply to one of its own messages -- Telegram's
+**Privacy Mode**, ON by default for every new bot, which does *not* actually forward
+a plain `@botname` mention typed mid-sentence despite it looking like a valid
+mention in the client (confirmed live: it left zero trace on the server even while
+the log was being watched in real time as it was sent). Everyday group chatter
+stays invisible either way, and invisible costs nothing: **this is what you want
+for most groups**, so the bot answers when asked and stays out of the conversation
+otherwise.
+
+To also make a real `@botname` mention wake it up -- not just a reply -- turn
+Privacy Mode off (**@BotFather** → `/mybots` → this bot → *Bot Settings* →
+*Group Privacy* → *Turn off*). This makes Telegram forward every group message to
+the bot, but it does **not** turn the bot into a full participant: the same gate
+that used to be Privacy Mode's job now runs in the bot itself, so ordinary chatter
+still never reaches the model or spends any quota -- only a reply to the bot or an
+actual `@botname` mention does (the mention text itself is stripped out before the
+model sees it). Skip this step for a group that's fine with reply-only.
 
 Only accounts in the original
 `ALLOWED_USER_IDS` list can register (or unregister) a group; being authorized via an

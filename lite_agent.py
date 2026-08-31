@@ -2296,6 +2296,57 @@ def _authorized(update: Update) -> bool:
     return user_id in ALLOWED_USER_IDS
 
 
+# -- group "wake word" gating ------------------------------------------------
+# With Telegram's own Privacy Mode, a group only forwards commands and replies
+# to the bot -- confirmed live that a plain "@mention" embedded mid-sentence
+# does NOT count as an exception and never reaches the bot at all, even though
+# it looks like a valid mention in the client. To let a real @mention wake the
+# bot up (not just a reply), Privacy Mode has to be turned OFF, which then
+# forwards every group message -- so this gate replaces what Privacy Mode used
+# to enforce, checked in-app instead: a reply to the bot's own message, or an
+# actual @mention entity, or nothing happens. Ordinary chatter never reaches
+# the model either way; only the mechanism moved.
+def _entity_text(text: str, offset: int, length: int) -> str:
+    """Telegram entity offsets are UTF-16 code-unit based, not Python codepoint
+    indices -- slicing the string directly misaligns whenever a character
+    before the entity sits outside the BMP (e.g. an emoji). Round-trip
+    through UTF-16 to get this right."""
+    encoded = text.encode("utf-16-le")
+    return encoded[offset * 2:(offset + length) * 2].decode("utf-16-le", errors="ignore")
+
+
+def _strip_entity(text: str, offset: int, length: int) -> str:
+    """Remove a UTF-16-indexed entity span from text, same care as above."""
+    encoded = text.encode("utf-16-le")
+    start, end = offset * 2, (offset + length) * 2
+    return (encoded[:start] + encoded[end:]).decode("utf-16-le", errors="ignore")
+
+
+def _group_mention_span(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Optional[tuple[int, int]]:
+    """(offset, length) of the entity that @-mentions this bot by username in
+    update.message, or None. A literal '@name' substring Telegram did not
+    itself parse as a mention entity does not count -- this matches exactly
+    what Telegram recognizes as addressing the bot, nothing looser."""
+    msg = update.message
+    bot_username = (context.bot.username or "").lower()
+    if not msg or not msg.entities or not bot_username:
+        return None
+    text = msg.text or ""
+    for ent in msg.entities:
+        if ent.type != "mention":
+            continue
+        mention = _entity_text(text, ent.offset, ent.length)
+        if mention.lstrip("@").lower() == bot_username:
+            return ent.offset, ent.length
+    return None
+
+
+def _is_reply_to_bot(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    msg = update.message
+    replied = msg.reply_to_message if msg else None
+    return bool(replied and replied.from_user and replied.from_user.id == context.bot.id)
+
+
 # --------------------------------------------------------------------------
 # Rendering model output for Telegram
 #
@@ -3878,7 +3929,7 @@ Every reply ends with a "— by ..." tag. If it's ever NOT "{TIERS[0]['label']}"
 
 *Using it in a Telegram Group*
 If this group has been registered by an admin (check with `/chatid`), EVERY member can give the bot commands automatically -- no per-person whitelist needed.
-1. By default the bot only sees *commands* (`/status` etc), a mention (`@botname ...`), or a reply to one of its own messages -- that's Telegram's Privacy Mode, ON for every new bot, and it hides everyday chat from the bot entirely. **For most groups this is what you want**: no token spent unless someone actually asked it something. Turning Privacy Mode off (@BotFather → `/mybots` → this bot → *Bot Settings* → *Group Privacy* → *Turn off*) makes it read -- and reply to -- every message like a full participant; only do that for a group that genuinely wants it that involved, since every message it now answers spends this deployment's shared subscription quota.
+1. By default the bot only sees *commands* (`/status` etc) or a reply to one of its own messages -- that's Telegram's Privacy Mode, ON for every new bot, and it hides everyday chat (a plain `@botname` typed mid-sentence included, despite looking like a mention) from the bot entirely. **For most groups this is what you want**: no token spent unless someone actually asked it something. Turning Privacy Mode off (@BotFather → `/mybots` → this bot → *Bot Settings* → *Group Privacy* → *Turn off*) makes a real `@botname` mention wake it up too -- it does NOT turn the bot into a full participant, ordinary chatter still costs nothing; only do this for a group that wants mentions to work, not just replies.
 2. Sessions (`/new`, `/session`) in this group are *separate* from each member's private DM -- safely isolated. But `/remember` is *GLOBAL* across every chat including this group -- if someone remembers a fact here, everyone here (and in every other chat with this bot) can see it via `/memory`.
 3. This group doesn't have access yet? An admin just needs to type `/registergroup` here -- takes effect immediately, no restart needed. (`/unregistergroup` to revoke it again.)
 4. Confirming with a PIN (`/addserver`, `/update`, etc) here uses this group's OWN PIN if it has one (`/setgrouppin`), so different companies sharing one bot don't need to share a secret -- the owner's personal PIN always works too, everywhere, as a master credential.
@@ -3939,7 +3990,7 @@ Setiap balasan diakhiri tanda "— by ...". Kalau tandanya BUKAN "{TIERS[0]['lab
 
 *Memakainya di Grup Telegram*
 Kalau grup ini sudah didaftarkan admin (cek dengan `/chatid`), SEMUA anggota otomatis bisa kasih perintah ke bot -- tidak perlu whitelist per orang.
-1. Secara default bot cuma melihat *perintah* (`/status` dll), mention (`@namabot ...`), atau reply ke salah satu pesannya -- itu Privacy Mode bawaan Telegram, AKTIF untuk setiap bot baru, dan itu menyembunyikan chat sehari-hari dari bot sepenuhnya. **Untuk kebanyakan grup, ini yang Anda mau**: nol token terpakai kecuali memang ada yang bertanya. Mematikan Privacy Mode (chat @BotFather → `/mybots` → pilih bot ini → *Bot Settings* → *Group Privacy* → *Turn off*) bikin bot membaca -- dan membalas -- setiap pesan layaknya anggota penuh; lakukan itu hanya untuk grup yang memang ingin bot seaktif itu, karena tiap pesan yang dijawabnya memakai kuota subscription bersama deployment ini.
+1. Secara default bot cuma melihat *perintah* (`/status` dll) atau reply ke salah satu pesannya -- itu Privacy Mode bawaan Telegram, AKTIF untuk setiap bot baru, dan itu menyembunyikan chat sehari-hari (termasuk sekadar ketik `@namabot` di tengah kalimat, meski terlihat seperti mention) dari bot sepenuhnya. **Untuk kebanyakan grup, ini yang Anda mau**: nol token terpakai kecuali memang ada yang bertanya. Mematikan Privacy Mode (chat @BotFather → `/mybots` → pilih bot ini → *Bot Settings* → *Group Privacy* → *Turn off*) bikin mention `@namabot` beneran bisa membangunkan bot juga -- bot TIDAK jadi anggota penuh yang baca semua chat, obrolan biasa tetap tidak memakai token; lakukan ini hanya untuk grup yang mau mention-nya berfungsi, bukan cuma reply.
 2. Sesi (`/new`, `/session`) di grup ini *terpisah* dari DM pribadi masing-masing anggota -- aman terisolasi. Tapi `/remember` bersifat *GLOBAL* di semua chat termasuk grup ini -- kalau seseorang me-remember fakta di sini, semua orang di sini (dan di semua chat lain dengan bot ini) bisa melihatnya lewat `/memory`.
 3. Grup ini belum punya akses? Admin tinggal ketik `/registergroup` di sini -- langsung aktif, tanpa perlu restart. (`/unregistergroup` untuk mencabutnya lagi.)
 4. Konfirmasi pakai PIN (`/addserver`, `/update`, dll) di sini memakai PIN milik grup INI kalau sudah diatur (`/setgrouppin`), jadi beberapa perusahaan yang berbagi satu bot tidak perlu berbagi rahasia yang sama -- PIN pribadi owner tetap berlaku di mana pun, sebagai kredensial utama.
@@ -5917,11 +5968,28 @@ async def cmd_agentstatus(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _authorized(update):
         return
+    chat = update.effective_chat
+    mention_span = None
+    if chat and chat.type != "private":
+        # See the "group wake word" note above _group_mention_span -- a group
+        # message that neither replies to the bot nor @-mentions it is
+        # ordinary chatter and must never reach the wizard/server-input
+        # capture below either, not just the model: with Privacy Mode off,
+        # EVERY group message arrives here now, and without this gate an
+        # unrelated message posted while, say, an OAuth code capture is
+        # pending would get treated as that code.
+        mention_span = _group_mention_span(update, context)
+        if mention_span is None and not _is_reply_to_bot(update, context):
+            return
     if await _handle_wizard_input(update, context):
         return
     if await _handle_server_input(update, context):
         return
     text = update.message.text or ""
+    if mention_span is not None:
+        # Drop the "@botname" itself so the model sees a clean question
+        # ("weather today?") rather than the mention as part of the prompt.
+        text = _strip_entity(text, *mention_span).strip()
     if not text.strip():
         return
     await _run_turn(update, context, text)

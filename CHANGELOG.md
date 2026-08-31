@@ -1,5 +1,48 @@
 # Changelog
 
+## v0.2b.37 -- an @mention in a group can now wake the bot up
+
+Asked directly: how to make the bot activate on @mention, not just a reply or
+a command -- and, live testing to answer it, found something worth fixing
+regardless: a plain "@bscloud_agent_bot" typed mid-sentence in a group never
+reached the bot at all, confirmed by tailing the server log in real time
+while it was sent. Only slash commands and replies to the bot's own messages
+were actually getting through -- Telegram's own Privacy Mode does not treat a
+bare mention as an exception, despite it looking like a valid mention in the
+client. Live-tested a third case too (a plain unrelated message, no mention,
+no reply) to rule out the group having simply gone unregistered -- it had
+not; that message also left zero trace.
+
+Getting a real @mention to work at all requires Privacy Mode OFF (BotFather
+-> bot -> Group Privacy -> Turn off), which then forwards every group
+message to the bot instead of just commands and replies. Added the gate that
+used to be Privacy Mode's job back in-app, in `handle_message`, so ordinary
+group chatter still never reaches the wizard/server-input capture or the
+model: a message only proceeds if it replies to the bot's own message, or
+contains a real @mention entity of the bot's username. The @mention itself is
+then stripped out of the text before it reaches the model, so a question
+reads clean rather than carrying "@bscloud_agent_bot" as part of the prompt.
+
+Entity offsets from Telegram are UTF-16 code-unit based, not Python codepoint
+indices -- naive string slicing misaligns whenever a character earlier in the
+message (an emoji, say) sits outside the BMP. `_entity_text`/`_strip_entity`
+round-trip through UTF-16 to get this right, tested against a message with an
+emoji placed deliberately before the mention.
+
+New: `dev/test_group_mention.py`, 16 tests -- entity offset correctness
+(including the emoji case), mention detection (the bot's own username vs.
+someone else's, a real entity vs. a literal "@name" substring Telegram itself
+did not parse as one), reply detection, and the gate end to end through
+`handle_message` (plain chatter dropped, a mention of someone else dropped, a
+real mention processed with the mention stripped, a reply processed
+unconditionally, a private DM never gated). Full suite re-run clean: 156/156
+across 9 files.
+
+Requires a manual step per deployment this code change cannot make for you:
+Privacy Mode must be turned off in BotFather for @mentions to reach the bot
+at all -- replies and commands work either way.
+
+
 ## v0.2b.36 -- a genuinely-accepted sign-in code was reported as rejected
 
 Reported live: the user pasted a code, got "Antigravity (Gemini) tidak
