@@ -1,5 +1,53 @@
 # Changelog
 
+## v0.2b.34 -- the actual root cause: the OAuth URL was silently truncated
+
+The real one, found only after v0.2b.30, v0.2b.32, and v0.2b.33 had each
+fixed something genuine but none of them had fixed THIS: the sign-in URL
+handed to the user was missing its own tail end. Confirmed by having the
+user paste the literal URL they'd tried to open -- it ended mid-word,
+`...cloud-platform+https%`, with `state=` (always the last parameter) never
+appearing at all.
+
+Root cause, confirmed byte for byte on the live server: agy's OAuth URL
+alone runs 500-700+ characters. The tmux pane driving it was 400 columns
+wide, so the URL hard-wraps mid-parameter with no continuation marker.
+`capture-pane -J` is supposed to rejoin a soft-wrapped line back into one --
+it did not, tested explicitly both with and without `-J`, identical
+truncation either way. Near-certain reason: agy's TUI draws its bordered
+panel via cursor-positioned redraws rather than plain sequential character
+output, which is specifically what tmux's own wrap-tracking watches for --
+so tmux never marked this line as wrapped in the first place, and had
+nothing to rejoin.
+
+Every earlier verification in this saga -- including this project's own --
+checked the captured URL contained `"accounts.google.com"` and `"oauth"` as
+substrings and called that a pass. A truncated URL contains both. Every one
+of those checks would have passed against the exact broken URL a real human
+was failing to sign in with.
+
+Fixed at the source: the tmux pane width is now 2000 columns, comfortably
+fitting any realistic OAuth URL on one genuine unwrapped line. Verified live
+against the real binary with a check that actually matters this time -- the
+full URL, ending in a real `state=` value, not a percent-escape cut in half:
+704 characters, complete, confirmed identical across two separate live runs.
+
+Also added, as defense in depth for whatever wrap scenario isn't the one just
+fixed: `wait_for_url()` now refuses a matched URL that ends mid-percent-escape
+(`...%`, `...%3`) rather than trusting it, and keeps polling instead.
+
+12/12 tests in `dev/test_cli_login.py` (up from 9) -- including a rewrite of
+the original "reaches the URL" check from a substring match to checking the
+URL's complete, unbroken shape, since the substring version was itself the
+exact class of false-positive that let this ship undetected three times in a
+row. All fifteen earlier suites (365 tests) re-run with no regressions; 377
+total.
+
+This entire chain -- v0.2b.30 through v0.2b.34 -- exists because a real user
+kept pushing past "should be fixed now" and pasted the actual failing
+artifact each time instead of accepting a plausible-sounding explanation.
+
+
 ## v0.2b.33 -- v0.2b.32's own fix caused a WORSE version of the bug it fixed
 
 v0.2b.32's theory (a bare auto-linked URL is fragile) was correct in spirit

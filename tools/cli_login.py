@@ -28,6 +28,9 @@ from typing import Optional
 # URLs change shape between releases, and a pattern that is too specific fails
 # closed in a way that looks like "login is broken".
 URL_RE = re.compile(r"https://\S+", re.I)
+# A URL ending mid-percent-escape ("...%" or "...%3") is unmistakably cut off,
+# never a real terminator -- see wait_for_url()'s use of this.
+_TRUNCATED_TAIL_RE = re.compile(r"%[0-9A-Fa-f]?$")
 SUCCESS_HINTS = ("logged in", "signed in", "login successful", "authenticated",
                  "you're all set", "success")
 # Antigravity's own startup banner is: "Welcome to the Antigravity CLI. You
@@ -73,9 +76,21 @@ class LoginHandle:
         self._tmux("kill-session", "-t", self.session)
 
     # -- flow -------------------------------------------------------------
+    # Width matters more than it looks: agy's OAuth URL alone regularly runs
+    # 500-600+ characters, and at 400 columns it hard-wraps mid-parameter with
+    # no continuation marker. capture-pane's -J (meant to rejoin a soft-wrapped
+    # line) does NOT undo this -- confirmed live, byte for byte, both with and
+    # without -J -- almost certainly because agy's TUI draws its bordered
+    # panel via cursor-positioned redraws rather than plain sequential output,
+    # which is what tmux's own wrap-tracking actually watches for. So the URL
+    # that reached the user was silently missing everything after the wrap
+    # point: e.g. redirect_uri and scope alone are ~230 characters before the
+    # more distinguishing part of the query string even starts. 2000 columns
+    # comfortably fits any realistic OAuth URL on one real line, sidestepping
+    # the whole rejoin question rather than trying to solve it after the fact.
     def start(self) -> None:
         self.kill()  # a leftover from an abandoned attempt would confuse us
-        self._tmux("new-session", "-d", "-s", self.session, "-x", "400", "-y", "60",
+        self._tmux("new-session", "-d", "-s", self.session, "-x", "2000", "-y", "60",
                    *self.command)
 
     def wait_for_url(self, timeout: int = 45) -> Optional[str]:
@@ -86,6 +101,16 @@ class LoginHandle:
             for candidate in URL_RE.findall(screen):
                 url = candidate.rstrip(").,'\"…")
                 if "oauth" in url.lower() or "auth" in url.lower():
+                    # Defense in depth against the class of bug the 2000-column
+                    # pane width above fixes at the source: a URL cut off
+                    # mid-percent-escape ("...%", "...%3") is unmistakably
+                    # truncated, not a real terminator. Found live: the wide
+                    # pane fixes this specific wrap, but nothing here should
+                    # go on trusting a URL that still looks cut off, from
+                    # whatever cause, rather than silently handing the human a
+                    # broken sign-in link the way this did before.
+                    if _TRUNCATED_TAIL_RE.search(url):
+                        continue
                     return url
             if self.already_done(screen):
                 return None
