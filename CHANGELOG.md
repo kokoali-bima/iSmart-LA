@@ -1,5 +1,43 @@
 # Changelog
 
+## v0.2b.38 -- docs: the re-invite step v0.2b.37 needs to work at all
+
+v0.2b.37 shipped the mention gate but not the one operational step that makes
+it function, and the omission cost a full live debugging round to rediscover:
+**Telegram applies a bot's privacy setting at JOIN time.** Turning Privacy
+Mode off in BotFather does nothing for a group the bot is already in -- that
+group keeps the old setting indefinitely, silently dropping every mention,
+while `getMe` cheerfully reports `can_read_all_group_messages: true`.
+
+Proven rather than assumed: temporary debug logging was added as the very
+first statement of `handle_message`, before `_authorized()` and before the
+new gate, and a mention sent with Privacy Mode already off produced **zero**
+log output -- the message never reached the bot at all, so no in-app gate
+could have been responsible. After removing and re-inviting the bot to the
+same group, the same kind of mention logged normally and ran a full turn.
+
+Captured live in one continuous session, all five in the same group:
+
+- `"apakah anda kenal @robirama93 @bscloud_agent_bot ?"` -> ran, agy OK
+- `"hahaha kita masukin lagi dia"` -> reached the bot, dropped, no model call
+- `"...provinsi NTB? @bscloud_agent_bot"` -> ran, agy OK
+- `"ngerii mini"` -> reached the bot, dropped, no model call
+- `"akhirnya mau dia"` -> reached the bot, dropped, no model call
+
+That is both halves confirmed at once: with Privacy Mode off every message
+now genuinely arrives, and only the mentions cost anything. Two designed
+behaviours also showed up in the real data unprompted -- `@robirama93` and
+`@robi` (other people's mentions) neither woke the bot nor were stripped from
+the question, and the bot's own mention was stripped before the model saw it
+(110-character message -> `prompt_len=93`, exactly the 18-character
+`@bscloud_agent_bot` removed).
+
+Docs only, no behaviour change: README's Group access section and both
+/help texts now carry the remove-and-re-invite step, why it is required, and
+that `/registergroup` does NOT need re-running afterwards (the chat ID and
+any group PIN survive the re-invite).
+
+
 ## v0.2b.37 -- an @mention in a group can now wake the bot up
 
 Asked directly: how to make the bot activate on @mention, not just a reply or
