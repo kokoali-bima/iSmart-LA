@@ -51,6 +51,19 @@ FAILURE_HINTS = ("invalid", "expired", "failed", "error", "denied")
 # menu was just watched forever until the 45s timeout, then reported (via the
 # bug above) as "already signed in" instead of "timed out".
 MENU_HINTS = ("select login method", "use arrow keys")
+# Found live on 10.10.63.11: a code that Google genuinely accepted still got
+# reported to the user as "didn't accept that code -- may have expired".
+# Real cause, captured directly from the server: agy's FIRST launch after a
+# fresh sign-in doesn't land on a "you're signed in" message at all -- it
+# lands on a first-run "Choose your color scheme" wizard (a completely
+# separate, unrelated onboarding step). That screen's own preview pane
+# demonstrates its styling with literal sample lines like "error: compilation
+# failed" and "warning: deprecation warning" -- which matched FAILURE_HINTS
+# ("error", "failed") before SUCCESS_HINTS ever got a chance, so a genuinely
+# accepted code was misreported as rejected, near-instantly, every time.
+# Reaching this screen is only possible once the code was accepted, so it is
+# unambiguous proof of success.
+FIRST_RUN_HINTS = ("choose your color scheme",)
 
 
 @dataclass
@@ -138,6 +151,8 @@ class LoginHandle:
                 pass  # authoritative: not a success, whatever else is on screen
             elif any(h in low for h in SUCCESS_HINTS):
                 return True, screen
+            elif any(h in low for h in FIRST_RUN_HINTS):
+                return True, screen
             elif any(h in low for h in FAILURE_HINTS):
                 return False, screen
             if not self.alive():
@@ -150,7 +165,11 @@ class LoginHandle:
         low = screen.lower()
         if any(h in low for h in NOT_SIGNED_IN_HINTS):
             return False
-        return any(h in low for h in SUCCESS_HINTS)
+        # An already-signed-in agy can still land on the first-run color-scheme
+        # wizard (see FIRST_RUN_HINTS above) instead of printing a URL -- that
+        # screen only exists to appear post-auth, so it counts as "done" here
+        # too, not just in wait_for_result().
+        return any(h in low for h in SUCCESS_HINTS) or any(h in low for h in FIRST_RUN_HINTS)
 
 
 def tmux_available() -> bool:

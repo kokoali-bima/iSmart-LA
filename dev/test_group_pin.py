@@ -17,6 +17,10 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 SRC = sys.argv[1]
+# lite_agent.py does `from cli_login import ...` -- needs tools/ on sys.path
+# too, or every fresh_module() call below fails with ModuleNotFoundError
+# regardless of anything this suite is actually testing.
+sys.path.insert(0, str(Path(SRC).resolve().parent / "tools"))
 
 OWNER = 111
 GROUP_A = -100

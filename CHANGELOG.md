@@ -1,5 +1,46 @@
 # Changelog
 
+## v0.2b.36 -- a genuinely-accepted sign-in code was reported as rejected
+
+Reported live: the user pasted a code, got "Antigravity (Gemini) tidak
+menerima kode itu. Mungkin sudah kedaluwarsa" (didn't accept that code, may
+have expired) -- then said directly "tapi udah login" (but it's already
+signed in). The code had, in fact, been accepted.
+
+Root cause, found by launching the real `agy` binary (already holding a
+valid token) fresh in a scratch tmux session directly on 10.10.63.11: agy's
+first launch right after a fresh sign-in does not print any "signed in"
+message at all. It lands on a one-time "Choose your color scheme" wizard --
+completely unrelated to authentication -- whose own preview pane demonstrates
+its styling with literal sample lines: `error: compilation failed` and
+`warning: deprecation warning`. Those are exactly two of the words in
+`FAILURE_HINTS` (`"invalid", "expired", "failed", "error", "denied"`), and
+nothing recognized the wizard screen for what it was, so it matched
+FAILURE_HINTS before SUCCESS_HINTS ever got a chance -- reporting a
+genuinely-accepted code as rejected, almost instantly, every single time.
+
+The same screen also broke the *other* direction: an already-signed-in agy
+launched by "Ganti Gemini" (tapping to re-check/re-link an account that's
+already fine) lands on the same wizard instead of a URL, so `already_done()`
+didn't recognize it either -- would have shown a confusing "couldn't find a
+sign-in URL" after the full 45s timeout, on an account that was never broken.
+
+Fixed by adding `FIRST_RUN_HINTS = ("choose your color scheme",)` and
+checking it in both `wait_for_result()` (before FAILURE_HINTS) and
+`already_done()` -- reaching that screen is only possible once a code has
+already been accepted, so it counts as unambiguous proof of success.
+
+`dev/test_cli_login.py` gained 3 tests built on the real captured screen text
+(12 -> 15), including a genuine-failure-screen case to confirm the fix
+doesn't swallow real rejections along with the false one. While re-running
+the full suite for this fix, found and fixed an unrelated pre-existing gap:
+`dev/test_group_pin.py` and `dev/test_setscope.py`'s `fresh_module()` copied
+`lite_agent.py` into an isolated scratch dir but never put `tools/` on
+`sys.path`, so both suites had been unable to run at all since `cli_login`
+became an import of `lite_agent.py` (v0.2b.30) -- no behavior changed, only
+the harness's own module resolution. All 8 suites re-run clean: 140/140.
+
+
 ## v0.2b.35 -- /logout could leave /start showing green forever
 
 Reported directly: "seharusnya ketika sudah logout dari gemini/claude status

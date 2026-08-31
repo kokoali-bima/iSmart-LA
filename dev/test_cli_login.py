@@ -34,6 +34,21 @@ it was checking was, coincidentally, complete, and would have passed just as
 happily against the truncated one a real user actually hit. Rewritten to
 check the URL's full, unbroken shape instead of a substring.
 
+A FOURTH bug, found after all three above were fixed and pushed, from a real
+user's report that a code Google had genuinely just accepted was still shown
+as rejected: agy's first launch right after a fresh sign-in doesn't print any
+"signed in" message at all -- it lands on a one-time "Choose your color
+scheme" wizard, whose own preview pane demonstrates its styling with literal
+sample lines like "error: compilation failed" and "warning: deprecation
+warning". Those are exactly two of FAILURE_HINTS's words, and nothing
+recognized the wizard screen for what it was, so it matched FAILURE_HINTS
+before anything else got a chance -- reported as a rejected code, almost
+instantly, every time, even though the code had already been accepted.
+Captured live by launching the real agy binary (already holding a valid
+token) fresh in a scratch tmux session on 10.10.63.11. Fixed by recognizing
+that screen as unambiguous proof of success in both wait_for_result() and
+already_done() -- reaching it is only possible once the code was accepted.
+
 subprocess.run is mocked to replay a scripted tmux pane sequence rather than
 spinning up real tmux -- the actual live end-to-end proof (a real, complete
 OAuth URL reached through the real binary, verified down to the state=
@@ -68,6 +83,24 @@ REAL_URL_SCREEN = (
     "\n After authenticating, copy the code displayed in the browser and paste it below:\n"
 )
 REAL_SUCCESS_SCREEN = "\n Successfully authenticated. Welcome back!\n"
+# Captured live on 10.10.63.11 by launching the real agy binary (already
+# holding a valid, working OAuth token) fresh in a scratch tmux session: this
+# is what actually appeared instead of any "signed in" message -- a one-time
+# first-run color-scheme wizard, whose own preview pane demos its styling
+# with literal sample lines containing "error" and "failed". Those two words
+# are also FAILURE_HINTS, and used to be checked before anything recognized
+# this screen as what it is -- so a code Google had genuinely just accepted
+# was reported to the user as rejected, almost instantly, every single time.
+REAL_FIRST_RUN_SCREEN = (
+    "\nWelcome to Antigravity CLI!\n\n"
+    "Choose your color scheme:        \xb7 you: add a greeting function\n"
+    "  > terminal                     Here's the change:\n"
+    "    light                        \xb7 error: compilation failed\n"
+    "    dark                         \xb7 warning: deprecation warning\n"
+    "    tokyo night\n\n"
+    "    [Next]\n\n"
+    "  ↑/↓ Navigate \xb7 enter Confirm                          Gemini 3.7 Flash \xb7 high\n"
+)
 
 # --- 1. already_done() must not false-positive on the real banner ----------
 check("already_done() is False on the real 'not signed in' banner (THE bug)",
@@ -78,6 +111,9 @@ check("already_done() IS True on a real success screen",
       cl.LoginHandle.already_done(REAL_SUCCESS_SCREEN) is True)
 check("already_done() is False on an empty/blank screen",
       cl.LoginHandle.already_done("") is False)
+check("already_done() IS True on the real first-run color-scheme wizard "
+      "(an already-signed-in agy lands here, not on a 'signed in' message)",
+      cl.LoginHandle.already_done(REAL_FIRST_RUN_SCREEN) is True)
 
 # --- 2. wait_for_url: reaches the URL, sending the menu keypress along the way
 def make_handle(pane_sequence):
@@ -145,6 +181,27 @@ with patch.object(cl.time, "sleep", lambda s: None):  # don't actually wait in t
     h3.wait_for_url(timeout=10)
     check("the menu keypress is sent at most once, not once per poll",
           sum(1 for c in calls3 if c and c[0] == "send-keys") == 1)
+
+    # --- 3. wait_for_result must not be fooled by the wizard's own demo text
+    # THE bug, reproduced directly: the color-scheme preview pane's sample
+    # lines ("error: compilation failed", "warning: deprecation warning")
+    # used to match FAILURE_HINTS before anything recognized the screen for
+    # what it actually is, so a genuinely-accepted code was reported to the
+    # user as rejected -- captured live on 10.10.63.11.
+    h_fr, calls_fr = make_handle([REAL_FIRST_RUN_SCREEN])
+    ok_fr, screen_fr = h_fr.wait_for_result(timeout=10)
+    check("wait_for_result treats the first-run wizard as SUCCESS, not a "
+          "false rejection from its own 'error'/'failed' demo text (THE bug)",
+          ok_fr is True)
+
+    # A screen with a genuine failure word and NO first-run wizard markers
+    # must still be reported as a failure -- the fix must not swallow real
+    # rejections along with the false one.
+    REAL_GENUINE_FAILURE_SCREEN = "\n Error: that code is invalid or has expired.\n"
+    h_gf, _ = make_handle([REAL_GENUINE_FAILURE_SCREEN])
+    ok_gf, _ = h_gf.wait_for_result(timeout=10)
+    check("a real failure screen (no wizard markers) is still reported as a failure",
+          ok_gf is False)
 
 failed = [n for n, ok in results if not ok]
 print(f"\n{len(results) - len(failed)}/{len(results)} passed")

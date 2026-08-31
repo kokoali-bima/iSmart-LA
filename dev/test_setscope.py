@@ -10,6 +10,10 @@ from unittest.mock import AsyncMock
 
 SRC = Path(sys.argv[1])
 REPO = Path(sys.argv[2]) if len(sys.argv) > 2 else SRC.parent
+# lite_agent.py does `from cli_login import ...` -- needs tools/ on sys.path
+# too, or the module load below fails regardless of anything this suite is
+# actually testing.
+sys.path.insert(0, str(REPO / "tools"))
 
 scratch = Path(tempfile.mkdtemp(prefix="isla_scope_"))
 os.environ["HOME"] = str(scratch)
