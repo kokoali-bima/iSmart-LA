@@ -29,8 +29,25 @@ from typing import Optional
 # closed in a way that looks like "login is broken".
 URL_RE = re.compile(r"https://\S+", re.I)
 SUCCESS_HINTS = ("logged in", "signed in", "login successful", "authenticated",
-                 "welcome", "you're all set", "success")
+                 "you're all set", "success")
+# Antigravity's own startup banner is: "Welcome to the Antigravity CLI. You
+# are currently not signed in." -- which contains "signed in" AND (before this
+# was found) "welcome", both SUCCESS_HINTS, on a line that is explicitly
+# saying the opposite. Checked first and wins outright: a screen saying "not
+# signed in" is authoritative regardless of what other words are nearby.
+# Found live: this made /start ALWAYS report success within a couple of
+# seconds without ever reaching a real OAuth flow, for a session that was
+# provably signed out (confirmed separately via a direct, non-interactive
+# agy call returning "authentication required").
+NOT_SIGNED_IN_HINTS = ("not signed in", "not logged in", "currently not")
 FAILURE_HINTS = ("invalid", "expired", "failed", "error", "denied")
+# Antigravity's OAuth flow starts on a "Select login method" menu -- one
+# keypress (Enter, accepting the pre-highlighted default: Google OAuth, which
+# is the entire point of this flow) away from the URL that used to be the
+# very next thing checked for. Nothing sent it that keypress before, so this
+# menu was just watched forever until the 45s timeout, then reported (via the
+# bug above) as "already signed in" instead of "timed out".
+MENU_HINTS = ("select login method", "use arrow keys")
 
 
 @dataclass
@@ -63,6 +80,7 @@ class LoginHandle:
 
     def wait_for_url(self, timeout: int = 45) -> Optional[str]:
         deadline = time.time() + timeout
+        sent_menu_default = False
         while time.time() < deadline:
             screen = self.pane()
             for candidate in URL_RE.findall(screen):
@@ -71,6 +89,12 @@ class LoginHandle:
                     return url
             if self.already_done(screen):
                 return None
+            # A "pick a login method" menu, still needing the one keypress a
+            # human would give it (Enter, taking the pre-highlighted default)
+            # before a URL ever appears. Sent once per attempt.
+            if not sent_menu_default and any(h in screen.lower() for h in MENU_HINTS):
+                self._tmux("send-keys", "-t", self.session, "Enter")
+                sent_menu_default = True
             time.sleep(1)
         return None
 
@@ -85,9 +109,11 @@ class LoginHandle:
         while time.time() < deadline:
             screen = self.pane()
             low = screen.lower()
-            if any(h in low for h in SUCCESS_HINTS):
+            if any(h in low for h in NOT_SIGNED_IN_HINTS):
+                pass  # authoritative: not a success, whatever else is on screen
+            elif any(h in low for h in SUCCESS_HINTS):
                 return True, screen
-            if any(h in low for h in FAILURE_HINTS):
+            elif any(h in low for h in FAILURE_HINTS):
                 return False, screen
             if not self.alive():
                 return True, screen
@@ -97,6 +123,8 @@ class LoginHandle:
     @staticmethod
     def already_done(screen: str) -> bool:
         low = screen.lower()
+        if any(h in low for h in NOT_SIGNED_IN_HINTS):
+            return False
         return any(h in low for h in SUCCESS_HINTS)
 
 

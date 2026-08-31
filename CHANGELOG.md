@@ -1,5 +1,53 @@
 # Changelog
 
+## v0.2b.30 -- the Telegram sign-in flow could report success without ever really signing in
+
+The most serious finding of this project so far. Reported live: "every time
+I run /start, Google shows as already logged in" -- immediately, no URL, no
+code, nothing to approve. Confirmed directly: a raw `agy` call on that same
+deployment returned "authentication required" at the exact same time /start
+was reporting success.
+
+Root cause, found by replaying the real tmux flow live on the affected
+server: Antigravity's own startup banner is *"Welcome to the Antigravity
+CLI. You are currently not signed in."* -- and the code that decides whether
+a sign-in is already done (`LoginHandle.already_done()`) matched on the
+words "welcome" and "signed in" appearing ANYWHERE on screen, with no
+awareness that this exact banner line is saying the opposite. The false
+match fired within the first second or two of every attempt, well before
+agy's actual "pick a login method" menu ever appeared -- so a second, related
+bug (nothing ever sent the one keypress that menu needs to reach a real URL)
+never even got a chance to matter on its own.
+
+Fixed both, and proved it working end to end for real: `already_done()` now
+checks explicitly for "not signed in" / "not logged in" first and treats
+that as authoritative regardless of what other words are nearby; a detected
+login-method menu gets one automatic Enter (the pre-highlighted default,
+Google OAuth -- the entire point of this flow) before continuing to wait for
+the URL. Ran the actual patched code against the real `agy` binary on the
+affected server afterward: it now reaches a genuine
+`https://accounts.google.com/o/oauth2/auth?...` URL instead of a false
+"already signed in".
+
+Also added `/logout` (owner or a registered group's admin, Gemini/Claude/
+Cancel buttons): clears a provider's stored credentials on request, so a
+sign-in that's stuck in whatever state caused this can be given a clean
+slate rather than trusting the (now-fixed, but still worth having an escape
+hatch for) detection logic. Gemini: removes just the OAuth token file,
+nothing else under `~/.gemini/antigravity-cli`. Claude: runs the real,
+documented `claude auth logout` subcommand. Either way, /start's own stale-
+success flag (the one v0.2b.27 already had to teach the reauth notice to
+clear) is cleared too, and the confirmation says plainly what to do next.
+
+24/24 new tests: 9 in `dev/test_cli_login.py` (anchored on the exact real
+banner/menu text captured live -- the false positive, the menu keypress sent
+exactly once, a genuinely-already-signed-in session still resolving
+correctly) and 15 in `dev/test_logout.py` (both providers, the "already
+signed out" case, a failed `claude auth logout` surfaced rather than
+swallowed, permission gating). All fourteen earlier suites (342 tests, plus
+this pair not double-counted) re-run with no regressions; 357 total.
+
+
 ## v0.2b.29 -- /setscope: change what KIND of assistant this is, not just what it manages
 
 Requested after a weather question got politely declined ("out of scope"):

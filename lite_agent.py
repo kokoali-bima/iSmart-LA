@@ -1567,6 +1567,42 @@ def claude_signed_in() -> bool:
         return "claude" in _setup_state()
 
 
+def logout_agy() -> bool:
+    """Remove agy's stored OAuth token, forcing a genuinely fresh sign-in next
+    time. Only that one file -- settings.json (the permissions written at
+    install), conversation history, and everything else under
+    ~/.gemini/antigravity-cli is left alone. Returns False if there was
+    nothing to remove (already signed out)."""
+    token_file = Path.home() / ".gemini" / "antigravity-cli" / "antigravity-oauth-token"
+    if not token_file.exists():
+        return False
+    token_file.unlink()
+    _unmark_setup("agy")
+    logger.warning("agy logged out (OAuth token removed) by request")
+    return True
+
+
+async def logout_claude() -> tuple[bool, str]:
+    """`claude auth logout` is a real, documented subcommand -- unlike login,
+    it needs no TTY, so a plain subprocess call is enough."""
+    if not claude_signed_in():
+        return False, ""
+    try:
+        proc = await asyncio.get_running_loop().run_in_executor(
+            None, lambda: subprocess.run([CLAUDE_BIN, "auth", "logout"],
+                                         capture_output=True, text=True, timeout=30))
+    except Exception as exc:
+        logger.exception("claude auth logout failed to run")
+        return False, str(exc)
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "").strip()[-500:]
+        logger.warning("claude auth logout exited %d: %s", proc.returncode, detail)
+        return False, detail
+    _unmark_setup("claude")
+    logger.warning("claude logged out by request")
+    return True, ""
+
+
 def setup_summary() -> list[tuple[str, bool, str]]:
     """(label, done, hint) for each thing /start can set up."""
     return [
@@ -3245,6 +3281,100 @@ async def cmd_setup_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return
 
 
+async def cmd_logout(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Clear a provider's stored credentials so the next sign-in is genuinely
+    fresh -- the fix for a sign-in that keeps reporting success without a
+    real OAuth exchange ever happening (a stale or broken session), and the
+    way to switch this deployment to a different account."""
+    if not _may_run_setup(update):
+        return
+    lang = _chat_lang(update)
+    if not _is_owner(update) and not await _is_group_admin(update, context):
+        return await update.message.reply_text(_t(lang,
+            "\U0001f512 Bot owner or a group admin only.",
+            "\U0001f512 Cuma pemilik bot atau admin grup.",
+        ))
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton(_t(lang, "Gemini (Antigravity)", "Gemini (Antigravity)"),
+                              callback_data="logout:agy"),
+         InlineKeyboardButton(_t(lang, "Claude Code", "Claude Code"), callback_data="logout:claude")],
+        [InlineKeyboardButton(_t(lang, "✖️ Cancel", "✖️ Batal"),
+                              callback_data="logout:cancel")],
+    ])
+    await update.message.reply_text(_t(lang,
+        "\U0001f513 <b>Log out which one?</b>\n\n"
+        "Clears its stored credentials so the NEXT sign-in is genuinely fresh. "
+        "Use this if a sign-in keeps reporting “already signed in” without you "
+        "actually doing anything, or if you're switching this deployment to a "
+        "different account.",
+        "\U0001f513 <b>Logout yang mana?</b>\n\n"
+        "Menghapus kredensial tersimpannya supaya sign-in BERIKUTNYA benar-benar "
+        "baru. Pakai ini kalau sign-in terus bilang “sudah sign-in” padahal "
+        "Anda tidak melakukan apa-apa, atau kalau mau ganti ke akun lain.",
+    ), reply_markup=kb, parse_mode="HTML")
+
+
+async def cmd_logout_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    lang = _chat_lang(update)
+    if not _may_run_setup(update):
+        await query.answer()
+        return
+    if not _is_owner(update) and not await _is_group_admin(update, context):
+        await query.answer(_t(lang, "Not permitted.", "Tidak diizinkan."), show_alert=True)
+        return
+    await query.answer()
+    _, _, which = query.data.partition(":")
+
+    if which == "cancel":
+        await query.edit_message_text(_t(lang, "✖️ Cancelled.", "✖️ Dibatalkan."))
+        return
+
+    if which == "agy":
+        if logout_agy():
+            await query.edit_message_text(_t(lang,
+                "✅ <b>Logged out of Gemini (Antigravity).</b>\n\n"
+                "Run /start and tap “Change Gemini (Antigravity)” to sign in "
+                "again -- it will now show a real sign-in URL instead of reporting "
+                "success from old state.",
+                "✅ <b>Sudah logout dari Gemini (Antigravity).</b>\n\n"
+                "Jalankan /start lalu tap “Ganti Gemini (Antigravity)” untuk "
+                "sign-in lagi -- sekarang akan tampil URL sign-in sungguhan, bukan "
+                "“sudah sign-in” dari state lama.",
+            ), parse_mode="HTML")
+        else:
+            await query.edit_message_text(_t(lang,
+                "ℹ️ Already signed out -- no stored Gemini credentials found.",
+                "ℹ️ Sudah logout -- tidak ada kredensial Gemini tersimpan.",
+            ))
+        return
+
+    if which == "claude":
+        ok, detail = await logout_claude()
+        if ok:
+            await query.edit_message_text(_t(lang,
+                "✅ <b>Logged out of Claude Code.</b>\n\n"
+                "Run /start and tap “Set up Claude Code” to sign in again.",
+                "✅ <b>Sudah logout dari Claude Code.</b>\n\n"
+                "Jalankan /start lalu tap “Atur Claude Code” untuk sign-in lagi.",
+            ), parse_mode="HTML")
+        elif detail:
+            await query.edit_message_text(_t(lang,
+                f"⚠️ Logout failed:\n<pre>{_tg_escape(detail)}</pre>",
+                f"⚠️ Logout gagal:\n<pre>{_tg_escape(detail)}</pre>",
+            ), parse_mode="HTML")
+        else:
+            await query.edit_message_text(_t(lang,
+                "ℹ️ Already signed out of Claude Code.",
+                "ℹ️ Sudah logout dari Claude Code.",
+            ))
+        return
+
+    logger.error("unknown /logout choice: %s", which)
+    await query.edit_message_text(_t(lang, "⚠️ Internal error: unknown choice.",
+                                          "⚠️ Error internal: pilihan tidak dikenal."))
+
+
 async def _begin_cli_login(update: Update, query, provider: str) -> None:
     """Kick off a provider's OAuth and show the URL."""
     lang = _chat_lang(update)
@@ -3684,6 +3814,7 @@ Every reply ends with a "— by ..." tag. If it's ever NOT "{TIERS[0]['label']}"
 /update — check GitHub for a newer version and install it (PIN)
 /setbrief <what it looks after> — set the one-line environment brief
 /setscope <kind of assistant> — change the role itself, e.g. beyond infrastructure-only
+/logout — clear a sign-in (Gemini or Claude) so the next /start is a genuinely fresh one
 /boundaries — what the agent must never do (0 tokens)
 /addboundary <rule> — add a rule the agent may NEVER break (run it alone to see what that means)
 /rmboundary <n> — remove one (PIN)
@@ -3744,6 +3875,7 @@ Setiap balasan diakhiri tanda "— by ...". Kalau tandanya BUKAN "{TIERS[0]['lab
 /update — cek versi terbaru di GitHub dan pasang (pakai PIN)
 /setbrief <yang diurus> — atur brief lingkungan satu baris
 /setscope <jenis agent> — ubah perannya sendiri, mis. lebih luas dari infrastruktur saja
+/logout — hapus satu sign-in (Gemini atau Claude) supaya /start berikutnya benar-benar baru
 /boundaries — apa yang tidak boleh dilakukan agent (NOL token)
 /addboundary <aturan> — tambah aturan yang TIDAK BOLEH dilanggar agent (ketik sendirian untuk lihat penjelasannya)
 /rmboundary <n> — hapus satu (pakai PIN)
@@ -6037,6 +6169,8 @@ def main() -> None:
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("cancel", cmd_cancel))
     app.add_handler(CallbackQueryHandler(cmd_setup_button, pattern="^setup:"))
+    app.add_handler(CommandHandler("logout", cmd_logout))
+    app.add_handler(CallbackQueryHandler(cmd_logout_button, pattern="^logout:"))
     app.add_handler(CallbackQueryHandler(cmd_start_lang_button, pattern="^startlang:"))
     app.add_handler(CommandHandler("chatid", cmd_chatid))
     app.add_handler(CommandHandler("registergroup", cmd_registergroup))
