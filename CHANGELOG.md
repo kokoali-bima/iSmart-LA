@@ -1,5 +1,31 @@
 # Changelog
 
+## v0.2b.32 -- the sign-in URL was sent as bare text, not a real link
+
+Follow-up to v0.2b.30's fix: with a real OAuth URL now actually reaching the
+chat, sign-in still failed -- Google's own consent screen rejected it
+("Error 400: invalid_request" / "Access blocked"), for every account tried
+(a Workspace account, then a personal Gmail one, both blocked identically),
+never when `agy` is run directly in a real terminal.
+
+The URL was placed as plain text in an HTML-parsed message, relying on
+Telegram's own heuristic to detect and correctly link a bare URL in message
+text -- fragile for one this long, with this many `&`-separated query
+parameters. Replaced with a real `<a href="...">` anchor: the client opens
+(and copies) the href attribute directly, with no auto-detection guessing
+involved.
+
+Verified live, via the real Bot API: sent the exact new construction with a
+realistic OAuth-shaped URL to a real chat, then read back Telegram's own
+`text_link` entity -- its `.url` matched the original byte-for-byte.
+
+6/6 new tests (`dev/test_login_link.py`): a real `<a href>` anchor is
+present (not a bare URL), the href round-trips through HTML-unescaping to
+exactly the original URL, the raw URL never appears unlinked anywhere else
+in the message, and the same holds in both languages. All fifteen earlier
+suites (357 tests) re-run with no regressions; 363 total.
+
+
 ## v0.2b.31 -- replies contained raw LaTeX Telegram can't render
 
 Reported live, with a screenshot: a weather report came back with

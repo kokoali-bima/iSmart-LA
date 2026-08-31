@@ -3426,18 +3426,27 @@ async def _begin_cli_login(update: Update, query, provider: str) -> None:
         "human": human,
         "expires": _dt.datetime.now().timestamp() + WIZARD_TTL_SECONDS,
     }
+    # A bare URL in the message TEXT relies on Telegram's own auto-linkifier to
+    # find and open it correctly -- fragile for a URL this long, with this many
+    # '&'-separated query parameters. A real <a href> anchor is not: the client
+    # opens (and copies) the exact href attribute, correctly decoded, with no
+    # guessing involved. Found live: sign-in failed with Google's own
+    # "Error 400: invalid_request" for every account tried, only through this
+    # bot -- never when agy is run directly in a real terminal, where none of
+    # this rendering exists at all to go wrong.
+    safe_url = _tg_escape(url)
     await query.edit_message_text(_t(lang,
         f"🔗 <b>Sign in to {human}</b>\n\n"
-        "1. Open this on any device:\n"
-        f"{_tg_escape(url)}\n\n"
+        f"1. <a href=\"{safe_url}\">Tap here to open the sign-in page</a> "
+        "(long-press to copy the link if you'd rather open it on another device).\n"
         "2. Approve it, copy the code you get back.\n"
         "3. <b>Send that code here as your next message.</b>\n\n"
         "<i>The code is single-use and expires quickly, which is why it's safe to "
         "paste in chat — unlike a password or an SSH key, which I'll never ask for.</i>\n\n"
         "Send /cancel to stop.",
         f"🔗 <b>Sign in ke {human}</b>\n\n"
-        "1. Buka ini di perangkat mana pun:\n"
-        f"{_tg_escape(url)}\n\n"
+        f"1. <a href=\"{safe_url}\">Tap di sini untuk buka halaman sign-in</a> "
+        "(tekan-tahan untuk salin link kalau mau dibuka di perangkat lain).\n"
         "2. Setujui, salin kode yang muncul.\n"
         "3. <b>Kirim kode itu di sini sebagai pesan berikutnya.</b>\n\n"
         "<i>Kodenya sekali-pakai dan cepat kedaluwarsa, makanya aman ditempel "
