@@ -4,7 +4,7 @@ A lightweight Telegram bridge to **Claude Code** and **Antigravity CLI (agy)**, 
 infrastructure monitoring and investigation -- built to be dramatically cheaper to run
 than a full agent framework, while staying just as capable for real operational work.
 
-> **Status: v0.2b.28 -- early/beta.** Built and battle-tested against a real production
+> **Status: v0.2b.29 -- early/beta.** Built and battle-tested against a real production
 > Proxmox VE cluster over several days of iteration, including a live-fire test of the
 > unlock/PIN/snapshot flow against real infrastructure. Works well; still has known
 > rough edges (see [Known limitations](#known-limitations)).
@@ -201,9 +201,12 @@ Ollama, say), since something has to translate between protocols.
 | `/schedules` | **0 tokens** | Everything that runs on a timer, and what it does |
 | `/unschedule <name>` | owner + DM only | Remove a scheduled task |
 | `/adopt` | owner + DM only | Bring pre-existing cron entries under management |
-| `/setpin` | owner, DM **or group** | Set/change the 6-digit PIN (keypad, never typed in chat) |
+| `/setpin` | owner, DM **or group** | Set/change the OWNER's PIN -- works everywhere |
+| `/setgrouppin` | owner/admin, in that group | Set/change THAT group's own PIN |
+| `/rmgrouppin` | owner/admin, in that group | Remove that group's own PIN, falls back to the owner's |
 | `/update` | owner/admin + PIN | Check GitHub for a newer version and install it |
 | `/setbrief <one line>` | owner/admin | Say what this agent looks after (also the 4th item on `/start`) |
+| `/setscope <phrase>` | owner/admin | Change what KIND of assistant it is, not just what it manages |
 | `/boundaries` | **0 tokens** | What the agent must never do |
 | `/addboundary <rule>` | owner/admin | Add a hard boundary — run it bare for an explanation of what that means |
 | `/rmboundary <n>` | owner/admin + PIN | Remove one |

@@ -1,5 +1,34 @@
 # Changelog
 
+## v0.2b.29 -- /setscope: change what KIND of assistant this is, not just what it manages
+
+Requested after a weather question got politely declined ("out of scope"):
+`/setbrief` only fills in what this deployment looks after -- the "...assistant
+for <role>" part -- never the "You are a(n) infrastructure assistant" framing
+itself, which was hardcoded in the template with no way to touch it short of
+editing SOUL.md/GEMINI.md by hand.
+
+`/setscope <phrase>` (owner or a registered group's admin, same gate as
+/setbrief) rewrites just that phrase -- `/setscope general-purpose, with
+strong infrastructure skills` turns "You are an infrastructure assistant"
+into "You are a general-purpose, with strong infrastructure skills
+assistant", leaving the role, hard boundaries, and everything else in the
+protected zone untouched. Picks "a"/"an" automatically, is fully re-editable
+(not a one-shot placeholder swap like /setbrief's), and the no-args form
+shows the current scope plus a deliberate reminder: broadening this spends
+more of the shared token budget on things that were previously filtered out
+for free, which cuts against the whole reason this project exists over a
+heavier agent framework.
+
+25/25 new tests (`dev/test_setscope.py`) against the real template content:
+first-time set, re-setting it (proving it's not one-shot), interaction with
+/setbrief (each survives the other), the HARD BOUNDARIES / learned-zone
+protections, article selection, permission gating, bilingual text, and the
+refusal path when a brief has been hand-edited away from the template shape
+entirely. All thirteen earlier suites (317 tests) re-run with no
+regressions; 342 total.
+
+
 ## v0.2b.28 -- per-group PINs
 
 Each registered group can now have its own PIN, separate from the owner's --

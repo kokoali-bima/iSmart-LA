@@ -1351,6 +1351,50 @@ def set_brief_role(role: str) -> None:
     logger.warning("environment brief role set: %s", role)
 
 
+# Separate from BRIEF_PLACEHOLDER/set_brief_role above: that controls WHAT this
+# deployment looks after ("...assistant for <role>"); this controls what KIND
+# of assistant it is at all -- the "a(n) <scope>" between "You are" and
+# "assistant". Anchored on that structural phrase, not on the word
+# "infrastructure" itself, so it keeps matching after being changed once
+# already, the same way _BRIEF_ROLE_RE does for the role.
+_BRIEF_SCOPE_RE = re.compile(r"^You are (?:a|an) (.+?) assistant for ", re.MULTILINE)
+
+
+def brief_scope() -> Optional[str]:
+    """The current scope phrase (e.g. "infrastructure"), or None if it can't
+    be found -- an unusual brief that doesn't follow the template's opening
+    sentence at all, not something /setscope can safely touch."""
+    try:
+        text = SYSTEM_PROMPT_FILE.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    m = _BRIEF_SCOPE_RE.search(text)
+    return m.group(1) if m else None
+
+
+def set_brief_scope(scope: str) -> bool:
+    """Rewrite the "You are a(n) <scope> assistant for ..." opening in both
+    briefs. Only that phrase changes -- the role /setbrief sets, the hard
+    boundaries, everything else is untouched. Returns False (writes nothing)
+    if the opening sentence isn't in the expected shape to begin with.
+    """
+    scope = " ".join(scope.split()).rstrip(".")
+    article = "an" if scope[:1].lower() in "aeiou" else "a"
+    replacement = f"You are {article} {scope} assistant for "
+    touched = False
+    for path in (SYSTEM_PROMPT_FILE, GEMINI_PROMPT_FILE):
+        if not path.exists():
+            continue
+        text = path.read_text(encoding="utf-8")
+        text, n = _BRIEF_SCOPE_RE.subn(replacement, text, count=1)
+        if n:
+            path.write_text(text, encoding="utf-8")
+            touched = True
+    if touched:
+        logger.warning("brief scope set: %s", scope)
+    return touched
+
+
 # --------------------------------------------------------------------------
 # Self-update
 # --------------------------------------------------------------------------
@@ -3534,6 +3578,55 @@ async def cmd_setbrief(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     ), parse_mode="HTML")
 
 
+async def cmd_setscope(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Change what KIND of assistant this is -- not what it looks after
+    (/setbrief), the role word itself: "You are a(n) ___ assistant"."""
+    if not _may_run_setup(update):
+        return
+    lang = _chat_lang(update)
+    if not _is_owner(update) and not await _is_group_admin(update, context):
+        return await update.message.reply_text(_t(lang,
+            "\U0001f512 Bot owner or a group admin only.",
+            "\U0001f512 Cuma pemilik bot atau admin grup.",
+        ))
+    scope = " ".join(context.args).strip() if context.args else ""
+    if len(scope) < 3:
+        current = brief_scope()
+        current_note = _t(lang, f"\n\nRight now: {current}", f"\n\nSekarang: {current}") if current else ""
+        return await update.message.reply_text(_t(lang,
+            "\U0001f3af <b>What KIND of assistant should this be?</b>\n\n"
+            "This changes the role itself -- \"You are a(n) ___ assistant\" -- not what "
+            "it looks after, which is /setbrief.\n\n"
+            "<code>/setscope infrastructure</code> (the default)\n"
+            "<code>/setscope general-purpose, with strong infrastructure skills</code>\n\n"
+            "<i>Broadening this means it will also try to help with things that have "
+            "nothing to do with infrastructure -- weigh that against the token-efficiency "
+            "this project is built around.</i>" + current_note,
+
+            "\U0001f3af <b>Ini agent jenis apa?</b>\n\n"
+            "Ini mengubah perannya sendiri -- \"You are a(n) ___ assistant\" -- bukan apa "
+            "yang diurusnya, itu /setbrief.\n\n"
+            "<code>/setscope infrastructure</code> (bawaan)\n"
+            "<code>/setscope general-purpose, with strong infrastructure skills</code>\n\n"
+            "<i>Memperluas ini artinya dia juga akan mencoba membantu hal yang sama sekali "
+            "tidak berhubungan dengan infrastruktur -- pertimbangkan itu terhadap prinsip "
+            "efisiensi token yang jadi dasar proyek ini.</i>" + current_note,
+        ), parse_mode="HTML")
+    if not set_brief_scope(scope):
+        return await update.message.reply_text(_t(lang,
+            "\u26a0\ufe0f Couldn't find the opening sentence to rewrite in the brief -- "
+            "it may have been hand-edited away from the template shape. Nothing changed.",
+            "\u26a0\ufe0f Tidak ketemu kalimat pembuka yang bisa diubah di brief -- "
+            "mungkin sudah diedit manual dan bentuknya beda dari template. Tidak ada yang diubah.",
+        ))
+    await update.message.reply_text(_t(lang,
+        f"\u2705 <b>Recorded.</b> This is now a(n) <b>{_tg_escape(scope)}</b> assistant.\n\n"
+        "<i>Takes effect on the next new conversation -- /new applies it now.</i>",
+        f"\u2705 <b>Tercatat.</b> Sekarang jadi agent <b>{_tg_escape(scope)}</b>.\n\n"
+        "<i>Berlaku di percakapan baru berikutnya -- /new untuk langsung terapkan.</i>",
+    ), parse_mode="HTML")
+
+
 async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _authorized(update):
         return
@@ -3590,6 +3683,7 @@ Every reply ends with a "— by ..." tag. If it's ever NOT "{TIERS[0]['label']}"
 /rmgrouppin — remove this group's own PIN, falls back to the owner's (owner or this group's admin)
 /update — check GitHub for a newer version and install it (PIN)
 /setbrief <what it looks after> — set the one-line environment brief
+/setscope <kind of assistant> — change the role itself, e.g. beyond infrastructure-only
 /boundaries — what the agent must never do (0 tokens)
 /addboundary <rule> — add a rule the agent may NEVER break (run it alone to see what that means)
 /rmboundary <n> — remove one (PIN)
@@ -3649,6 +3743,7 @@ Setiap balasan diakhiri tanda "— by ...". Kalau tandanya BUKAN "{TIERS[0]['lab
 /rmgrouppin — hapus PIN grup ini, kembali pakai PIN owner (owner atau admin grup ini)
 /update — cek versi terbaru di GitHub dan pasang (pakai PIN)
 /setbrief <yang diurus> — atur brief lingkungan satu baris
+/setscope <jenis agent> — ubah perannya sendiri, mis. lebih luas dari infrastruktur saja
 /boundaries — apa yang tidak boleh dilakukan agent (NOL token)
 /addboundary <aturan> — tambah aturan yang TIDAK BOLEH dilanggar agent (ketik sendirian untuk lihat penjelasannya)
 /rmboundary <n> — hapus satu (pakai PIN)
@@ -5964,6 +6059,7 @@ def main() -> None:
     app.add_handler(CommandHandler("update", cmd_update))
     app.add_handler(CallbackQueryHandler(cmd_update_button, pattern="^upd:"))
     app.add_handler(CommandHandler("setbrief", cmd_setbrief))
+    app.add_handler(CommandHandler("setscope", cmd_setscope))
     app.add_handler(CommandHandler("addboundary", cmd_addboundary))
     app.add_handler(CommandHandler("rmboundary", cmd_rmboundary))
     app.add_handler(CommandHandler("snapshots", cmd_snapshots))
