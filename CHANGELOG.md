@@ -1,5 +1,46 @@
 # Changelog
 
+## v0.2b.33 -- v0.2b.32's own fix caused a WORSE version of the bug it fixed
+
+v0.2b.32's theory (a bare auto-linked URL is fragile) was correct in spirit
+but wrong in fix: switching to a real `<a href>` anchor did not solve
+anything -- it introduced a new, more damaging failure. Confirmed with the
+actual broken URL pasted from a real failed attempt: `redirect_uri` had gone
+from `...%3A%2F%2F...` to `...%253A%252F%2F...` -- the literal `%` character
+itself got percent-encoded AGAIN (`%` -> `%25`) somewhere between the anchor
+being sent and the browser opening it. An already-percent-encoded URL,
+percent-encoded a second time, no longer matches any redirect_uri Google has
+registered for the client -- hence "Error 400: invalid_request", identical
+for three different Google accounts across two account types, something no
+amount of trying a different account could ever have fixed.
+
+Both the v0.2b.29-and-earlier bare-auto-link and the v0.2b.32 `<a href>`
+approach ultimately hand the exact same string to the same platform
+"launch this URL" call when tapped -- that call is where the double-encoding
+happened, on at least one real Telegram client, and tapping either
+construct hits it.
+
+Sidestepped entirely rather than fixed at its root (which would need
+knowing which specific client build does this and why): the URL now goes
+inside a `<code>` block, with the instructions changed from "tap to open" to
+"copy this, then paste it into a browser yourself". Telegram treats a code
+block as literal text to copy, not a link to launch -- it never enters the
+vulnerable code path at all. Confirmed live via the real Bot API that the
+raw message text Telegram stored contains the URL completely unmodified.
+
+Also a live case study in the value of pushing every self-reported "it's
+fixed" claim: v0.2b.30's real fix (a genuine OAuth URL reaching the user at
+all) got credited with solving a problem it had only partly solved, and
+v0.2b.32 shipped on a plausible-sounding but unverified theory about WHY the
+remaining failure was happening. Only pasting the actual failed URL settled
+it.
+
+8/8 tests in `dev/test_login_link.py` rewritten for the new shape, including
+an explicit regression guard that fails if an `<a href>` construct is ever
+reintroduced. All fifteen earlier suites (357 tests, `dev/test_cli_login.py`
+run separately as it needs no server) re-run with no regressions; 374 total.
+
+
 ## v0.2b.32 -- the sign-in URL was sent as bare text, not a real link
 
 Follow-up to v0.2b.30's fix: with a real OAuth URL now actually reaching the

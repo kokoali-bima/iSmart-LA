@@ -1,16 +1,29 @@
 #!/usr/bin/env python3
-"""Test for the OAuth sign-in URL being sent as a proper <a href> anchor,
-not bare text relying on Telegram's own auto-linkifier -- found live: sign-in
-failed with Google's "Error 400: invalid_request" for every account tried,
-only through this bot, never running agy directly in a real terminal where
-none of this HTML rendering exists to go wrong. A real anchor's href is what
-the client actually opens/copies verbatim; a bare URL in message text is a
-heuristic Telegram applies to what it thinks looks like a link.
+"""Test for how the OAuth sign-in URL is presented.
 
-Verified independently, live, via the real Bot API (not part of this
-automated suite): sending this exact <a href> construction with a realistic
-OAuth-shaped URL (many '&'-joined params) came back with a text_link entity
-whose .url matched the original byte-for-byte.
+History, in order, each disproven by the next real attempt:
+  v0.2b.29 and earlier: bare URL in message text, relying on Telegram's own
+    auto-linkifier. Never actually reached (LoginHandle.already_done() false-
+    positived on agy's own "Welcome... you are currently not signed in"
+    banner before a URL was ever found -- fixed in v0.2b.30).
+  v0.2b.32: switched to a real <a href> anchor, theorizing the bare-URL
+    auto-linkifier was the fragile part. WRONG theory: with the real broken
+    URL in hand from a live failure, redirect_uri had gone from ...%3A%2F%2F...
+    to ...%253A%252F%2F... -- the literal "%" character itself re-escaped to
+    "%25", i.e. an already-percent-encoded URL got percent-encoded AGAIN when
+    at least one real Telegram client launched a browser from a tapped <a
+    href>. Google's OAuth server correctly rejects that as invalid_request:
+    it no longer matches any registered redirect_uri.
+
+Current (this version): the URL goes inside a <code> block instead. Telegram
+treats code-block content as literal text to COPY, not a link to open --
+sidestepping the "launch a URL" platform call that both earlier approaches
+funneled through (a bare auto-linked URL and an explicit anchor tap the same
+underlying mechanism). This test can't reproduce a specific client's launch-
+time re-encoding bug (that needs a real device, and was), so it verifies what
+IS testable here: no launchable link construct is present at all, the raw URL
+inside the <code> block is exactly the original once HTML-unescaped, and it
+appears nowhere else unlinked/differently-formed in the message.
 """
 import asyncio, importlib.util, os, re, sys, tempfile
 from pathlib import Path
@@ -35,6 +48,8 @@ def check(name, cond):
     results.append((name, bool(cond)))
     print(("PASS" if cond else "FAIL"), "-", name)
 
+# The exact shape of a real agy OAuth URL -- long, several '&'-joined params,
+# already percent-encoded (redirect_uri and scope both contain %3A/%2F).
 REALISTIC_URL = (
     "https://accounts.google.com/o/oauth2/auth?access_type=offline&client_id=X"
     "&code_challenge=Y&code_challenge_method=S256&prompt=consent"
@@ -53,47 +68,56 @@ def qupd():
 def html_unescape(s: str) -> str:
     return s.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">")
 
-async def main():
+async def run_login(provider: str, lang: str | None = None):
+    if lang:
+        mod._write_chat_languages({str(OWNER): lang})
     upd, query = qupd()
     with patch.object(mod, "tmux_available", return_value=True), \
          patch.object(mod, "LoginHandle") as LH:
         handle = LH.return_value
         handle.start = lambda: None
         handle.wait_for_url = lambda timeout=45: REALISTIC_URL
-        await mod._begin_cli_login(upd, query, "agy")
+        await mod._begin_cli_login(upd, query, provider)
+    if lang:
+        mod._write_chat_languages({})
+    return query.edit_message_text.call_args
 
-    final_call = query.edit_message_text.call_args
-    text = final_call[0][0]
-    check("the message uses parse_mode=HTML",
-          final_call[1].get("parse_mode") == "HTML")
+async def main():
+    call = await run_login("agy")
+    text = call[0][0]
 
-    m = re.search(r'<a href="(.*?)">', text, re.DOTALL)
-    check("the message contains a real <a href=...> anchor, not a bare URL", m is not None)
+    check("the message uses parse_mode=HTML", call[1].get("parse_mode") == "HTML")
+
+    # Regression guard: never go back to a launchable <a href> construct --
+    # that specific shape is what triggered the double-encoding bug.
+    check("no <a href> anchor is used (that path double-encoded on a real client)",
+          "<a href" not in text.lower())
+
+    m = re.search(r"<code>(.*?)</code>", text, re.DOTALL)
+    check("the URL is presented inside a <code> block", m is not None)
     if m:
-        href = html_unescape(m.group(1))
-        check("the anchor's href, once HTML-unescaped, matches the real URL exactly",
-              href == REALISTIC_URL)
-        check("nothing else in the message repeats the raw bare URL "
-              "(no second, unlinked copy that could be tapped/copied by mistake)",
-              text.count(REALISTIC_URL) == 0)  # only ever appears HTML-escaped, inside the href
+        recovered = html_unescape(m.group(1))
+        check("the <code> block content, HTML-unescaped, is exactly the real URL",
+              recovered == REALISTIC_URL)
 
-    check("the link text itself is human-readable, not the raw URL as link text",
-          "Tap here" in text or "Tap di sini" in text)
+    check("instructs copying, not tapping to open",
+          "copy" in text.lower() or "salin" in text.lower())
+    check("warns that tapping/opening directly can mangle the URL",
+          "mangle" in text.lower() or "merusak" in text.lower())
 
-    # Bilingual: same structural guarantee in Indonesian.
-    mod._write_chat_languages({str(OWNER): "id"})
-    upd2, query2 = qupd()
-    with patch.object(mod, "tmux_available", return_value=True), \
-         patch.object(mod, "LoginHandle") as LH2:
-        handle2 = LH2.return_value
-        handle2.start = lambda: None
-        handle2.wait_for_url = lambda timeout=45: REALISTIC_URL
-        await mod._begin_cli_login(upd2, query2, "claude")
-    text2 = query2.edit_message_text.call_args[0][0]
-    m2 = re.search(r'<a href="(.*?)">', text2, re.DOTALL)
-    check("[ID] claude sign-in also uses a real anchor",
-          m2 is not None and html_unescape(m2.group(1)) == REALISTIC_URL)
-    mod._write_chat_languages({})
+    # The raw URL must not additionally appear somewhere else in a form that
+    # would still be tappable (only inside the one escaped <code> block).
+    escaped = mod._tg_escape(REALISTIC_URL)
+    check("the escaped URL appears exactly once (only inside the <code> block)",
+          text.count(escaped) == 1)
+
+    # Bilingual: same structural guarantee in Indonesian, other provider.
+    call2 = await run_login("claude", lang="id")
+    text2 = call2[0][0]
+    m2 = re.search(r"<code>(.*?)</code>", text2, re.DOTALL)
+    check("[ID] claude sign-in also uses a <code> block, no <a href>",
+          m2 is not None and "<a href" not in text2.lower()
+          and html_unescape(m2.group(1)) == REALISTIC_URL)
 
     failed = [n for n, ok in results if not ok]
     print(f"\n{len(results) - len(failed)}/{len(results)} passed")

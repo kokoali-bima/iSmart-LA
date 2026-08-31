@@ -3427,30 +3427,38 @@ async def _begin_cli_login(update: Update, query, provider: str) -> None:
         "expires": _dt.datetime.now().timestamp() + WIZARD_TTL_SECONDS,
     }
     # A bare URL in the message TEXT relies on Telegram's own auto-linkifier to
-    # find and open it correctly -- fragile for a URL this long, with this many
-    # '&'-separated query parameters. A real <a href> anchor is not: the client
-    # opens (and copies) the exact href attribute, correctly decoded, with no
-    # guessing involved. Found live: sign-in failed with Google's own
-    # "Error 400: invalid_request" for every account tried, only through this
-    # bot -- never when agy is run directly in a real terminal, where none of
-    # this rendering exists at all to go wrong.
+    # find and open it correctly (v0.2b.32 tried a real <a href> anchor instead
+    # -- ALSO wrong: found live, with the exact broken URL in hand, that at
+    # least one real Telegram client double-percent-encodes an already-encoded
+    # href when the user taps it to launch a browser (redirect_uri went from
+    # ...%3A%2F%2F... to ...%253A%252F%2F..., i.e. the literal "%" itself got
+    # re-escaped to "%25"), which Google's OAuth server correctly rejects as
+    # invalid_request since it no longer matches any registered redirect_uri).
+    # Both a bare auto-linked URL and an <a href> ultimately hand the same
+    # string to the same "launch this URL" platform call -- tapping either is
+    # the vulnerable path. A <code> block sidesteps it entirely: Telegram
+    # treats it as literal text to COPY, not a link to open, so what reaches
+    # the clipboard -- and then the browser's own address bar, pasted by the
+    # human -- is the untouched, single-encoded string agy actually printed.
     safe_url = _tg_escape(url)
     await query.edit_message_text(_t(lang,
         f"🔗 <b>Sign in to {human}</b>\n\n"
-        f"1. <a href=\"{safe_url}\">Tap here to open the sign-in page</a> "
-        "(long-press to copy the link if you'd rather open it on another device).\n"
+        f"1. Copy this link (tap it to copy) and open it in a browser:\n<code>{safe_url}</code>\n\n"
         "2. Approve it, copy the code you get back.\n"
         "3. <b>Send that code here as your next message.</b>\n\n"
         "<i>The code is single-use and expires quickly, which is why it's safe to "
-        "paste in chat — unlike a password or an SSH key, which I'll never ask for.</i>\n\n"
+        "paste in chat — unlike a password or an SSH key, which I'll never ask for. "
+        "Copy the link rather than tapping to open it directly -- some Telegram clients "
+        "mangle a long URL when launching a browser straight from a tap.</i>\n\n"
         "Send /cancel to stop.",
         f"🔗 <b>Sign in ke {human}</b>\n\n"
-        f"1. <a href=\"{safe_url}\">Tap di sini untuk buka halaman sign-in</a> "
-        "(tekan-tahan untuk salin link kalau mau dibuka di perangkat lain).\n"
+        f"1. Salin link ini (tap untuk menyalin) dan buka di browser:\n<code>{safe_url}</code>\n\n"
         "2. Setujui, salin kode yang muncul.\n"
         "3. <b>Kirim kode itu di sini sebagai pesan berikutnya.</b>\n\n"
         "<i>Kodenya sekali-pakai dan cepat kedaluwarsa, makanya aman ditempel "
-        "di chat — beda dengan password atau SSH key, yang tidak akan pernah saya minta.</i>\n\n"
+        "di chat — beda dengan password atau SSH key, yang tidak akan pernah saya minta. "
+        "Salin link-nya, jangan langsung tap untuk membuka -- beberapa client Telegram "
+        "merusak URL panjang saat membuka browser langsung dari tap.</i>\n\n"
         "Kirim /cancel untuk berhenti.",
     ), parse_mode="HTML", disable_web_page_preview=True)
 
