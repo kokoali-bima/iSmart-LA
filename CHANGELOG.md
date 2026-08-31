@@ -1,5 +1,39 @@
 # Changelog
 
+## v0.2b.26 -- a dead Gemini session was invisible until someone happened to notice
+
+Found live: bscloud's Antigravity (Gemini) sign-in had quietly died -- every
+reply was actually coming from the Claude fallback, silently, for hours,
+discovered only because the operator was watching closely. `agy_signed_in()`
+can't catch this by design (it checks the filesystem, or a permanent
+`setup_state.json` flag from whenever /start's sign-in last reported success
+-- neither ever re-validates), and nothing else was watching either.
+
+Root cause of *why* it dies unevenly: agy's OAuth session apparently needs
+actual use to keep renewing. VM175 (constant real traffic) has a token file
+touched within the hour; bscloud (freshly installed, still light use) had no
+token file at all. An idle deployment can lose it where a busy one doesn't --
+worth knowing, not yet fully explained (Antigravity's own token lifetime
+isn't something this project controls or has documented specs for).
+
+Now: each tier-chain failure is checked for the OAuth-relogin signature (agy
+gets stuck offering an authorize URL it can't complete non-interactively --
+the URL survives into the captured stderr tail even though the interactive
+prompt text itself never reaches it, going straight to agy's controlling
+terminal instead of the pipe this reads). On a match, the chat that hit it
+gets a one-time notice -- reply still comes through via Claude, but here's
+why, and here's the fix (/start, then Change Gemini). At most once an hour
+while it stays broken (`AGY_REAUTH_NOTICE_COOLDOWN_HOURS`), and reset the
+moment a real agy success happens, so a later, genuinely new outage isn't
+left waiting out a stale cooldown from one that already resolved.
+
+9/9 new tests (`dev/test_reauth_notice.py`), including detection against the
+EXACT failure line captured from bscloud's own log, plus the cases that must
+NOT fire (an ordinary network failover, a claude-side failure, success) and
+the cooldown/reset behavior. All eleven earlier suites (270 tests) re-run
+with no regressions; 279 total.
+
+
 ## v0.2b.25 -- /update's PIN dead-ended in a group for an already-vetted admin
 
 Reported live: a group admin ran `/update`, reached the PIN keypad (its own

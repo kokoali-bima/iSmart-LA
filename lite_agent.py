@@ -1902,6 +1902,34 @@ def _note_tier_success(model: str) -> None:
         _tier_cooldown.pop(model, None)
 
 
+# Antigravity's OAuth session can expire between actual uses without agy_signed_in()
+# ever noticing (that check is filesystem-based, see its own docstring) -- so an
+# idle deployment can sit "signed in" on the setup card while every real gemini
+# call quietly fails over to Claude. Detected from the tier chain's own failure
+# log: when this happens, agy's stderr carries the OAuth authorize URL it's stuck
+# waiting on. The prompt text ("Waiting for authentication...") itself never
+# reaches this -- it goes straight to agy's controlling terminal, not the pipe
+# _run_agy_once() reads -- but the URL survives into the captured stderr tail.
+_AGY_REAUTH_MARKERS = ("accounts.google.com", "oauth", "googleapis.com/auth", "googleapis.com%2fauth")
+
+
+def _agy_attempt_needs_reauth(attempts: list[str]) -> bool:
+    for line in attempts:
+        if line.startswith("agy:") and "FAILED" in line:
+            low = line.lower()
+            if any(marker in low for marker in _AGY_REAUTH_MARKERS):
+                return True
+    return False
+
+
+# How often to say something again while it stays broken -- once per real
+# message that hits it, not a timer, and reset the moment agy actually
+# succeeds again so a NEW outage is never left waiting out a stale cooldown
+# from one that already resolved.
+AGY_REAUTH_NOTICE_COOLDOWN_HOURS = float(os.environ.get("AGY_REAUTH_NOTICE_COOLDOWN_HOURS", "1"))
+_agy_reauth_last_notice: float = 0.0
+
+
 def _run_agy_once(prompt: str, model: str, conversation_id: Optional[str],
                   timeout: Optional[int] = None, print_timeout: Optional[str] = None) -> dict:
     cmd = [
@@ -2011,6 +2039,8 @@ def run_combo(prompt: str, sess: dict, session_name: str,
                 attempts.append(f"agy:{model} OK ({usage.get('total_tokens', '?')} tok)")
                 agy_convs[model] = parsed.get("conversation_id")
                 _note_tier_success(model)
+                global _agy_reauth_last_notice
+                _agy_reauth_last_notice = 0.0  # a real success -- the next outage is a fresh one
                 return _normalize_agy_result(parsed), model, attempts
 
             result = run_claude(prompt, claude_sessions.get(model), session_name, model)
@@ -5451,6 +5481,34 @@ async def _run_turn(update: Update, context: ContextTypes.DEFAULT_TYPE, text: st
         logger.exception("combo run failed")
         await update.message.reply_text(_t(lang, f"⚠️ Error: {exc}", f"⚠️ Error: {exc}"))
         return
+
+    # Gemini's own session can die silently between turns (see
+    # _agy_attempt_needs_reauth) -- the chain already failed over to Claude for
+    # THIS reply, so say something rather than let every future turn quietly
+    # cost more until someone happens to notice on their own.
+    if _agy_attempt_needs_reauth(attempts):
+        global _agy_reauth_last_notice
+        now = _dt.datetime.now().timestamp()
+        if now - _agy_reauth_last_notice > AGY_REAUTH_NOTICE_COOLDOWN_HOURS * 3600:
+            _agy_reauth_last_notice = now
+            target = _msg(update)
+            if target is not None:
+                try:
+                    await target.reply_text(_t(lang,
+                        "⚠️ <b>Gemini (Antigravity) is signed out.</b>\n\n"
+                        "Replies are still coming through -- just from the Claude "
+                        "fallback instead, which spends more of this deployment's "
+                        "shared quota than the usual tiers.\n\n"
+                        "Fix: send /start and tap “Change Gemini (Antigravity)” "
+                        "to sign in again.",
+                        "⚠️ <b>Gemini (Antigravity) sudah logout.</b>\n\n"
+                        "Balasan tetap jalan -- cuma lewat fallback Claude, yang lebih "
+                        "boros kuota bersama deployment ini dibanding tier biasa.\n\n"
+                        "Perbaikan: kirim /start lalu tap “Ganti Gemini "
+                        "(Antigravity)” untuk sign-in ulang.",
+                    ), parse_mode="HTML")
+                except Exception:
+                    logger.warning("could not deliver the Gemini re-auth notice", exc_info=True)
 
     # re-load in case /session or /remember ran concurrently -- unlikely with
     # single-user polling, but avoid clobbering another chat's write.
