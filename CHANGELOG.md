@@ -1,5 +1,51 @@
 # Changelog
 
+## v0.2b.44 -- securing a host must not lock the agent out of it
+
+Follow-up to v0.2b.43, and a bug in v0.2b.43 itself, found while confirming
+what the operator actually wants from this agent: full maintenance capability
+-- create, change, delete -- gated by verification rather than removed.
+
+That IS the design (locked by default, /unlock opens an unrestricted key after
+a PIN, the original request then resumes on its own), and v0.2b.43 made it
+real. But it retired the old unrestricted key inside secure_server(), while
+`~/.ssh/config` still pointed at that very key: `_rebuild_ssh_config()` only
+ever runs when a server is added or removed, never at startup. So on an
+existing deployment the sequence would have been:
+
+  1. the guard installs and verifies -- fine
+  2. the legacy key is deleted from the node
+  3. ~/.ssh/config is still pointing at the legacy key
+  4. the agent can no longer reach the host it just secured
+
+The same gap also made lock/unlock cosmetic there: /unlock swaps the
+`agent_active` symlink, and nothing was using it.
+
+Fixed by splitting the steps and ordering them properly. `secure_server()` now
+installs and verifies only. `cmd_secure()` then rebuilds `~/.ssh/config` to
+point at the active-key symlink -- which is also what finally makes
+lock/unlock swap the credential actually in use -- and only after that calls
+the new `retire_legacy_key()` per host that verified.
+
+Also worth stating plainly, because "read-only guard" reads like a
+restriction and is not one: the guard applies to the read-only key only. After
+/unlock the agent holds an unrestricted key and can create, change and delete
+normally until the window closes by itself. What the guard removes is the
+ability for a *sentence* to be sufficient -- the credential for a change only
+exists after a human confirms on the PIN keypad, which no prompt, log line or
+group message can reach. `/secure`'s report now says this outright.
+
+The one remaining piece from the incident is also explained by v0.2b.43's
+finding: `write_mode_notice()` returns an empty string when the keys are
+missing, so the model was never told the protocol at all -- no instruction to
+emit NEEDS_WRITE:, no mention of a button. It invented one. With the keys
+present it is told, every turn, in whichever mode it is in.
+
+`dev/test_node_guard.py`: 17 -> 21 tests, covering that a fully successful
+secure_server() still does NOT retire the old key, and that retire_legacy_key()
+is the separate later step that does. Full suite: 223/223 across 14 files.
+
+
 ## v0.2b.43 -- the write gate was never actually installed
 
 A live incident, reproduced deliberately by the operator to test exactly this.

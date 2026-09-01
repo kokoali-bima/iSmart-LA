@@ -156,6 +156,39 @@ if HAVE_KEYGEN:
           "(a wrong order here locks the operator out of their own node)",
           not any("sed -i" in c for c in calls))
 
+    # Retiring is a SEPARATE step on purpose. Until ~/.ssh/config points at the
+    # active-key symlink, the legacy key is still the credential actually in
+    # use -- removing it from a node inside secure_server() would lock the
+    # agent out of the very host it had just secured.
+    def all_good(key, host, user, port, cmd, timeout=30):
+        calls.append(cmd)
+        if "ISMART_ADMIN_OK" in cmd:
+            return proc(stdout="ISMART_ADMIN_OK\n")
+        if "ISMART_GUARD_INSTALLED" in cmd:
+            return proc(stdout="ISMART_GUARD_INSTALLED\n")
+        if "hostname" in cmd:
+            return proc(stdout="node1\n")
+        return proc(stderr=GUARD_MSG, rc=126)
+
+    calls.clear()
+    with patch.object(mod, "_ssh_as", side_effect=all_good):
+        ok, detail = mod.secure_server("h", "root", 22)
+    check("a fully successful secure_server still does NOT retire the old key "
+          "(that waits until ~/.ssh/config has been flipped)",
+          ok is True and not any("sed -i" in c for c in calls))
+    check("retire_legacy_key exists as the separate, later step",
+          callable(getattr(mod, "retire_legacy_key", None)))
+
+    calls.clear()
+    def retire_ok(key, host, user, port, cmd, timeout=30):
+        calls.append(cmd)
+        return proc(stdout="LEGACY_KEY_REMOVED\n")
+    with patch.object(mod, "_ssh_as", side_effect=retire_ok):
+        check("retire_legacy_key reports success when the old key was removed",
+              mod.retire_legacy_key("h", "root", 22) is True)
+    check("...and it is the step that actually edits authorized_keys",
+          any("sed -i" in c for c in calls))
+
 failed = [n for n, ok in results if not ok]
 print(f"\n{len(results) - len(failed)}/{len(results)} passed")
 if failed:

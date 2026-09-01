@@ -1412,12 +1412,13 @@ def verify_node_guard(host: str, user: str, port: int) -> tuple[bool, str]:
 
 
 def secure_server(host: str, user: str, port: int) -> tuple[bool, str]:
-    """Install the guard, verify it bites, then retire the legacy open key.
+    """Install the guard and prove it refuses a write. Nothing is retired here.
 
-    The ordering is deliberate: the unrestricted key that predates this feature
-    is removed only AFTER the replacement is proven to work, so a failure
-    anywhere leaves the operator with working access rather than a locked-out
-    node.
+    Retiring the old unrestricted key is deliberately NOT part of this: until
+    ~/.ssh/config points at the active-key symlink, that legacy key is still
+    the credential the agent actually uses, and deleting it from a node would
+    lock the agent out of the very host it just secured. cmd_secure() does the
+    retirement pass afterwards, once the config has been flipped.
     """
     ok, detail = install_node_guard(host, user, port)
     if not ok:
@@ -1425,7 +1426,16 @@ def secure_server(host: str, user: str, port: int) -> tuple[bool, str]:
     ok, detail = verify_node_guard(host, user, port)
     if not ok:
         return False, "verification failed: " + detail
-    removed = ""
+    return True, detail
+
+
+def retire_legacy_key(host: str, user: str, port: int) -> bool:
+    """Drop the pre-guard unrestricted key from a host's authorized_keys.
+
+    Only safe once BOTH are true: the replacement keys verify on that host,
+    and ~/.ssh/config here points at the active-key symlink rather than the
+    legacy key. cmd_secure() enforces that order.
+    """
     try:
         cleanup = _ssh_as(
             SSH_RW_KEY, host, user, port,
@@ -1433,11 +1443,11 @@ def secure_server(host: str, user: str, port: int) -> tuple[bool, str]:
             f"sed -i '/{LEGACY_KEY_COMMENT}/d' ~/.ssh/authorized_keys && "
             "echo LEGACY_KEY_REMOVED; fi")
         if "LEGACY_KEY_REMOVED" in cleanup.stdout:
-            removed = "; retired the old unrestricted key"
-            logger.warning("removed the legacy unrestricted agent key on %s", host)
+            logger.warning("retired the legacy unrestricted agent key on %s", host)
+            return True
     except Exception:
-        logger.warning("could not check for a legacy key on %s", host, exc_info=True)
-    return True, detail + removed
+        logger.warning("could not retire the legacy key on %s", host, exc_info=True)
+    return False
 
 
 def blocked_by_readonly(result_text: str, attempts: list[str]) -> bool:
@@ -3446,7 +3456,8 @@ async def cmd_secure(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         "\U0001f512 Securing every configured host\u2026",
         "\U0001f512 Mengamankan semua host terdaftar\u2026"))
     loop = asyncio.get_running_loop()
-    lines = []
+    lines: list[str] = []
+    secured: list[tuple] = []
     for srv in servers:
         host, user = srv.get("host"), srv.get("user", "root")
         port = int(srv.get("port", 22))
@@ -3457,15 +3468,39 @@ async def cmd_secure(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         mark = "\u2705" if ok else "\u274c"
         lines.append(f"{mark} <b>{_tg_escape(srv.get('name') or host)}</b>\n   {_tg_escape(detail)}")
         logger.warning("secure %s: %s (%s)", host, "OK" if ok else "FAILED", detail)
+        if ok:
+            secured.append((host, user, port))
+
+    # Point ~/.ssh/config at the active-key symlink BEFORE retiring anything.
+    # Until this runs, the legacy key is still the credential in use, and
+    # removing it from a node would lock the agent out of the host it had just
+    # secured. Only after this does lock/unlock actually swap what gets used.
+    if secured:
+        try:
+            await loop.run_in_executor(None, _rebuild_ssh_config, servers)
+            for host, user, port in secured:
+                if await loop.run_in_executor(None, retire_legacy_key, host, user, port):
+                    lines.append(_t(lang,
+                        f"   \u21b3 retired the old unrestricted key on {_tg_escape(host)}",
+                        f"   \u21b3 kunci lama tanpa batas di {_tg_escape(host)} dipensiunkan"))
+        except Exception as exc:
+            logger.exception("post-secure cleanup failed")
+            lines.append(_t(lang,
+                f"\u26a0\ufe0f cleanup incomplete: {_tg_escape(str(exc))}",
+                f"\u26a0\ufe0f pembersihan belum tuntas: {_tg_escape(str(exc))}"))
 
     await msg.edit_text(
         _t(lang, "\U0001f512 <b>Guard status</b>\n\n", "\U0001f512 <b>Status guard</b>\n\n")
         + "\n".join(lines)
         + _t(lang,
              "\n\n<i>A green line means a write with the read-only key was actually "
-             "attempted and refused -- not merely assumed.</i>",
+             "attempted and refused -- not merely assumed. This does not reduce what the "
+             "agent can do: after /unlock it holds an unrestricted key and can create, "
+             "change and delete normally, until the window closes by itself.</i>",
              "\n\n<i>Baris hijau berarti percobaan tulis dengan key read-only benar-benar "
-             "dilakukan dan ditolak -- bukan sekadar diasumsikan.</i>"),
+             "dilakukan dan ditolak -- bukan sekadar diasumsikan. Ini tidak mengurangi "
+             "kemampuan agent: setelah /unlock ia memegang key tanpa batas dan bisa membuat, "
+             "mengubah, serta menghapus seperti biasa, sampai jendelanya tertutup sendiri.</i>"),
         parse_mode="HTML")
 
 
