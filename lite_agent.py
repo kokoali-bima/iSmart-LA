@@ -7159,7 +7159,22 @@ def main() -> None:
     # on restart -- the user got no response and no error, just silence.
     # False means a message sent during a brief outage is still processed
     # once the service comes back, instead of vanishing.
-    app.run_polling(drop_pending_updates=False)
+    #
+    # allowed_updates: only the three types this bot actually registers a
+    # handler for (see the CommandHandler/MessageHandler/CallbackQueryHandler
+    # calls above) -- restricting this at the source is what actually fixes a
+    # real crash, not just this one call site. Telegram's own edited_message
+    # updates were being delivered too (the default when this isn't set), and
+    # python-telegram-bot's CommandHandler matches those exactly like a fresh
+    # message -- but update.message is None for one (the content lives in
+    # update.edited_message instead). Confirmed live: a user editing an
+    # already-sent "/usemodel ..." crashed cmd_usemodel with
+    # AttributeError: 'NoneType' object has no attribute 'reply_text', twice
+    # in the same minute. That same raw `update.message.reply_text` pattern
+    # appears at over a hundred call sites in this file, so the fix belongs
+    # here, at the source, rather than patched into each one by hand.
+    app.run_polling(drop_pending_updates=False,
+                    allowed_updates=["message", "callback_query"])
 
 
 if __name__ == "__main__":

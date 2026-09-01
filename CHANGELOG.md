@@ -1,5 +1,58 @@
 # Changelog
 
+## v0.2b.46 -- editing a sent command used to crash its handler
+
+Asked for a health check across both deployments -- errors today, anything
+stuck, any wasted tokens. Found a real, reproducible crash on bscloud, twice
+in the same minute:
+
+    File "lite_agent.py", line 4437, in cmd_usemodel
+        await update.message.reply_text(_t(lang,
+    AttributeError: 'NoneType' object has no attribute 'reply_text'
+
+Root cause: a user edited an already-sent `/usemodel ...` message (fixing a
+typo, say). Telegram delivers that as an `edited_message` update, not a
+`message` one -- the content lives in `update.edited_message`, and
+`update.message` is `None`. python-telegram-bot's `CommandHandler` matches an
+edited_message exactly like a fresh one by default (it reads
+`effective_message`, which resolves to whichever of the two is present), so
+the handler fires anyway and crashes on the very first attribute access.
+
+That same `update.message.reply_text` pattern, with no None-check, appears at
+over a hundred call sites in this file -- so the same user action (edit any
+already-sent command) could crash any of them, not just `/usemodel`. Patching
+`cmd_usemodel` alone would have left the other ~129 exactly as exposed.
+
+Fixed at the source instead: `run_polling(allowed_updates=...)` is now
+restricted to exactly the update types this bot has handlers for --
+`message` and `callback_query`, confirmed by scanning every registered
+handler (`CommandHandler`, `MessageHandler`, `CallbackQueryHandler`; nothing
+needs `edited_message`, `chat_member`, polls, or inline queries). Telegram
+then never delivers an edited_message update at all, so `update.message` can
+no longer be `None` for any command-triggered callback -- one change closes
+the whole class of bug rather than each call site individually.
+
+Also investigated as part of the same health check, and NOT a bug: ~841,000
+tokens wasted today on bscloud across 7 events where agy reported
+`status=SUCCESS` (or `CANCELED`) with an empty response -- real tokens spent,
+nothing usable returned. Traced the exact conversation ids through the log:
+`_handle_survives()` correctly does NOT recognise "(empty response)" as a
+survivable failure, so the resume handle was discarded every time (confirmed:
+the very next attempt in the chain always shows `conversation_id=None`), the
+tier cooldown from v0.2b.2x-era engaged as designed (a `SKIPPED (cooldown)`
+attempt appears in the very next turn each time), and every affected turn
+still completed via Claude failover. This is Gemini/agy occasionally
+returning nothing despite reporting success -- an external reliability cost,
+not a local defect -- and the existing detect/failover/cooldown/log chain is
+already handling it correctly; no code change was warranted or made for it.
+
+New: `dev/test_edited_message_crash.py`, 11 tests -- runs with no server
+dependency (pure AST inspection of the deployed source, no `telegram` import
+needed), verifying the exact `allowed_updates` list, that it excludes
+`edited_message` specifically, and that it matches the bot's actual
+registered handler types. Full suite: 266/266 across 16 files.
+
+
 ## v0.2b.45 -- connecting a Google Drive account now goes through Telegram
 
 Asked directly: why did gdrive already show a connected account without ever
