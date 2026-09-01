@@ -1,5 +1,52 @@
 # Changelog
 
+## v0.2b.39 -- "continue this" was starting over instead of continuing
+
+Reported from a real session: the same task was being re-explained to the
+model over and over, at ~12,000 characters of brief each time. The user's own
+log said exactly why -- a turn timed out, and the very next message, which
+literally said "Lanjutkan yang ini" ("continue this one"), opened a brand new
+conversation:
+
+  running agy: model=gemini-3.7-flash-medium conversation_id=5dd5b5ca-... prompt_len=18
+  turn done: ... FAILED/failover (agy exited 1: {"conversation_id":"5dd5b5ca-...",
+             "status":"ERROR","error":"timeout waiting for response",
+             "duration_seconds":207.15738437,"num_turns":2, ...})
+  running agy: model=gemini-3.7-flash-medium conversation_id=None prompt_len=11823
+
+`conversation_id=None` and `prompt_len` jumping from 18 to 11823 is the whole
+bug in two numbers: the resume handle was gone, so the brief went out again.
+
+Root cause, one line in `run_combo`'s error path, comment and all:
+
+    # Don't try to resume a conversation that just errored.
+    (agy_convs if provider == "agy" else claude_sessions)[model] = None
+
+That is right for a conversation the model can no longer load, and wrong for
+the case that actually happens most: a **timeout**, where the conversation is
+intact and sitting on exactly the work the next message wants continued.
+Discarding it there throws away the accumulated context AND pays to re-send
+the brief -- the most expensive thing this bot can do.
+
+Now the handle is only dropped when the handle itself is implicated
+(`_handle_survives`): timeouts, network drops, rate limits and 5xx keep it;
+anything else -- "conversation not found", a malformed id -- still clears it,
+so a genuinely dead conversation is not retried forever. Tier cooldowns are
+unchanged and still bound the retries either way.
+
+Second, smaller fix in the same path: a run that started FRESH and then failed
+had its conversation id ONLY inside the error payload agy returns
+(`{"conversation_id": "...", "status": "ERROR", ...}`), so nothing had stored
+it yet and the conversation was orphaned along with all the work it had
+already done. `_conversation_id_from_error` now picks it up.
+
+New: `dev/test_resume_handle.py`, 13 tests, built on the exact error string
+this deployment produced rather than a synthetic one -- including the case
+that proves the saving, asserting the resumed turn carries the kept id and
+does NOT re-send the brief, and the counter-case that a genuinely fresh
+conversation still does. Full suite clean: 169/169 across 10 files.
+
+
 ## v0.2b.38 -- docs: the re-invite step v0.2b.37 needs to work at all
 
 v0.2b.37 shipped the mention gate but not the one operational step that makes

@@ -2082,6 +2082,46 @@ def _classify_failure(exc: Exception) -> str:
     # message doesn't silently stop the fallback chain working.
     return "failover"
 
+# A conversation handle is only worth throwing away when the handle ITSELF is
+# what failed. A timeout -- or a network blip, or a rate limit -- leaves the
+# conversation intact on disk and usually mid-task, so discarding it there
+# forces the next message to start from nothing AND re-send the whole brief,
+# which is the single most expensive thing this bot does.
+# Found live on bscloud: agy timed out after 2 turns on a healthy conversation
+# (error: "timeout waiting for response"), the handle was dropped, and the
+# user's next "Lanjutkan yang ini" opened a BRAND NEW conversation with a
+# ~12,000-character brief (prompt_len=11823, conversation_id=None) instead of
+# resuming the task it was told to continue.
+_HANDLE_SURVIVES_HINTS = (
+    "timeout", "timed out", "deadline",
+    "connection", "network", "unreachable", "reset by peer", "broken pipe",
+    "rate limit", "ratelimit", "429", "quota", "overloaded",
+    "temporarily unavailable", "502", "503", "504",
+)
+
+
+def _handle_survives(exc: Exception) -> bool:
+    """True when the failure says nothing bad about the conversation handle
+    itself, so the NEXT turn should resume it rather than start over."""
+    msg = str(exc).lower()
+    return any(h in msg for h in _HANDLE_SURVIVES_HINTS)
+
+
+# agy reports the conversation it was working in even when the run fails, e.g.
+# {"conversation_id":"5dd5b5ca-...","status":"ERROR","error":"timeout ..."}.
+# That matters for a run that STARTED fresh: the id exists only in that error
+# payload, so without picking it up here a long first turn that times out
+# orphans the conversation and every bit of work it already did.
+_CONV_ID_IN_ERROR_RE = re.compile(
+    r'"conversation_id"\s*:\s*"([0-9a-fA-F-]{36})"'
+)
+
+
+def _conversation_id_from_error(exc: Exception) -> Optional[str]:
+    m = _CONV_ID_IN_ERROR_RE.search(str(exc))
+    return m.group(1) if m else None
+
+
 def _tier_available(model: str) -> bool:
     entry = _tier_cooldown.get(model)
     if not entry:
@@ -2257,8 +2297,20 @@ def run_combo(prompt: str, sess: dict, session_name: str,
             kind = _classify_failure(exc)
             attempts.append(f"{provider}:{model} FAILED/{kind} ({exc})")
             logger.warning("%s model=%s failed (%s): %s", provider, model, kind, exc)
-            # Don't try to resume a conversation that just errored.
-            (agy_convs if provider == "agy" else claude_sessions)[model] = None
+            # Keep the resume handle unless the handle itself is suspect --
+            # see _handle_survives. A timed-out conversation is still full of
+            # the work the next message is meant to continue.
+            store = agy_convs if provider == "agy" else claude_sessions
+            if _handle_survives(exc):
+                if not store.get(model):
+                    # A fresh run that failed: its id exists only in the error.
+                    recovered = _conversation_id_from_error(exc)
+                    if recovered:
+                        store[model] = recovered
+                        logger.info("kept %s conversation %s despite a transient failure",
+                                    model, recovered)
+            else:
+                store[model] = None
             if kind == "terminal":
                 # The request itself is the problem -- every remaining tier would
                 # spend real quota to fail in exactly the same way.
