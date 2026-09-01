@@ -1,5 +1,80 @@
 # Changelog
 
+## v0.2b.43 -- the write gate was never actually installed
+
+A live incident, reproduced deliberately by the operator to test exactly this.
+"tolong hapus vps dengan vmid 8006" in a group produced a reply saying "click
+the approval button below" -- no button appeared, no PIN was asked, and the
+next message caused the VM to be destroyed. The Proxmox task log settles what
+happened:
+
+    qmstop     vmid=8006  root@pam  2026-09-01 09:56:53 WIB
+    qmdestroy  vmid=8006  root@pam  2026-09-01 09:57:00 WIB
+
+against the bot log:
+
+    09:56:44  running agy: ... prompt_len=37   <- "tombol persetujuan tidak ada terlihat"
+    09:57:08  turn done: ... OK
+
+The destroy ran inside that turn. Telling the bot the approval button was
+missing was itself enough to make it delete the VM.
+
+Two independent failures, and every one of them silent:
+
+  1. `~/.ssh/agent_readonly` and `agent_write` did not exist, so
+     `_keys_configured()` was False, so the ENTIRE approval/PIN gate was inert.
+     No button could ever be rendered regardless of what the model emitted.
+     The docstring even says it: "If not, this whole mechanism is inert and we
+     say so rather than pretending a boundary exists that doesn't" -- but
+     nothing said so where an operator would see it.
+  2. The node's authorized_keys entry carried no `command=` restriction, so
+     the agent's key was ordinary unrestricted root over the whole cluster
+     (120 VMs). Proven at the time with a harmless write:
+
+         === HARMLESS write test as the AGENT key ===
+         WRITE_SUCCEEDED_NOT_BLOCKED
+
+Root cause of both: they were **manual README steps**, while `/addserver` --
+the path the bot itself tells operators to use, and the one `/start` links --
+generated ONE unrestricted key and told the user to append it plainly. The
+dangerous configuration was the default, and the safe one required finding a
+README section the bot never points at. The model-side `NEEDS_WRITE:` marker
+was then the only thing left standing, and a model that writes prose instead
+of the marker removes even that.
+
+Now, with no manual steps:
+
+- **`ensure_write_mode_keys()`** runs at startup and creates the read-only /
+  write pair plus the `agent_active` symlink (pointed at read-only: locked is
+  the default). A deployment cloned from GitHub has a live gate on first boot.
+  If it cannot, that is logged as an error naming the consequence, not passed
+  over.
+- **`install_node_guard()`** uploads `pve-ro-guard` to the node and authorises
+  the read-only key behind `command=`, over SSH, from the bot. This is what
+  made it a step nobody performed: it meant pasting a 7KB script into a
+  terminal by hand.
+- **`verify_node_guard()`** then attempts a real write with the read-only key
+  and requires it to be refused. "Protected" is never reported on trust --
+  only on an observed refusal. This is precisely the check whose absence let
+  the incident look fine.
+- **`secure_server()`** ties them together and retires the legacy unrestricted
+  key, but strictly AFTER the replacement verifies, so a failure anywhere
+  leaves the operator with working access instead of a locked-out node.
+- **`/addserver`** now hands over the WRITE key for the operator to authorise,
+  then installs and verifies its own restricted key. If protection cannot be
+  established the server is NOT quietly added: it warns, names the
+  consequence, and requires an explicit "Add unprotected" tap.
+- **`/secure`** re-runs install-and-verify across every configured host, and
+  bootstraps through the old unrestricted key when the write key is not
+  authorised yet -- so an existing deployment migrates without being rebuilt.
+
+New: `dev/test_node_guard.py`, 17 tests, written around the incident: the gate
+being inert before setup and live after, verification failing when the
+read-only key can still write, the legacy-key migration path, and the ordering
+rule that the old key is never removed on a failed verify. Full suite: 219/219
+across 14 files.
+
+
 ## v0.2b.42 -- /graduate can finally see Gemini's history
 
 Asked for directly, after the previous release pointed out that /graduate is

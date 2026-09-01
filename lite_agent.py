@@ -1228,6 +1228,218 @@ def extract_needs_write(text: str) -> tuple[str, Optional[str]]:
     return NEEDS_WRITE_RE.sub("", text).strip(), (hits[0] if hits else None)
 
 
+# --------------------------------------------------------------------------
+# Making the write gate REAL on a fresh deployment
+#
+# The gate above (locked/unlocked, PIN, snapshot offer) is only a boundary if
+# two things exist that nothing used to create:
+#
+#   1. the two keys themselves -- _keys_configured() returns False without
+#      both, and a False there makes the ENTIRE gate inert: no approval button
+#      is ever offered, and lock_write_mode() has nothing to swap.
+#   2. the guard on the node, which is what actually refuses a write. Without
+#      it the "read-only" key is ordinary unrestricted root.
+#
+# Both were documented as manual README steps while /addserver -- the path the
+# bot itself tells you to use -- generated ONE unrestricted key and appended it
+# plainly. So the default install produced a deployment where the safety UI
+# could never fire AND nothing blocked writes: exactly the combination that let
+# a "delete this VM" request run with no approval button and no PIN on a live
+# cluster.
+#
+# Everything below exists so that path is automatic, verified, and loud when it
+# fails -- never silently absent again.
+# --------------------------------------------------------------------------
+
+NODE_GUARD_SCRIPT = BASE_DIR / "node-guard" / "pve-ro-guard"
+NODE_GUARD_REMOTE = "/usr/local/bin/pve-ro-guard"
+RO_KEY_COMMENT = "ismart-la-readonly"
+RW_KEY_COMMENT = "ismart-la-write"
+LEGACY_KEY_COMMENT = "ismart-la-agent"
+_GUARD_KEY_OPTS = (
+    'command="' + NODE_GUARD_REMOTE + '",no-port-forwarding,'
+    'no-agent-forwarding,no-X11-forwarding,no-pty'
+)
+
+
+def ensure_write_mode_keys() -> bool:
+    """Create the read-only/write keypair and the active symlink if missing.
+
+    Idempotent, and called at startup, so a deployment cloned from GitHub has a
+    live write gate without anyone having to find a README section first.
+    Returns True if the pair is present afterwards.
+
+    The symlink starts pointed at the READ-ONLY key: locked is the default, and
+    /unlock is what moves it, exactly as write_mode_expires_at() assumes.
+    """
+    try:
+        SSH_RO_KEY.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        for key, comment in ((SSH_RO_KEY, RO_KEY_COMMENT), (SSH_RW_KEY, RW_KEY_COMMENT)):
+            if not key.exists():
+                subprocess.run(
+                    ["ssh-keygen", "-t", "ed25519", "-f", str(key), "-N", "", "-C", comment],
+                    capture_output=True, text=True, check=True,
+                )
+                logger.warning("generated %s", key)
+        if not SSH_ACTIVE_KEY.exists() and not SSH_ACTIVE_KEY.is_symlink():
+            _point_active_key_at(SSH_RO_KEY)
+            logger.warning("active key symlink created, pointing at the read-only key")
+        return _keys_configured()
+    except Exception:
+        logger.exception("could not set up the write-mode keypair")
+        return False
+
+
+def _ssh_as(key: Path, host: str, user: str, port: int, cmd: str,
+            timeout: int = 30) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["ssh", "-i", str(key), "-p", str(port),
+         "-o", "StrictHostKeyChecking=no", "-o", "BatchMode=yes",
+         "-o", "ConnectTimeout=15", f"{user}@{host}", cmd],
+        capture_output=True, text=True, timeout=timeout,
+    )
+
+
+def _admin_key_for(host: str, user: str, port: int) -> Optional[Path]:
+    """A key that can currently WRITE on this host, or None.
+
+    Prefers the proper write key. Falls back to the single unrestricted key
+    older deployments were given by /addserver, which is what makes migrating
+    an existing, unprotected host automatic instead of a manual re-setup --
+    the whole point of this being permanent rather than a one-off tweak.
+    """
+    legacy = Path.home() / ".ssh" / "ismart_agent"
+    for key in (SSH_RW_KEY, legacy):
+        if not key.exists():
+            continue
+        try:
+            if _ssh_as(key, host, user, port, "echo ISMART_ADMIN_OK", timeout=25).stdout.count(
+                    "ISMART_ADMIN_OK"):
+                return key
+        except Exception:
+            continue
+    return None
+
+
+def install_node_guard(host: str, user: str, port: int) -> tuple[bool, str]:
+    """Put the guard on the node and authorise the read-only key behind it.
+
+    Runs over the WRITE key -- the one the operator authorised by hand -- and
+    the bot then installs its own restricted key, rather than asking a human to
+    paste a 7KB script into a terminal (which is why this was a README step
+    nobody performed).
+
+    Idempotent: re-running refreshes the guard script, so a fixed guard can be
+    rolled out, but never duplicates an authorized_keys line.
+    """
+    if not NODE_GUARD_SCRIPT.exists():
+        return False, f"guard script missing from this deployment: {NODE_GUARD_SCRIPT}"
+    ro_pub_path = SSH_RO_KEY.with_suffix(".pub")
+    if not ro_pub_path.exists():
+        return False, "no read-only public key to install"
+    admin_key = _admin_key_for(host, user, port)
+    if admin_key is None:
+        return False, ("no key can reach this host with write access yet -- authorise "
+                       "the write key first")
+    guard_src = NODE_GUARD_SCRIPT.read_text()
+    ro_pub = ro_pub_path.read_text().strip()
+    rw_pub = SSH_RW_KEY.with_suffix(".pub").read_text().strip() \
+        if SSH_RW_KEY.with_suffix(".pub").exists() else ""
+    ro_line = _GUARD_KEY_OPTS + " " + ro_pub
+    # Match on the key material itself, not the comment: comments are editable
+    # by anyone with the file open, the base64 blob is what actually grants.
+    fingerprint_bit = ro_pub.split()[1][:40]
+
+    script = "\n".join([
+        "set -e",
+        "umask 077",
+        "mkdir -p ~/.ssh",
+        "touch ~/.ssh/authorized_keys",
+        # Quoted heredoc: nothing inside the guard is expanded by the remote
+        # shell, and it only moves into place once it has landed complete.
+        "cat > /tmp/.pve-ro-guard.new <<'ISMART_GUARD_EOF'",
+        guard_src,
+        "ISMART_GUARD_EOF",
+        f"install -m 755 /tmp/.pve-ro-guard.new {NODE_GUARD_REMOTE}",
+        "rm -f /tmp/.pve-ro-guard.new",
+        f"grep -qF '{fingerprint_bit}' ~/.ssh/authorized_keys || "
+        f"printf '%s\\n' '{ro_line}' >> ~/.ssh/authorized_keys",
+        # Bootstrapping off the legacy key? Authorise the write key too, so the
+        # next run has a proper admin key and the legacy one can be retired.
+        (f"grep -qF '{rw_pub.split()[1][:40]}' ~/.ssh/authorized_keys || "
+         f"printf '%s\\n' '{rw_pub}' >> ~/.ssh/authorized_keys") if rw_pub else "true",
+        "chmod 600 ~/.ssh/authorized_keys",
+        "echo ISMART_GUARD_INSTALLED",
+    ])
+    try:
+        proc = _ssh_as(admin_key, host, user, port, script, timeout=60)
+    except Exception as exc:
+        return False, str(exc)
+    if "ISMART_GUARD_INSTALLED" in proc.stdout:
+        return True, "guard installed"
+    return False, (proc.stderr or proc.stdout or "no response").strip()[-400:]
+
+
+def verify_node_guard(host: str, user: str, port: int) -> tuple[bool, str]:
+    """Prove the guard actually refuses a write -- never take it on trust.
+
+    This is the entire point of the feature. The incident that prompted it
+    looked fine from every angle except the one nobody checked: a write,
+    attempted with the key that is supposed to be read-only, SUCCEEDING. So
+    that exact thing is what gets tested here, with a harmless touch/rm rather
+    than anything that matters.
+    """
+    try:
+        read = _ssh_as(SSH_RO_KEY, host, user, port, "hostname")
+        if read.returncode != 0:
+            detail = (read.stderr or read.stdout or "no response").strip()[-200:]
+            return False, "read-only key cannot even read: " + detail
+        probe = "/tmp/.ismart_guard_probe"
+        write = _ssh_as(
+            SSH_RO_KEY, host, user, port,
+            f"touch {probe} && rm -f {probe} && echo WRITE_WENT_THROUGH")
+    except Exception as exc:
+        return False, str(exc)
+    if "WRITE_WENT_THROUGH" in write.stdout:
+        return False, ("the read-only key can still WRITE -- the guard is not in "
+                       "force. This node is unprotected.")
+    if GUARD_REFUSAL in (write.stderr or "") or GUARD_REFUSAL in (write.stdout or ""):
+        return True, "guard verified: reads work, writes refused"
+    # Refused, but not recognisably by our guard. Say exactly that rather than
+    # claim a boundary that was not actually observed.
+    detail = (write.stderr or write.stdout or "").strip()[-200:]
+    return True, "write refused (not by pve-ro-guard): " + detail
+
+
+def secure_server(host: str, user: str, port: int) -> tuple[bool, str]:
+    """Install the guard, verify it bites, then retire the legacy open key.
+
+    The ordering is deliberate: the unrestricted key that predates this feature
+    is removed only AFTER the replacement is proven to work, so a failure
+    anywhere leaves the operator with working access rather than a locked-out
+    node.
+    """
+    ok, detail = install_node_guard(host, user, port)
+    if not ok:
+        return False, "install failed: " + detail
+    ok, detail = verify_node_guard(host, user, port)
+    if not ok:
+        return False, "verification failed: " + detail
+    removed = ""
+    try:
+        cleanup = _ssh_as(
+            SSH_RW_KEY, host, user, port,
+            f"if grep -q '{LEGACY_KEY_COMMENT}' ~/.ssh/authorized_keys 2>/dev/null; then "
+            f"sed -i '/{LEGACY_KEY_COMMENT}/d' ~/.ssh/authorized_keys && "
+            "echo LEGACY_KEY_REMOVED; fi")
+        if "LEGACY_KEY_REMOVED" in cleanup.stdout:
+            removed = "; retired the old unrestricted key"
+            logger.warning("removed the legacy unrestricted agent key on %s", host)
+    except Exception:
+        logger.warning("could not check for a legacy key on %s", host, exc_info=True)
+    return True, detail + removed
+
+
 def blocked_by_readonly(result_text: str, attempts: list[str]) -> bool:
     return GUARD_REFUSAL in result_text or any(GUARD_REFUSAL in a for a in attempts)
 
@@ -3203,6 +3415,58 @@ async def cmd_graduate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     # history this was actually graduated from, since each tier keeps its own
     # and the answer depends on which one held the case.
     await _reply_chunked(update, f"{body}\n\n\u2014 graduated from {label}")
+
+
+async def cmd_secure(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Install and verify the read-only guard on every configured server.
+
+    Exists because a deployment that predates this feature has hosts reachable
+    by one unrestricted key, and no amount of bot-side gating helps when the
+    credential itself has no limits. Idempotent, so re-running is the way to
+    confirm nothing has drifted.
+    """
+    if not await _may_authorize_group_action(update, context):
+        return
+    lang = _chat_lang(update)
+    servers = _read_servers()
+    if not servers:
+        await update.message.reply_text(_t(lang,
+            "No servers configured yet -- /addserver first.",
+            "Belum ada server terdaftar -- /addserver dulu."))
+        return
+    if not _keys_configured():
+        await update.message.reply_text(_t(lang,
+            "\u26a0\ufe0f The read-only/write keypair is missing, so there is nothing "
+            "to install. Restart the bot to generate it.",
+            "\u26a0\ufe0f Pasangan key read-only/write belum ada, jadi tidak ada yang "
+            "bisa dipasang. Restart bot untuk membuatnya."))
+        return
+
+    msg = await update.message.reply_text(_t(lang,
+        "\U0001f512 Securing every configured host\u2026",
+        "\U0001f512 Mengamankan semua host terdaftar\u2026"))
+    loop = asyncio.get_running_loop()
+    lines = []
+    for srv in servers:
+        host, user = srv.get("host"), srv.get("user", "root")
+        port = int(srv.get("port", 22))
+        try:
+            ok, detail = await loop.run_in_executor(None, secure_server, host, user, port)
+        except Exception as exc:
+            ok, detail = False, str(exc)
+        mark = "\u2705" if ok else "\u274c"
+        lines.append(f"{mark} <b>{_tg_escape(srv.get('name') or host)}</b>\n   {_tg_escape(detail)}")
+        logger.warning("secure %s: %s (%s)", host, "OK" if ok else "FAILED", detail)
+
+    await msg.edit_text(
+        _t(lang, "\U0001f512 <b>Guard status</b>\n\n", "\U0001f512 <b>Status guard</b>\n\n")
+        + "\n".join(lines)
+        + _t(lang,
+             "\n\n<i>A green line means a write with the read-only key was actually "
+             "attempted and refused -- not merely assumed.</i>",
+             "\n\n<i>Baris hijau berarti percobaan tulis dengan key read-only benar-benar "
+             "dilakukan dan ditolak -- bukan sekadar diasumsikan.</i>"),
+        parse_mode="HTML")
 
 
 async def cmd_chatid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -5364,6 +5628,25 @@ async def cmd_server_button(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         await _finish_addserver(update, query, discovery=(detail if ok else f"scan failed: {detail}"))
         return
 
+    if action == "unsafe":
+        # Reached only by deliberately tapping through the warning above.
+        data["guard"] = None
+        logger.warning("server %s added WITHOUT the read-only guard, by explicit choice",
+                       data.get("host"))
+        data["probe"] = data.get("probe") or "connected (unprotected)"
+        if data.get("flavour") == "proxmox":
+            state["step"] = "cluster"
+            await query.edit_message_text(_t(lang,
+                "Added without protection. Does this same key reach every node?",
+                "Ditambahkan tanpa perlindungan. Apakah key yang sama menjangkau semua node?"),
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton(_t(lang, "Yes", "Ya"), callback_data="srv:cluster:yes"),
+                    InlineKeyboardButton(_t(lang, "No", "Tidak"), callback_data="srv:cluster:no"),
+                ]]))
+        else:
+            await _finish_addserver(update, query)
+        return
+
     if action == "test":
         await query.edit_message_text(_t(lang, "🔌 Testing the connection…", "🔌 Menguji koneksi…"))
         loop = asyncio.get_running_loop()
@@ -5384,6 +5667,40 @@ async def cmd_server_button(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                     InlineKeyboardButton(_t(lang, "✖️ Cancel", "✖️ Batal"), callback_data="srv:cancel:"),
                 ]]))
             return
+        # Put the guard in place and PROVE it refuses a write before this host
+        # is treated as managed. The failure this whole feature exists to stop
+        # was silent: everything looked configured, and nothing was.
+        if _keys_configured() and not data.get("key"):
+            await query.edit_message_text(_t(lang,
+                "🔒 Installing the read-only guard and verifying it really refuses writes\u2026",
+                "🔒 Memasang guard read-only dan memastikan tulis benar-benar ditolak\u2026"))
+            gok, gdetail = await loop.run_in_executor(
+                None, secure_server, data["host"], data["user"], data["port"])
+            data["guard"] = gdetail if gok else None
+            if not gok:
+                await query.edit_message_text(
+                    _t(lang,
+                       f"\u26a0\ufe0f <b>Connected, but this host is NOT protected.</b>\n\n"
+                       f"<pre>{_tg_escape(gdetail)}</pre>\n\n"
+                       "Without the guard, a destructive request reaches this host with "
+                       "nothing to stop it -- no approval button, no PIN. Retry, or add it "
+                       "anyway and accept that.",
+                       f"\u26a0\ufe0f <b>Terhubung, tapi host ini TIDAK terlindungi.</b>\n\n"
+                       f"<pre>{_tg_escape(gdetail)}</pre>\n\n"
+                       "Tanpa guard, perintah merusak sampai ke host ini tanpa penahan apa pun "
+                       "-- tanpa tombol persetujuan, tanpa PIN. Coba lagi, atau tetap tambahkan "
+                       "dengan menerima risiko itu.",
+                    ),
+                    parse_mode="HTML",
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton(_t(lang, "\U0001f501 Retry protection", "\U0001f501 Coba lindungi lagi"),
+                                              callback_data="srv:test:")],
+                        [InlineKeyboardButton(_t(lang, "\u26a0\ufe0f Add unprotected", "\u26a0\ufe0f Tambah tanpa perlindungan"),
+                                              callback_data="srv:unsafe:")],
+                        [InlineKeyboardButton(_t(lang, "\u2716\ufe0f Cancel", "\u2716\ufe0f Batal"),
+                                              callback_data="srv:cancel:")],
+                    ]))
+                return
         data["probe"] = detail
         if data.get("flavour") == "proxmox":
             state["step"] = "cluster"
@@ -5528,6 +5845,12 @@ async def _handle_server_input(update: Update, context: ContextTypes.DEFAULT_TYP
         ))
         return True
 
+    # The operator authorises the WRITE key by hand; the bot then installs its
+    # own restricted key behind the guard and proves the guard refuses writes.
+    # Handing over the read-only key here instead would look safer and be the
+    # opposite -- an unguarded key whose NAME says read-only.
+    if _keys_configured():
+        pubkey = SSH_RW_KEY.with_suffix(".pub").read_text().strip()
     await update.message.reply_text(
         _t(lang,
            f"🔑 <b>Authorise the agent on {_tg_escape(data['host'])}</b>\n\n"
@@ -6413,6 +6736,15 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 def main() -> None:
+    # Create the read-only/write keypair before anything can ask whether the
+    # write gate is configured. Without this the gate is inert on a fresh
+    # clone -- no approval button, no PIN -- and nothing says so out loud.
+    if ensure_write_mode_keys():
+        logger.info("write-mode keys ready (locked by default)")
+    else:
+        logger.error(
+            "WRITE GATE INERT: could not create %s / %s. Destructive requests "
+            "will NOT be gated by an approval button or PIN.", SSH_RO_KEY, SSH_RW_KEY)
     if not SYSTEM_PROMPT_FILE.exists():
         logger.error("System prompt file not found: %s", SYSTEM_PROMPT_FILE)
         sys.exit(1)
@@ -6466,6 +6798,7 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(cmd_logout_button, pattern="^logout:"))
     app.add_handler(CallbackQueryHandler(cmd_start_lang_button, pattern="^startlang:"))
     app.add_handler(CommandHandler("chatid", cmd_chatid))
+    app.add_handler(CommandHandler("secure", cmd_secure))
     app.add_handler(CommandHandler("registergroup", cmd_registergroup))
     app.add_handler(CommandHandler("unregistergroup", cmd_unregistergroup))
     app.add_handler(CommandHandler("help", cmd_help))
