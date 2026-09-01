@@ -4,7 +4,7 @@ A lightweight Telegram bridge to **Claude Code** and **Antigravity CLI (agy)**, 
 infrastructure monitoring and investigation -- built to be dramatically cheaper to run
 than a full agent framework, while staying just as capable for real operational work.
 
-> **Status: v0.2b.44 -- early/beta.** Built and battle-tested against a real production
+> **Status: v0.2b.45 -- early/beta.** Built and battle-tested against a real production
 > Proxmox VE cluster over several days of iteration, including a live-fire test of the
 > unlock/PIN/snapshot flow against real infrastructure. Works well; still has known
 > rough edges (see [Known limitations](#known-limitations)).
@@ -351,40 +351,46 @@ somewhere a client or teammate can browse, not just be attached to a chat messag
 More than one account can be connected (a personal one, a company one, one per
 client...) with each chat picking its own default independently.
 
-**Connecting an account is a one-time step done directly on the host, not through
-Telegram** — the same reasoning as the SSH keypair: an OAuth flow needs a real
-browser, and this is infrequent enough that a guided chat wizard isn't worth
-building. Uses [rclone](https://rclone.org/drive/) with `scope=drive.file`, so a
-connected account only ever exposes files rclone itself creates — never its
-existing Drive contents.
+**Connecting an account is `/connectgdrive`, in Telegram** — same principle as
+Gemini/Claude's sign-in: explicit, done by an authorised human, logged with who and
+when. It cannot be a single tap-a-link flow the way those are, though, and that is
+Google's constraint, not a design choice: `rclone`'s OAuth for Drive waits for a
+network redirect back to a listener on `127.0.0.1` on whichever machine runs it
+(confirmed live -- running it on the server itself just prints a link pointing at
+the *server's own* localhost, useless from a phone or another laptop), so the
+consent step still has to happen on a machine with a real browser. What moved into
+Telegram is everything that used to be a manual, error-prone step done by hand:
+
+```
+/connectgdrive
+```
+
+The bot replies with one command to run on any machine you control that has
+`rclone` and a browser (your laptop -- does not have to be the server):
 
 ```bash
-# on any machine with a browser (does not have to be the server):
-rclone authorize "drive" --drive-scope drive.file
-# paste the resulting {"access_token": ...} JSON into a file on the server, then --
-# pick a remote name: "gdrive" for the first account, "gdrive_<something>" for
-# every one after that (e.g. gdrive_company, gdrive_clienta) -- that naming
-# convention IS how the bot discovers which accounts exist, nothing else to register:
-python3 -c '
-from pathlib import Path
-import json, sys
-name = "gdrive"  # or gdrive_<something> for a second/third/... account
-token = Path("/tmp/gdrive_token.json").read_text().strip()
-json.loads(token)  # sanity-check
-conf = Path.home() / ".config/rclone/rclone.conf"
-conf.parent.mkdir(parents=True, exist_ok=True)
-with conf.open("a") as f:
-    f.write(f"\n[{name}]\ntype = drive\nscope = drive.file\ntoken = {token}\n")
-conf.chmod(0o600)
-'
-# IMPORTANT: check for an existing root folder before creating one -- if this
-# remote turns out to be the SAME underlying Google account as one already
-# connected (a typo'd name, or re-authorizing the same account by mistake),
-# `mkdir` would silently create a SECOND "iSmart-LA Data" folder side by side
-# with the first, and nothing would notice until files start landing in the
-# wrong one:
-rclone lsd gdrive: | grep "iSmart-LA Data" || rclone mkdir "gdrive:iSmart-LA Data"
+rclone authorize drive --drive-scope drive.file
 ```
+
+Approve in the browser that opens; rclone prints a block starting with
+`{"access_token"...}`. Paste that whole block back into the chat. The bot:
+
+- picks a collision-free name (`gdrive` for the first account, asks for a short
+  label like `company` or `clienta` for a second+ one -- becomes `gdrive_company`)
+- registers it with `rclone config create`, never by hand-editing `rclone.conf`
+- checks whether this account already has the shared `iSmart-LA Data` root folder
+  before creating one, so re-authorizing the same account by mistake (a typo'd
+  label, say) can't silently produce a second folder with nothing to notice until
+  files start landing in the wrong one
+- **verifies** with a real listing before calling it connected -- reported success
+  always means an actual Drive call worked, not that a file was written
+- rolls back cleanly (removes the half-configured remote) on any failure, so a
+  bad paste never leaves something broken lying around
+- deletes your pasted message immediately after reading it, same as an OAuth code
+
+Uses [rclone](https://rclone.org/drive/) with `scope=drive.file`, so a connected
+account only ever exposes files rclone itself creates — never its existing Drive
+contents. `/cancel` stops the flow at any point.
 
 Once at least one account is connected, `/gdrive` in any chat shows a picker —
 tap one to make it that chat's default. **With exactly one account connected,
@@ -394,9 +400,7 @@ explicitly chosen yet must pick one via `/gdrive` before uploading — deliberat
 no silent fallback to "whichever account connected first" once there's a real
 choice, since that's exactly the kind of default that sends a file to the wrong
 place unnoticed. A chat that was already auto-using the sole account keeps working
-unchanged; only chats that never uploaded anything are asked to choose. Adding a
-further account is still the host-side step above; `/gdrive` only lets a chat
-choose among accounts that already exist.
+unchanged; only chats that never uploaded anything are asked to choose.
 
 From then on, mention "gdrive" or "Google Drive" in a normal message and where you
 want it, and the agent handles the rest:

@@ -3989,10 +3989,93 @@ async def _begin_cli_login(update: Update, query, provider: str) -> None:
     ), parse_mode="HTML", disable_web_page_preview=True)
 
 
+async def _handle_gdrive_wizard_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """A separate small wizard from _wizard/_server_wizard -- its two steps
+    (label, then token) don't overlap either of those in shape, and keeping
+    it apart means a stuck gdrive connect can't wedge sign-in or /addserver."""
+    chat_id = update.effective_chat.id
+    state = _gdrive_wizard.get(chat_id)
+    if not state:
+        return False
+    lang = _chat_lang(update)
+    text = (update.message.text or "").strip()
+
+    if state["expires"] < _dt.datetime.now().timestamp():
+        _gdrive_wizard.pop(chat_id, None)
+        await update.message.reply_text(_t(lang,
+            "\u231b That expired. Run /connectgdrive again.",
+            "\u231b Sudah kedaluwarsa. Jalankan /connectgdrive lagi."))
+        return True
+    if text.lower() in ("/cancel", "cancel", "batal"):
+        _gdrive_wizard.pop(chat_id, None)
+        await update.message.reply_text(_t(lang, "\u2716\ufe0f Cancelled.", "\u2716\ufe0f Dibatalkan."))
+        return True
+
+    if state["step"] == "await_gdrive_label":
+        name = _sanitize_gdrive_label(text)
+        if not name or name == "gdrive_":
+            await update.message.reply_text(_t(lang,
+                "That didn't leave anything usable -- letters/digits/-/_ only, "
+                "try again or /cancel.",
+                "Tidak ada yang tersisa dari itu -- huruf/angka/-/_ saja, "
+                "coba lagi atau /cancel."))
+            return True
+        if name in _list_gdrive_accounts():
+            await update.message.reply_text(_t(lang,
+                f"'{_tg_escape(name)}' already exists -- pick a different label, or /cancel.",
+                f"'{_tg_escape(name)}' sudah ada -- pilih label lain, atau /cancel."))
+            return True
+        state["step"], state["name"] = "await_gdrive_token", name
+        state["expires"] = _dt.datetime.now().timestamp() + GDRIVE_TOKEN_WIZARD_TTL
+        await update.message.reply_text(
+            _gdrive_connect_instructions(lang, name), parse_mode="HTML")
+        return True
+
+    # step == "await_gdrive_token"
+    name = state["name"]
+    _gdrive_wizard.pop(chat_id, None)
+    try:
+        await update.message.delete()
+    except Exception:
+        logger.info("could not delete the pasted gdrive token (needs admin rights in groups)")
+    await update.message.reply_text(_t(lang,
+        f"\u23f3 Connecting and verifying \u2018{_tg_escape(name)}\u2019\u2026",
+        f"\u23f3 Menghubungkan dan memverifikasi \u2018{_tg_escape(name)}\u2019\u2026"))
+    loop = asyncio.get_running_loop()
+    try:
+        ok, detail = await loop.run_in_executor(None, connect_gdrive_account, name, text)
+    except Exception as exc:
+        logger.exception("gdrive connect failed")
+        ok, detail = False, str(exc)
+    if ok:
+        logger.warning("gdrive account '%s' connected by user=%s chat=%s",
+                       name, update.effective_user.id, chat_id)
+        await update.message.reply_text(_t(lang,
+            f"\u2705 <b>{_tg_escape(name)}</b> connected and verified -- a real upload "
+            f"and folder check both succeeded, not just \u201csaved\u201d.\n\n"
+            f"Run /gdrive to pick it for this room.",
+            f"\u2705 <b>{_tg_escape(name)}</b> terhubung dan terverifikasi -- upload dan "
+            f"cek folder sungguhan berhasil, bukan sekadar \u201ctersimpan\u201d.\n\n"
+            f"Jalankan /gdrive untuk pilih ini di room ini.",
+        ), parse_mode="HTML")
+    else:
+        logger.warning("gdrive connect '%s' failed for user=%s: %s",
+                       name, update.effective_user.id, detail)
+        await update.message.reply_text(_t(lang,
+            f"\u274c Couldn't connect \u2018{_tg_escape(name)}\u2019: {_tg_escape(detail)}\n\n"
+            "Nothing was left half-configured. Run /connectgdrive to try again.",
+            f"\u274c Gagal menghubungkan \u2018{_tg_escape(name)}\u2019: {_tg_escape(detail)}\n\n"
+            "Tidak ada yang tertinggal setengah-jadi. Jalankan /connectgdrive untuk coba lagi.",
+        ))
+    return True
+
+
 async def _handle_wizard_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     """If this chat is mid-wizard, treat the message as the OAuth code.
     Returns True when the message was consumed and must not reach the model."""
     chat_id = update.effective_chat.id
+    if await _handle_gdrive_wizard_input(update, context):
+        return True
     state = _wizard.get(chat_id)
     if not state:
         return False
@@ -4369,6 +4452,7 @@ Every reply ends with a "— by ..." tag. If it's ever NOT "{TIERS[0]['label']}"
 /providers — which AI tiers are configured and which are healthy (0 tokens)
 /usemodel [name] — force a specific tier for this chat (Opus, Gemini Pro-high, ...); `/usemodel auto` for the default chain
 /gdrive — pick (or show) which connected Drive account this room uploads to (0 tokens)
+/connectgdrive — connect a new Drive account, through Telegram (owner anywhere, or a registered group's own admin)
 /lang [en|id] — set/show this chat's language for the bot's own fixed replies (0 tokens)
 /mode — read-only right now, or able to make changes? (0 tokens)
 /unlock [minutes] — open a time-boxed window for real changes (owner anywhere, or a registered group's own admin -- capped at 10 min from a group)
@@ -4430,6 +4514,7 @@ Setiap balasan diakhiri tanda "— by ...". Kalau tandanya BUKAN "{TIERS[0]['lab
 /providers — tingkat AI mana saja yang dipakai dan mana yang sehat (NOL token)
 /usemodel [nama] — paksa satu tingkatan tertentu untuk chat ini (Opus, Gemini Pro-high, ...); `/usemodel auto` untuk balik ke rantai default
 /gdrive — pilih (atau lihat) akun Drive mana yang dipakai room ini untuk upload (NOL token)
+/connectgdrive — hubungkan akun Drive baru, lewat Telegram (owner di mana saja, atau admin grup terdaftar)
 /lang [en|id] — atur/lihat bahasa balasan tetap bot untuk chat ini (NOL token)
 /mode — agent lagi read-only atau boleh mengubah? (NOL token)
 /unlock [menit] — buka mode tulis untuk waktu terbatas (pemilik di mana saja, atau admin grup terdaftar -- dibatasi maks 10 menit dari grup)
@@ -4824,6 +4909,191 @@ async def cmd_gdrive_button(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         f"\U0001f4c1 This room now uploads to Drive account: <b>{_tg_escape(remote)}</b>",
         f"\U0001f4c1 Room ini sekarang upload ke akun Drive: <b>{_tg_escape(remote)}</b>",
     ), parse_mode="HTML")
+
+
+GDRIVE_TOKEN_WIZARD_TTL = 900
+# chat_id -> {"step": "await_gdrive_label" | "await_gdrive_token", "name": str|None, "expires": ts}
+_gdrive_wizard: dict[int, dict] = {}
+
+
+def _next_gdrive_default_name() -> str:
+    """"gdrive" if nothing is connected yet, else "gdrive_2", "gdrive_3", ...
+    Only used as a starting SUGGESTION when a second+ account is being added --
+    the operator still gets asked for a short human label first, since a
+    numbered name alone gives nobody picking an account in /gdrive a clue
+    which is which."""
+    existing = set(_list_gdrive_accounts())
+    if "gdrive" not in existing:
+        return "gdrive"
+    n = 2
+    while f"gdrive_{n}" in existing:
+        n += 1
+    return f"gdrive_{n}"
+
+
+def _sanitize_gdrive_label(label: str) -> str:
+    """A free-text label -> "gdrive_<label>", safe as an rclone remote name.
+    Same character set _list_gdrive_accounts()'s own regex expects."""
+    cleaned = re.sub(r"[^A-Za-z0-9_-]+", "_", label.strip()).strip("_")
+    return f"gdrive_{cleaned}"[:60] if cleaned else ""
+
+
+def _gdrive_connect_instructions(lang: str, name: str) -> str:
+    return _t(lang,
+        f"\U0001f511 <b>Connecting ‘{_tg_escape(name)}’</b>\n\n"
+        "Google's OAuth for Drive needs a redirect back to a browser on the SAME "
+        "machine that runs the command -- unlike Gemini/Claude's sign-in, there is no "
+        "single link that works from any device, so this one step has to happen on a "
+        "machine you control that has <code>rclone</code> and a browser (your laptop, "
+        "not necessarily this server):\n\n"
+        f"<pre>rclone authorize drive --drive-scope drive.file</pre>\n\n"
+        "Approve in the browser that opens. rclone will then print a block starting "
+        "with <code>{\"access_token\"...}</code> -- copy that whole line and paste it "
+        "here as your next message. I'll delete it immediately after reading it, same "
+        "as an OAuth code.\n\nSend /cancel to stop.",
+
+        f"\U0001f511 <b>Menghubungkan ‘{_tg_escape(name)}’</b>\n\n"
+        "OAuth Google untuk Drive butuh redirect balik ke browser di mesin YANG SAMA "
+        "dengan yang menjalankan perintah -- beda dari sign-in Gemini/Claude yang satu "
+        "link bisa dibuka dari perangkat mana pun, jadi langkah ini harus dilakukan di "
+        "mesin yang kamu kuasai dan punya <code>rclone</code> + browser (laptop kamu, "
+        "tidak harus server ini):\n\n"
+        f"<pre>rclone authorize drive --drive-scope drive.file</pre>\n\n"
+        "Setujui di browser yang terbuka. rclone lalu mencetak satu blok diawali "
+        "<code>{\"access_token\"...}</code> -- salin seluruh baris itu dan tempel di "
+        "sini sebagai pesan berikutnya. Saya hapus segera setelah dibaca, sama seperti "
+        "kode OAuth.\n\nKirim /cancel untuk berhenti.",
+    )
+
+
+async def cmd_connectgdrive(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Start connecting a NEW Google Drive account, explicitly through Telegram.
+
+    Google's OAuth for a Drive scope has no single portable link the way
+    Gemini/Claude's sign-in does -- rclone's own authorize flow binds a
+    listener on 127.0.0.1 on whichever machine runs it, so it must be run on a
+    machine the operator controls, not this server. What this DOES move into
+    Telegram, and what used to be the risky part done by hand: picking a
+    remote name, editing rclone.conf's TOML by hand, and remembering to check
+    for a duplicate root folder if the same account gets connected twice.
+    Every connect is now attempted, verified, and logged with who did it.
+    """
+    if not await _may_authorize_group_action(update, context):
+        return
+    lang = _chat_lang(update)
+    chat_id = update.effective_chat.id
+    if chat_id in _gdrive_wizard:
+        await update.message.reply_text(_t(lang,
+            "Already connecting one -- finish that (or /cancel) first.",
+            "Sedang menghubungkan satu -- selesaikan itu dulu (atau /cancel)."))
+        return
+
+    existing = _list_gdrive_accounts()
+    if not existing:
+        name = "gdrive"
+        _gdrive_wizard[chat_id] = {
+            "step": "await_gdrive_token", "name": name,
+            "expires": _dt.datetime.now().timestamp() + GDRIVE_TOKEN_WIZARD_TTL,
+        }
+        await update.message.reply_text(
+            _gdrive_connect_instructions(lang, name), parse_mode="HTML")
+        return
+
+    # A second+ account: ask for a short label first so /gdrive's picker stays
+    # meaningful ("gdrive_clienta", not "gdrive_2").
+    _gdrive_wizard[chat_id] = {
+        "step": "await_gdrive_label", "name": None,
+        "expires": _dt.datetime.now().timestamp() + GDRIVE_TOKEN_WIZARD_TTL,
+    }
+    suggestion = _next_gdrive_default_name()
+    await update.message.reply_text(_t(lang,
+        f"Already connected: {', '.join(existing)}.\n\n"
+        f"Short label for this new one (letters/digits/-/_ only, e.g. "
+        f"<code>company</code> or <code>clienta</code>) -- becomes "
+        f"<code>gdrive_&lt;label&gt;</code>. Send just the label, or /cancel.\n\n"
+        f"<i>No preference? Reply {_tg_escape(suggestion.removeprefix('gdrive_') or '2')} "
+        f"for {_tg_escape(suggestion)}.</i>",
+        f"Sudah terhubung: {', '.join(existing)}.\n\n"
+        f"Label pendek untuk yang baru ini (huruf/angka/-/_ saja, mis. "
+        f"<code>company</code> atau <code>clienta</code>) -- jadi "
+        f"<code>gdrive_&lt;label&gt;</code>. Kirim labelnya saja, atau /cancel.\n\n"
+        f"<i>Tidak ada preferensi? Balas {_tg_escape(suggestion.removeprefix('gdrive_') or '2')} "
+        f"untuk {_tg_escape(suggestion)}.</i>",
+    ), parse_mode="HTML")
+
+
+def _rclone_run(*args: str, timeout: int = 60) -> subprocess.CompletedProcess:
+    return subprocess.run([RCLONE_BIN, *args], capture_output=True, text=True, timeout=timeout)
+
+
+def connect_gdrive_account(name: str, token_raw: str) -> tuple[bool, str]:
+    """Register a new rclone Drive remote from a pasted OAuth token, verify it
+    actually works, and roll back cleanly on any failure.
+
+    Never hand-edits rclone.conf -- `rclone config create` is what actually
+    understands the file's format, so a stray character in a pasted token
+    can't corrupt every account already in it.
+    """
+    token_raw = token_raw.strip()
+    try:
+        token = json.loads(token_raw)
+    except (json.JSONDecodeError, ValueError):
+        return False, "that doesn't look like the JSON block rclone printed"
+    if not isinstance(token, dict) or "access_token" not in token:
+        return False, "no access_token in that JSON -- copy the whole printed block"
+    if name in _list_gdrive_accounts():
+        return False, f"'{name}' already exists -- pick a different label"
+
+    try:
+        create = _rclone_run("config", "create", name, "drive",
+                             "scope=drive.file", f"token={token_raw}",
+                             "--non-interactive")
+    except Exception as exc:
+        return False, f"couldn't run rclone: {exc}"
+    if create.returncode != 0:
+        return False, (create.stderr or create.stdout or "rclone config create failed").strip()[:400]
+
+    def rollback() -> None:
+        try:
+            _rclone_run("config", "delete", name, timeout=15)
+        except Exception:
+            logger.warning("could not roll back the half-configured remote %s", name, exc_info=True)
+
+    # Same duplicate-folder guard the manual README steps documented: if this
+    # token turns out to be the SAME underlying Google account as one already
+    # connected (a re-authorize by mistake, or a typo'd label), the shared
+    # root folder already exists -- creating it again would silently split
+    # future uploads across two "iSmart-LA Data" folders with nothing to
+    # notice until files start landing in the wrong one.
+    try:
+        listing = _rclone_run("lsd", f"{name}:", timeout=30)
+        if listing.returncode != 0:
+            rollback()
+            return False, "connected, but couldn't list the Drive root: " + \
+                (listing.stderr or listing.stdout or "").strip()[:300]
+        if GDRIVE_ROOT not in listing.stdout:
+            mk = _rclone_run("mkdir", f"{name}:{GDRIVE_ROOT}", timeout=30)
+            if mk.returncode != 0:
+                rollback()
+                return False, "connected, but couldn't create the data folder: " + \
+                    (mk.stderr or mk.stdout or "").strip()[:300]
+    except Exception as exc:
+        rollback()
+        return False, f"connected, but the folder check failed: {exc}"
+
+    # Verify, don't assume -- the same principle applied to the node guard:
+    # confirm this remote genuinely serves the folder before calling it done.
+    try:
+        verify = _rclone_run("lsd", f"{name}:{GDRIVE_ROOT}", timeout=30)
+        if verify.returncode != 0:
+            rollback()
+            return False, "verification failed after setup: " + \
+                (verify.stderr or verify.stdout or "").strip()[:300]
+    except Exception as exc:
+        rollback()
+        return False, f"verification failed after setup: {exc}"
+
+    return True, "connected and verified"
 
 
 async def cmd_mode(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -6873,6 +7143,7 @@ def main() -> None:
     app.add_handler(CommandHandler("lock", cmd_lock))
     app.add_handler(CommandHandler("usemodel", cmd_usemodel))
     app.add_handler(CommandHandler("gdrive", cmd_gdrive))
+    app.add_handler(CommandHandler("connectgdrive", cmd_connectgdrive))
     app.add_handler(CommandHandler(["lang", "language"], cmd_lang))
     app.add_handler(CallbackQueryHandler(cmd_gdrive_button, pattern="^gdrv:"))
     app.add_handler(CommandHandler("mode", cmd_mode))

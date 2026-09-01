@@ -1,5 +1,62 @@
 # Changelog
 
+## v0.2b.45 -- connecting a Google Drive account now goes through Telegram
+
+Asked directly: why did gdrive already show a connected account without ever
+going through a consent flow the way Gemini/Claude's sign-in does? Checking
+confirmed the account itself was genuinely working -- a real upload, link
+fetch, and cleanup all succeeded live -- but nothing about HOW it got
+connected, by whom, or when was ever visible from Telegram. It was a step
+done directly on the host, exactly as documented, which is precisely the
+problem being raised: unlike Gemini/Claude, there was no explicit, auditable
+moment of consent inside the tool the operator actually uses.
+
+Replicating Gemini/Claude's exact UX -- one link, paste a short code -- turned
+out not to be possible, and this was verified live rather than assumed: running
+`rclone authorize` directly on the server printed
+
+    please go to the following link: http://127.0.0.1:53682/auth?state=...
+    NOTICE: Waiting for code...
+
+a URL pointing at the SERVER's own localhost. Opened from any other device it
+simply fails to connect. Google's OAuth for rclone's Drive backend waits for a
+network redirect back to a local listener, not a portable code -- a real
+platform constraint agy/claude's OOB-style flow does not share.
+
+So the one unavoidable manual step -- running `rclone authorize` once, on a
+machine the operator controls with a browser -- stays. Everything that used to
+be the risky, error-prone part after that moves into Telegram:
+
+- **`/connectgdrive`** starts the flow, gated the same as `/addserver` (owner
+  anywhere, or a registered group's own admin).
+- The bot picks a collision-free name (`gdrive` for the first account, asks
+  for a short label for a second+ one -- `gdrive_company`, not `gdrive_2`).
+- Registers via `rclone config create` -- verified live, with a harmless probe
+  remote, not to disturb any existing account's config.
+- Checks whether the SAME underlying account already has the shared
+  `iSmart-LA Data` root folder before creating one -- the exact duplicate-folder
+  risk the old manual README steps could only warn about, now actually
+  prevented rather than just documented.
+- **Verifies with a real Drive listing before ever reporting success** -- the
+  same "prove it, don't assume it" principle the node guard just got in
+  v0.2b.43/44. "Connected" now always means an actual API call worked.
+- **Rolls back cleanly on any failure** (`rclone config delete`) so a bad paste
+  never leaves a half-configured remote lying around to confuse `_list_gdrive_
+  accounts()` later.
+- Deletes the pasted token from the chat immediately, the same treatment an
+  OAuth code gets -- it is a credential, however short-lived.
+- Every connect is logged with who did it and when.
+
+Verified twice: the full mocked suite, and separately end to end against the
+REAL production Drive account on 10.10.59.40 -- extracted the existing
+account's own token, ran it through `connect_gdrive_account()` under a throwaway
+name, got a real listing back (which even showed a leftover folder from an
+earlier, unrelated live test in this same session, confirming it was really
+talking to the same live account), then cleaned up with zero residue.
+
+New: `dev/test_connectgdrive.py`, 32 tests. Full suite: 255/255 across 15 files.
+
+
 ## v0.2b.44 -- securing a host must not lock the agent out of it
 
 Follow-up to v0.2b.43, and a bug in v0.2b.43 itself, found while confirming
