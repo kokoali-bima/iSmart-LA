@@ -1,5 +1,50 @@
 # Changelog
 
+## v0.2b.42 -- /graduate can finally see Gemini's history
+
+Asked for directly, after the previous release pointed out that /graduate is
+the only command that genuinely REDUCES future token spend -- it turns a
+solved case into a script that costs zero model tokens to reuse -- and then
+had to add that it usually would not work.
+
+It only ever read the primary Claude session, and admitted as much in its own
+refusal:
+
+    "if the last turn was answered by Gemini/'mini', /graduate can't see that
+     history -- current limitation, each tier keeps its own history"
+
+Since the default chain answers with Gemini FIRST, the cheapest and most
+common path was exactly the one that could not be graduated. The cost-saving
+feature was unavailable for most cases, which is backwards.
+
+Verified behaviourally against both versions, same Gemini-only session:
+
+    v0.2b.41  did it graduate? -> NO -- refused
+              "Belum ada percakapan Claude (dede iku) di sesi ini..."
+    v0.2b.42  routes to the agy tier and makes a real call
+
+Two parts to the fix:
+
+- Each completed turn now records **which tier answered** (`last_model` on the
+  session). Each tier keeps its own history, so that is the only reliable
+  pointer to where the work actually happened.
+- `_graduate_target()` resolves the session to `(provider, model,
+  conversation_id)`: the tier that answered last, else any Claude
+  conversation, else any agy one. /graduate then runs the same instruction
+  through whichever provider that is.
+
+Also here, since it is the same class of problem v0.2b.40 fixed for turns:
+/graduate's CLI call now goes through an executor instead of blocking the
+event loop, and the reply is tagged `— graduated from <tier>` so it is
+visible which history it was built from.
+
+New: `dev/test_graduate.py`, 16 tests -- target resolution in every
+precedence order, the Gemini-only case running end to end through the agy
+tier with the id stored back on the agy side, a clean refusal when there is
+no history at all, and a turn recording `last_model`. Full suite: 202/202
+across 13 files.
+
+
 ## v0.2b.41 -- a new chat could inherit another chat's conversation
 
 Found while working on /graduate, and more serious than the thing being

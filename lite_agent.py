@@ -3094,6 +3094,39 @@ async def cmd_tools(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await _reply_chunked(update, f"```\n{out}\n```")
 
 
+def _graduate_target(sess: dict) -> Optional[tuple[str, str, str]]:
+    """-> (provider, model, conversation_id) for the tier holding the case
+    just solved, or None if this session has no history anywhere yet.
+
+    /graduate used to look only at the primary Claude session, and said so in
+    its own refusal ("if the last turn was answered by Gemini/'mini',
+    /graduate can't see that history"). Since the default chain answers with
+    Gemini first, that meant the one feature that genuinely REDUCES future
+    token spend -- turning a solved case into a zero-token script -- was
+    unavailable for most cases, which is precisely backwards.
+
+    Preference order: whichever tier actually answered last (that is where the
+    history is), then any Claude conversation, then any agy one.
+    """
+    last = sess.get("last_model")
+    agy_convs = sess.get("agy") or {}
+    claude_sessions = sess.get("claude") or {}
+    if last:
+        if agy_convs.get(last):
+            return "agy", last, agy_convs[last]
+        if claude_sessions.get(last):
+            return "claude", last, claude_sessions[last]
+    if claude_sessions.get(CLAUDE_MODEL_PRIMARY):
+        return "claude", CLAUDE_MODEL_PRIMARY, claude_sessions[CLAUDE_MODEL_PRIMARY]
+    for m, cid in claude_sessions.items():
+        if cid:
+            return "claude", m, cid
+    for m, cid in agy_convs.items():
+        if cid:
+            return "agy", m, cid
+    return None
+
+
 async def cmd_graduate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Turn the case just solved in this session into a reusable script.
 
@@ -3119,23 +3152,33 @@ async def cmd_graduate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     sessions = load_sessions()
     state = get_chat_state(sessions, chat_id)
     active = state["active"]
-    claude_session_id = state["sessions"].get(active, {}).get("claude", {}).get(CLAUDE_MODEL_PRIMARY)
-    if not claude_session_id:
+    target = _graduate_target(state["sessions"].get(active, {}))
+    if target is None:
         await update.message.reply_text(_t(lang,
-            "No Claude ('dede iku') conversation in this session to graduate yet "
-            "(if the last turn was answered by Gemini/'mini', /graduate can't see "
-            "that history -- current limitation, each tier keeps its own history). "
-            "Ask again until Claude answers, or finish the case first, then /graduate.",
-            "Belum ada percakapan Claude (dede iku) di sesi ini buat di-graduate (kalau turn "
-            "terakhir dijawab Gemini/mini, /graduate belum bisa lihat history-nya -- "
-            "keterbatasan saat ini, tiap backend punya history sendiri). Coba tanya ulang "
-            "sampai dijawab Claude dulu, atau selesaikan kasusnya, baru /graduate.",
+            "Nothing to graduate yet -- this session has no conversation on any "
+            "tier. Solve a case first (ask, let it investigate, confirm the "
+            "answer), then run /graduate here.",
+            "Belum ada yang bisa di-graduate -- sesi ini belum punya percakapan di "
+            "tier mana pun. Selesaikan dulu satu kasus (tanya, biarkan diselidiki, "
+            "pastikan jawabannya benar), baru jalankan /graduate di sini.",
         ))
         return
+    provider, gmodel, conv_id = target
+    label = BACKEND_LABELS.get(gmodel, gmodel)
 
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+    instruction = GRADUATE_INSTRUCTION.format(name=name)
+    loop = asyncio.get_running_loop()
     try:
-        result = run_claude(GRADUATE_INSTRUCTION.format(name=name), claude_session_id, active, CLAUDE_MODEL_PRIMARY)
+        # Off the event loop for the same reason turns are (v0.2b.40): this
+        # shells out to a CLI and can run for minutes.
+        if provider == "agy":
+            parsed = await loop.run_in_executor(
+                None, functools.partial(_run_agy_once, instruction, gmodel, conv_id))
+            result = _normalize_agy_result(parsed)
+        else:
+            result = await loop.run_in_executor(
+                None, functools.partial(run_claude, instruction, conv_id, active, gmodel))
     except Exception as exc:
         logger.exception("graduate failed")
         await update.message.reply_text(_t(lang, f"⚠️ Error: {exc}", f"⚠️ Error: {exc}"))
@@ -3145,16 +3188,21 @@ async def cmd_graduate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if new_session_id:
         sessions = load_sessions()
         state = get_chat_state(sessions, chat_id)
-        state["sessions"][active]["claude"][CLAUDE_MODEL_PRIMARY] = new_session_id
+        state["sessions"].setdefault(active, _empty_session())
+        state["sessions"][active].setdefault(provider, {})[gmodel] = new_session_id
         save_sessions(sessions)
 
     usage = result.get("usage", {})
     logger.info(
-        "graduate done: name=%s in=%s out=%s cache_read=%s",
-        name, usage.get("input_tokens"), usage.get("output_tokens"),
+        "graduate done: name=%s via=%s:%s in=%s out=%s cache_read=%s",
+        name, provider, gmodel, usage.get("input_tokens"), usage.get("output_tokens"),
         usage.get("cache_read_input_tokens"),
     )
-    await _reply_chunked(update, result.get("result") or _t(lang, "(no response)", "(tidak ada respons)"))
+    body = result.get("result") or _t(lang, "(no response)", "(tidak ada respons)")
+    # Same visibility principle as a normal reply's tag: say which tier's
+    # history this was actually graduated from, since each tier keeps its own
+    # and the answer depends on which one held the case.
+    await _reply_chunked(update, f"{body}\n\n\u2014 graduated from {label}")
 
 
 async def cmd_chatid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -6225,6 +6273,10 @@ async def _run_turn_inner(update: Update, context: ContextTypes.DEFAULT_TYPE, te
     # single-user polling, but avoid clobbering another chat's write.
     sessions = load_sessions()
     state = get_chat_state(sessions, chat_id)
+    # Which tier actually answered is what /graduate needs to find the case's
+    # history later -- each tier keeps its own, so "the last one" is the only
+    # reliable pointer to where the work actually happened.
+    sess["last_model"] = model
     state["sessions"][active] = sess
     save_sessions(sessions)
 
