@@ -51,6 +51,7 @@ Design principles:
 from __future__ import annotations
 
 import asyncio
+import functools
 import datetime as _dt
 import hashlib
 import hmac
@@ -2236,6 +2237,41 @@ def _normalize_agy_result(parsed: dict) -> dict:
 #   agy flash-medium ("mini") -> agy pro-low ("mini pro")
 #   -> claude haiku ("dede iku") -> claude sonnet ("dede nnet")
 # --------------------------------------------------------------------------
+
+# How many model turns may be genuinely in flight at once, process-wide.
+# Less a throughput knob than a memory one: each in-flight turn is a real
+# agy/claude subprocess, and one agy process was measured at ~240MB RSS on a
+# live deployment, so an unbounded fan-out is how a busy group becomes an OOM.
+MAX_CONCURRENT_TURNS = int(os.environ.get("MAX_CONCURRENT_TURNS", "3") or 3)
+
+_turn_slots: Optional[asyncio.Semaphore] = None
+_chat_turn_locks: dict[str, asyncio.Lock] = {}
+
+
+def _turn_semaphore() -> asyncio.Semaphore:
+    """Created lazily so it binds to the running loop rather than import time."""
+    global _turn_slots
+    if _turn_slots is None:
+        _turn_slots = asyncio.Semaphore(MAX_CONCURRENT_TURNS)
+    return _turn_slots
+
+
+def _chat_turn_lock(chat_id: str) -> asyncio.Lock:
+    """One lock per chat: turns run in PARALLEL across chats, strictly in
+    ORDER within a chat.
+
+    Within a chat that ordering is correctness, not politeness -- two turns in
+    the same chat share one session file and the same per-tier conversation
+    ids, so overlapping them would have them clobber each other's resume
+    handles. That is the same class of bug v0.2b.39 had to fix by hand, and
+    there is no reason to reintroduce it concurrently.
+    """
+    lock = _chat_turn_locks.get(chat_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _chat_turn_locks[chat_id] = lock
+    return lock
+
 
 def run_combo(prompt: str, sess: dict, session_name: str,
               forced_tier: Optional[dict] = None) -> tuple[dict, str, list[str]]:
@@ -6082,6 +6118,19 @@ async def _maybe_notify_update(update: Update, context: ContextTypes.DEFAULT_TYP
 
 
 async def _run_turn(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
+    """One agent turn, serialised per chat and capped process-wide.
+
+    The work itself is in _run_turn_inner; this wrapper exists only to hold
+    the two guards while it runs -- see _chat_turn_lock (ordering within a
+    chat, which is a correctness requirement) and _turn_semaphore (a ceiling
+    on how many real subprocesses can exist at once).
+    """
+    async with _chat_turn_lock(str(update.effective_chat.id)):
+        async with _turn_semaphore():
+            await _run_turn_inner(update, context, text)
+
+
+async def _run_turn_inner(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
     """One agent turn, start to finish.
 
     Separate from handle_message because a turn can also be started by the
@@ -6101,7 +6150,15 @@ async def _run_turn(update: Update, context: ContextTypes.DEFAULT_TYPE, text: st
 
     lang = _chat_lang(update)
     try:
-        result, model, attempts = run_combo(text, sess, active, forced_tier=forced_tier)
+        # run_combo shells out to agy/claude and blocks for minutes at a time
+        # -- one live turn was measured at 4m35s. Called directly, as it was
+        # until now, that blocks the whole asyncio loop: the bot could not
+        # answer /status, accept /cancel, or serve any OTHER chat until it
+        # finished. Every other blocking call in this file already goes
+        # through an executor; the longest one in it did not.
+        result, model, attempts = await asyncio.get_running_loop().run_in_executor(
+            None, functools.partial(run_combo, text, sess, active, forced_tier=forced_tier)
+        )
     except Exception as exc:
         logger.exception("combo run failed")
         await update.message.reply_text(_t(lang, f"⚠️ Error: {exc}", f"⚠️ Error: {exc}"))
@@ -6321,7 +6378,14 @@ def main() -> None:
         except Exception:
             logger.warning("could not deliver the post-update notice", exc_info=True)
 
-    app = Application.builder().token(TELEGRAM_BOT_TOKEN).post_init(_announce_update).build()
+    # Without concurrent_updates the guards above are moot: python-telegram-bot
+    # hands updates to handlers strictly one at a time by default, so a long
+    # turn would still stall every other chat and every zero-token command.
+    app = (Application.builder()
+           .token(TELEGRAM_BOT_TOKEN)
+           .post_init(_announce_update)
+           .concurrent_updates(True)
+           .build())
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("cancel", cmd_cancel))
     app.add_handler(CallbackQueryHandler(cmd_setup_button, pattern="^setup:"))

@@ -1,5 +1,53 @@
 # Changelog
 
+## v0.2b.40 -- one long turn no longer freezes the entire bot
+
+Asked whether the bot could handle several prompts at once, each on a
+different tier. Checking turned up something more basic: it could not handle
+two prompts at all, and the reason was one missing wrapper.
+
+`_run_turn` called `run_combo` directly. `run_combo` is a plain synchronous
+function that shells out to agy/claude and blocks for minutes -- one live turn
+on bscloud ran 00:31:11 -> 00:35:46, **four minutes thirty-five seconds**, and
+for every second of it the asyncio loop was blocked. Not just that chat: the
+bot could not answer /status, could not accept /cancel, could not serve any
+other chat or group. `Application.builder()` also left `concurrent_updates`
+unset, so python-telegram-bot serialised updates on top of that.
+
+Fourteen other blocking calls in this file already went through
+`run_in_executor`. The single longest-running one did not.
+
+Now: `run_combo` runs in an executor, `concurrent_updates(True)` is set, and
+two guards bound what that opens up.
+
+- **`_chat_turn_lock`** -- one lock per chat. Turns run in parallel ACROSS
+  chats, strictly in order WITHIN a chat. Within a chat that ordering is
+  correctness, not politeness: two turns there share one session file and the
+  same per-tier conversation ids, so overlapping them would clobber each
+  other's resume handles -- the same class of bug v0.2b.39 just fixed by hand.
+- **`MAX_CONCURRENT_TURNS`** (default 3, env-overridable) -- a process-wide
+  ceiling. Each in-flight turn is a real subprocess, and one agy process was
+  measured at ~240MB RSS, so unbounded fan-out is how a busy group becomes an
+  OOM. Capping delays turns; it never drops them.
+
+Token cost of all this: **zero**. Same prompts, same cheapest-first ladder,
+same conversations -- only the waiting changed.
+
+Deliberately NOT done: pinning a different tier per prompt (mini here, sonnet
+there). It reads like load-spreading but bills like the opposite -- it skips
+the cheapest-first ladder that makes the chain cheap, and since each tier
+keeps its own conversation, it multiplies both brief injections and cold
+caches. This deployment's own numbers make the point: a warm conversation
+showed `cache_read=1,379,979`, while a cold start re-sends the brief at
+`prompt_len=11823`.
+
+New: `dev/test_concurrency.py`, 7 tests -- the loop stays responsive during a
+turn (this one FAILS against v0.2b.39, verified), different chats overlap, the
+same chat never does and strictly alternates start/end, the cap is a real
+ceiling, and capped turns still all complete. Full suite: 176/176 across 11
+files.
+
+
 ## v0.2b.39 -- "continue this" was starting over instead of continuing
 
 Reported from a real session: the same task was being re-explained to the
