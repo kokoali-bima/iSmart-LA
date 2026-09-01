@@ -1787,7 +1787,28 @@ ALL_TIERS = TIERS + EXTRA_TIERS
 # tier's history, but each tier's OWN history stays continuous across turns.
 # --------------------------------------------------------------------------
 
-EMPTY_SESSION = {"claude": {}, "agy": {}}
+def _empty_session() -> dict:
+    """A genuinely fresh, unshared session block.
+
+    This was a module-level constant copied with `dict(EMPTY_SESSION)` -- a
+    SHALLOW copy, so the two inner dicts were the SAME objects in every
+    session ever created that way. run_combo writes resume handles straight
+    into them (`sess.setdefault("agy", {})[model] = conversation_id`), so the
+    first chat to answer anything wrote its conversation id into the shared
+    constant, and every session created afterwards inherited it.
+
+    Two things that caused, both confirmed against the real get_chat_state:
+      * /new did not actually start fresh -- it handed back a session already
+        pointing at the previous conversation, quietly defeating the single
+        biggest cost-saving habit this bot documents.
+      * a brand-new chat could resume a DIFFERENT chat's conversation, which
+        in a deployment shared between groups is a context leak, not just a
+        billing surprise.
+
+    A function, not a constant, so there is no shared mutable default left to
+    reintroduce it.
+    """
+    return {"claude": {}, "agy": {}}
 # Both "agy" and "claude" are dicts keyed by model name -- each of the 4 tiers
 # gets its OWN session/conversation id. Resuming a conversation started on one
 # model using a DIFFERENT model produced a dramatically more expensive single
@@ -1816,7 +1837,7 @@ def get_chat_state(sessions: dict, chat_id: str) -> dict:
     dicts keyed by model name (needed once Claude also got two explicit tiers)."""
     entry = sessions.get(chat_id)
     if entry is None:
-        entry = {"active": DEFAULT_SESSION_NAME, "sessions": {DEFAULT_SESSION_NAME: dict(EMPTY_SESSION)}}
+        entry = {"active": DEFAULT_SESSION_NAME, "sessions": {DEFAULT_SESSION_NAME: _empty_session()}}
     elif isinstance(entry, str):
         # oldest format: chat_id mapped directly to a claude session_id string
         entry = {
@@ -1845,7 +1866,7 @@ def get_chat_state(sessions: dict, chat_id: str) -> dict:
                 # from back when Claude was routed through a 9Router combo
                 # alias instead of an explicit model.
                 val["claude"] = {CLAUDE_MODEL_PRIMARY: val["claude"]} if val.get("claude") else {}
-        entry["sessions"].setdefault(entry["active"], dict(EMPTY_SESSION))
+        entry["sessions"].setdefault(entry["active"], _empty_session())
         for name in entry["sessions"]:
             entry["sessions"][name].setdefault("claude", {})
             entry["sessions"][name].setdefault("agy", {})
@@ -2937,7 +2958,7 @@ async def cmd_new(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     sessions = load_sessions()
     state = get_chat_state(sessions, chat_id)
     active = state["active"]
-    state["sessions"][active] = dict(EMPTY_SESSION)
+    state["sessions"][active] = _empty_session()
     save_sessions(sessions)
     lang = _chat_lang(update)
     await update.message.reply_text(_t(lang,
@@ -2964,7 +2985,7 @@ async def cmd_session(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     state = get_chat_state(sessions, chat_id)
     is_new = name not in state["sessions"]
     if is_new:
-        state["sessions"][name] = dict(EMPTY_SESSION)
+        state["sessions"][name] = _empty_session()
     state["active"] = name
     save_sessions(sessions)
     if is_new:

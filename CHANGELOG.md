@@ -1,5 +1,47 @@
 # Changelog
 
+## v0.2b.41 -- a new chat could inherit another chat's conversation
+
+Found while working on /graduate, and more serious than the thing being
+worked on. Sessions were built with `dict(EMPTY_SESSION)` off a module-level
+constant:
+
+    EMPTY_SESSION = {"claude": {}, "agy": {}}
+
+`dict()` is a SHALLOW copy, so the two inner dicts were the SAME objects in
+every session ever created that way -- and run_combo writes resume handles
+straight into them (`sess.setdefault("agy", {})[model] = conversation_id`).
+The first chat to answer anything therefore wrote its conversation id into
+the shared constant, and every session created afterwards started life
+already pointing at it.
+
+Confirmed against the real `get_chat_state`, not reasoned about:
+
+    chatB brand-new session -> {'claude': {}, 'agy': {'m': 'A-CONV', ...}}
+    CROSS-CHAT LEAK?        -> True
+
+Two consequences, the second being the one that matters:
+
+  * **/new did not actually start fresh.** It handed back a session still
+    pointing at the previous conversation -- quietly defeating "`/new` every
+    time the topic changes", the single biggest cost-saving habit this
+    project's own README teaches. And because /new then saves, the inherited
+    id was persisted, so it outlived the process.
+  * **A brand-new chat could resume a DIFFERENT chat's conversation.** In a
+    deployment shared between groups -- which this project supports
+    deliberately, per-group PINs and all -- that is a context leak between
+    tenants, not just a billing surprise.
+
+`EMPTY_SESSION` is now `_empty_session()`, a function returning a fresh
+block every call, so there is no shared mutable default left to reintroduce
+this. All five copy sites use it.
+
+New: `dev/test_session_isolation.py`, 10 tests -- fresh sessions don't share
+inner dicts, a new chat doesn't inherit another chat's ids, /new really
+resets both sides, and two named sessions in one chat stay independent. Full
+suite: 186/186 across 12 files.
+
+
 ## v0.2b.40 -- one long turn no longer freezes the entire bot
 
 Asked whether the bot could handle several prompts at once, each on a
