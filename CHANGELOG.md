@@ -1,5 +1,55 @@
 # Changelog
 
+## v0.2b.47 -- /setownerscope: extra scope, owner-only, DM-only
+
+Asked for directly, after discussing that a scoped-down agent refuses general
+questions by design: the team wants ONE shared broadened scope for every
+group (a general-purpose assistant, jokes included, not just infrastructure),
+plus something EXTRA the owner alone gets -- and confirmed explicitly that the
+extra part must apply ONLY in the owner's own DM, never a group, "bukan di
+group" even when the owner is the one typing there.
+
+/setscope already covers the first half -- one shared brief, identical
+everywhere. This adds the second half as an independent layer rather than a
+second brief to keep in sync: `/setownerscope <text>` records extra
+instructions in a small new file (`OWNER_SCOPE.md`), injected into the prompt
+ONLY when BOTH are true for the message actually being answered -- the sender
+is the owner, and the chat is their own private DM.
+
+Checked fresh on every single turn, the same way MEMORY.md and
+write_mode_notice() already are -- deliberately NOT tied to whether a
+conversation is fresh or resumed (unlike the environment brief, which is only
+sent once per conversation). That matters for two failure modes a
+once-per-conversation design would have hit: a non-owner continuing the
+owner's own resumed DM conversation must not inherit it from history, and the
+owner showing up partway through an existing conversation must get it
+immediately, not only on a conversation that happens to start after they set
+it.
+
+Wired through both backends: agy gets it folded into the prompt text exactly
+like the environment brief and MEMORY.md already are (agy has no
+--append-system-prompt equivalent); Claude Code CLI gets it combined into the
+SAME --append-system-prompt call as MEMORY.md, rather than a second one --
+whether the CLI accumulates repeated flags or lets the last one win was never
+verified, and combining avoids depending on either answer.
+
+`run_combo()` gained an `owner_dm` parameter threaded through from
+`_run_turn_inner`, computed once as `_is_owner(update) and
+update.effective_chat.type == "private"` -- the exact condition asked for,
+confirmed explicitly by a live test case: the owner speaking in a group does
+NOT get the extra scope, only the owner in their own DM does.
+
+New: `dev/test_owner_scope.py`, 28 tests -- storage round-trip, both backends'
+prompt building with the gate on and off, `run_combo` threading it through to
+whichever tier answers, all four sender/location combinations (owner+DM only
+applies; owner+group, other+DM, other+group all correctly don't), and the
+full `/setownerscope` command (permission gating, DM-only gating, show
+current value, set, clear, clearing twice reports honestly rather than
+pretending). Two pre-existing test files mocked `run_combo()` with the OLD
+signature and needed their fakes updated to accept the new keyword --
+harness-only, no behaviour affected. Full suite: 294/294 across 17 files.
+
+
 ## v0.2b.46 -- editing a sent command used to crash its handler
 
 Asked for a health check across both deployments -- errors today, anything

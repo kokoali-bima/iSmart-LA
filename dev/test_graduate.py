@@ -127,7 +127,7 @@ async def main():
     # --- 3. a turn records which tier answered ----------------------------
     sessions3 = {}
     saved3 = {}
-    def fake_combo(text, sess, active, forced_tier=None):
+    def fake_combo(text, sess, active, forced_tier=None, owner_dm=False):
         return {"result": "ok", "usage": {}}, CLA, []
     u3 = upd()
     with patch.object(mod, "run_combo", side_effect=fake_combo), \

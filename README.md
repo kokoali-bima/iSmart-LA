@@ -4,7 +4,7 @@ A lightweight Telegram bridge to **Claude Code** and **Antigravity CLI (agy)**, 
 infrastructure monitoring and investigation -- built to be dramatically cheaper to run
 than a full agent framework, while staying just as capable for real operational work.
 
-> **Status: v0.2b.46 -- early/beta.** Built and battle-tested against a real production
+> **Status: v0.2b.47 -- early/beta.** Built and battle-tested against a real production
 > Proxmox VE cluster over several days of iteration, including a live-fire test of the
 > unlock/PIN/snapshot flow against real infrastructure. Works well; still has known
 > rough edges (see [Known limitations](#known-limitations)).
@@ -164,6 +164,27 @@ where it lands: always inside the learned zone, never anywhere else. The boundar
 enforced by code, not by the model's cooperation. Bootstrap follows the same rule --
 your hard boundaries are copied in verbatim, never paraphrased by a model.
 
+#### `/setownerscope` -- extra scope, owner-only, DM-only
+
+`/setscope` is deliberately **one shared setting** -- every group and every DM sees
+the exact same brief, on purpose, so there's one predictable answer to "what is this
+bot for" everywhere it's used. `/setownerscope` sits on top of that for one specific
+case: the owner wants the bot to also help with general things (a joke, casual
+questions) in their own DM, without loosening what every group gets.
+
+It applies only when BOTH are true for the message actually being answered right
+now: the sender is the owner, AND the chat is the owner's own private DM -- never a
+group, even one the owner happens to be speaking in, and checked fresh on every
+turn so a conversation the owner started can't go on granting it to whoever else
+continues it, or vice versa. Nothing needs to be reset when the group scope changes
+later; the two are independent layers, not a copy that can drift out of sync.
+
+```
+/setownerscope also help with general questions and the occasional joke, not just infrastructure
+```
+
+`/setownerscope clear` removes it; running it bare shows what's currently set.
+
 ### Using a gateway instead (optional)
 
 Claude Code signs in to your subscription directly, so **no gateway is needed** — this
@@ -207,6 +228,7 @@ Ollama, say), since something has to translate between protocols.
 | `/update` | owner/admin + PIN | Check GitHub for a newer version and install it |
 | `/setbrief <one line>` | owner/admin | Say what this agent looks after (also the 4th item on `/start`) |
 | `/setscope <phrase>` | owner/admin | Change what KIND of assistant it is, not just what it manages |
+| `/setownerscope <text>` | owner, **own DM only** | Extra scope on top of `/setscope`, for the owner alone, in their own DM only -- never a group, even one the owner is speaking in |
 | `/logout` | owner/admin | Clear a sign-in (Gemini or Claude) for a genuinely fresh /start |
 | `/boundaries` | **0 tokens** | What the agent must never do |
 | `/addboundary <rule>` | owner/admin | Add a hard boundary — run it bare for an explanation of what that means |

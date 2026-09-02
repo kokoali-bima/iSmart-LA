@@ -88,6 +88,7 @@ ALLOWED_GROUPS_FILE = BASE_DIR / "allowed_groups.json"
 SYSTEM_PROMPT_FILE = BASE_DIR / "SOUL.md"
 GEMINI_PROMPT_FILE = BASE_DIR / "GEMINI.md"
 MEMORY_FILE = BASE_DIR / "MEMORY.md"
+OWNER_SCOPE_FILE = BASE_DIR / "OWNER_SCOPE.md"
 LOG_FILE = BASE_DIR / "lite-agent.log"
 # Deterministic collectors: known questions answered by a script, no LLM
 # involved, so a repeat of an already-solved case costs zero tokens. See /status.
@@ -1618,6 +1619,37 @@ def set_brief_scope(scope: str) -> bool:
     return touched
 
 
+# Extra scope granted ONLY when the CURRENT message is confirmed from the bot
+# owner (_is_owner(update), checked fresh every turn -- not baked into a
+# brief that's shared by everyone). Deliberately separate from /setscope:
+# /setscope changes what the agent is FOR, seen by every chat identically;
+# this changes what it's ADDITIONALLY willing to do, and only when the sender
+# really is the owner, so a group's shared scope can stay narrow (or broad)
+# for everyone while the owner alone gets more without a second brief to keep
+# in sync, and without a non-owner's turn in the same conversation history
+# ever inheriting it by accident.
+def owner_scope_text() -> str:
+    if not OWNER_SCOPE_FILE.exists():
+        return ""
+    try:
+        return OWNER_SCOPE_FILE.read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+
+
+def set_owner_scope(text: str) -> None:
+    OWNER_SCOPE_FILE.write_text(text.strip() + "\n", encoding="utf-8")
+    logger.warning("owner-only extra scope set (%d chars)", len(text.strip()))
+
+
+def clear_owner_scope() -> bool:
+    if not OWNER_SCOPE_FILE.exists():
+        return False
+    OWNER_SCOPE_FILE.unlink()
+    logger.warning("owner-only extra scope cleared")
+    return True
+
+
 # --------------------------------------------------------------------------
 # Self-update
 # --------------------------------------------------------------------------
@@ -2190,7 +2222,7 @@ def append_memory(fact: str) -> None:
 # --------------------------------------------------------------------------
 
 def _run_claude_once(prompt: str, session_id: Optional[str], session_name: str, model: str,
-                     timeout: Optional[int] = None) -> dict:
+                     timeout: Optional[int] = None, owner_dm: bool = False) -> dict:
     env = os.environ.copy()
     if USE_GATEWAY:
         env["ANTHROPIC_BASE_URL"] = ANTHROPIC_BASE_URL
@@ -2209,9 +2241,18 @@ def _run_claude_once(prompt: str, session_id: Optional[str], session_name: str, 
         "--allowedTools", ALLOWED_TOOLS,
     ]
 
+    # Checked fresh every turn, same as agy's _build_agy_prompt -- a group
+    # conversation must never carry this even if the owner once spoke in it,
+    # and the owner's own DM must have it the instant they show up in a
+    # resumed conversation, not just when one starts. Folded into the SAME
+    # --append-system-prompt call as MEMORY.md rather than a second one, since
+    # whether Claude Code CLI accumulates repeated flags or lets the last one
+    # win was never verified and isn't worth depending on either way.
     memory_text = load_memory_text()
-    if memory_text:
-        cmd += ["--append-system-prompt", memory_text]
+    extra_parts = [p for p in (memory_text, owner_scope_text() if owner_dm else "") if p]
+    combined_extra = "\n\n".join(extra_parts)
+    if combined_extra:
+        cmd += ["--append-system-prompt", combined_extra]
 
     if session_id:
         cmd += ["--resume", session_id]
@@ -2221,8 +2262,8 @@ def _run_claude_once(prompt: str, session_id: Optional[str], session_name: str, 
         cmd += ["--name", session_name]
 
     logger.info(
-        "running claude: session_name=%s session_id=%s prompt_len=%d memory_chars=%d",
-        session_name, session_id, len(prompt), len(memory_text),
+        "running claude: session_name=%s session_id=%s prompt_len=%d memory_chars=%d owner_dm=%s",
+        session_name, session_id, len(prompt), len(memory_text), owner_dm,
     )
     proc = subprocess.run(
         cmd, cwd=str(BASE_DIR), env=env,
@@ -2238,15 +2279,15 @@ def _run_claude_once(prompt: str, session_id: Optional[str], session_name: str, 
 
 
 def run_claude(prompt: str, session_id: Optional[str], session_name: str, model: str,
-              timeout: Optional[int] = None) -> dict:
+              timeout: Optional[int] = None, owner_dm: bool = False) -> dict:
     """Run one Claude Code turn on an explicit model. Falls back to a fresh
     session if --resume fails (e.g. the referenced session expired)."""
     try:
-        return _run_claude_once(prompt, session_id, session_name, model, timeout)
+        return _run_claude_once(prompt, session_id, session_name, model, timeout, owner_dm)
     except RuntimeError as exc:
         if session_id:
             logger.warning("resume with session=%s failed (%s), retrying fresh", session_id, exc)
-            return _run_claude_once(prompt, None, session_name, model, timeout)
+            return _run_claude_once(prompt, None, session_name, model, timeout, owner_dm)
         raise
 
 
@@ -2254,7 +2295,7 @@ def run_claude(prompt: str, session_id: Optional[str], session_name: str, model:
 # agy (Antigravity CLI) invocation -- native Gemini access, fixed-price
 # --------------------------------------------------------------------------
 
-def _build_agy_prompt(prompt: str, include_env: bool = False) -> str:
+def _build_agy_prompt(prompt: str, include_env: bool = False, owner_dm: bool = False) -> str:
     """agy has no --append-system-prompt equivalent, so context is folded into
     the prompt text itself.
 
@@ -2281,6 +2322,20 @@ def _build_agy_prompt(prompt: str, include_env: bool = False) -> str:
     memory_text = load_memory_text()
     if memory_text:
         parts.append(f"[Cross-session facts to remember:]\n{memory_text}")
+    # Checked fresh every turn, unlike include_env above -- on purpose: a
+    # group conversation must never carry this even if the owner once spoke
+    # in it, and the owner's own DM must have it the instant they show up in
+    # a resumed conversation, not just when one starts. owner_dm reflects
+    # THIS turn's real sender and chat type (owner, AND in their own private
+    # DM -- never a group, even one the owner is speaking in), confirmed by
+    # the caller, not something conversation history can carry forward.
+    if owner_dm:
+        extra = owner_scope_text()
+        if extra:
+            parts.append(
+                "[Additional scope, ONLY because this message is confirmed from "
+                f"the bot owner in their own private chat:]\n{extra}"
+            )
     # Placed BEFORE the early return below: on a resumed turn with an empty
     # MEMORY.md there is nothing else to prepend, and an earlier version
     # returned here -- silently dropping the mode notice in exactly the case
@@ -2517,13 +2572,19 @@ def _chat_turn_lock(chat_id: str) -> asyncio.Lock:
 
 
 def run_combo(prompt: str, sess: dict, session_name: str,
-              forced_tier: Optional[dict] = None) -> tuple[dict, str, list[str]]:
+              forced_tier: Optional[dict] = None, owner_dm: bool = False) -> tuple[dict, str, list[str]]:
     """Walk the TIERS chain in order, moving on only when a tier fails in a way
     another tier could plausibly survive.
 
     `sess` is this named session's {"claude": {model: id}, "agy": {model: id}}
     dict -- mutated in place with whichever tier's resume handle actually got
     used; the caller persists it afterward.
+
+    `owner_dm`: True only when THIS turn is confirmed from the bot owner in
+    their own private chat (never a group, even one the owner is speaking
+    in) -- see owner_scope_text(). Passed straight through to whichever
+    backend answers so it can fold in the owner's extra scope; a resumed
+    conversation never carries it forward on its own.
 
     Returns (normalized_result, model_name, attempt_log). model_name is the
     literal model that answered -- never an alias -- so the "— by <label>" tag
@@ -2554,7 +2615,8 @@ def run_combo(prompt: str, sess: dict, session_name: str,
                 # starting from nothing, which may be a later one even while an
                 # earlier one is mid-conversation.
                 parsed = _run_agy_once(
-                    _build_agy_prompt(prompt, include_env=(conv_id is None)), model, conv_id
+                    _build_agy_prompt(prompt, include_env=(conv_id is None), owner_dm=owner_dm),
+                    model, conv_id
                 )
                 usage = parsed.get("usage", {}) or {}
                 attempts.append(f"agy:{model} OK ({usage.get('total_tokens', '?')} tok)")
@@ -2564,7 +2626,8 @@ def run_combo(prompt: str, sess: dict, session_name: str,
                 _agy_reauth_last_notice = 0.0  # a real success -- the next outage is a fresh one
                 return _normalize_agy_result(parsed), model, attempts
 
-            result = run_claude(prompt, claude_sessions.get(model), session_name, model)
+            result = run_claude(prompt, claude_sessions.get(model), session_name, model,
+                               owner_dm=owner_dm)
             usage = result.get("usage", {}) or {}
             total = sum(v for v in usage.values() if isinstance(v, int))
             attempts.append(f"claude:{model} OK ({total} tok)")
@@ -4383,6 +4446,78 @@ async def cmd_setscope(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     ), parse_mode="HTML")
 
 
+async def cmd_setownerscope(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Extra scope that applies ONLY when the owner is speaking in their own
+    private chat with the bot -- never in a group, even one the owner is
+    speaking in, and never for anyone else even inside the owner's own
+    resumed conversation. See owner_scope_text() / run_combo(owner_dm=...).
+
+    Deliberately separate from /setscope: /setscope changes what the agent IS
+    FOR, identically for every chat that talks to it; this changes what it's
+    ADDITIONALLY willing to do, and only in the one place it can't leak into
+    a group's shared, possibly narrower, brief.
+
+    Owner-only (not group-admin-eligible like /setscope) and only runnable
+    from the owner's own DM -- run from a group, the "where does this even
+    apply" question has an obvious wrong answer waiting to happen.
+    """
+    lang = _chat_lang(update)
+    if not _is_owner(update):
+        return await update.message.reply_text(_t(lang,
+            "\U0001f512 Bot owner only.", "\U0001f512 Cuma pemilik bot."))
+    if update.effective_chat.type != "private":
+        return await update.message.reply_text(_t(lang,
+            "This only takes effect in your own private chat, so it can only be set "
+            "from there too -- message me directly.",
+            "Ini cuma berlaku di chat pribadi kamu, jadi cuma bisa diatur dari sana juga "
+            "-- chat saya langsung.",
+        ))
+
+    text = " ".join(context.args).strip() if context.args else ""
+    if not text:
+        current = owner_scope_text()
+        if current:
+            return await update.message.reply_text(_t(lang,
+                f"\U0001f451 <b>Your extra scope</b> (this chat only):\n\n{_tg_escape(current)}\n\n"
+                "<code>/setownerscope clear</code> to remove it, or send new text to replace it.",
+                f"\U0001f451 <b>Scope tambahan kamu</b> (cuma di chat ini):\n\n{_tg_escape(current)}\n\n"
+                "<code>/setownerscope clear</code> untuk menghapus, atau kirim teks baru untuk mengganti.",
+            ), parse_mode="HTML")
+        return await update.message.reply_text(_t(lang,
+            "\U0001f451 <b>Extra scope, just for you, just here</b>\n\n"
+            "Every chat already gets whatever /setscope set. This ADDS to that, but only "
+            "when you're the one messaging me here -- a group never gets it, even one "
+            "you're speaking in, and this chat's own history never carries it to anyone "
+            "else who might resume it.\n\n"
+            "<code>/setownerscope can also help with general questions, jokes, and "
+            "anything else, not just infrastructure</code>\n\n"
+            "<i>Takes effect on the next new conversation -- /new applies it now.</i>",
+            "\U0001f451 <b>Scope tambahan, cuma untuk kamu, cuma di sini</b>\n\n"
+            "Setiap chat sudah dapat apa pun yang diatur /setscope. Ini MENAMBAH itu, tapi "
+            "cuma saat kamu yang chat saya di sini -- grup tidak pernah dapat ini, "
+            "walau kamu yang bicara di situ, dan riwayat chat ini juga tidak membawanya "
+            "ke siapa pun lain yang mungkin melanjutkannya.\n\n"
+            "<code>/setownerscope boleh juga bantu pertanyaan umum, joke, dan hal lain, "
+            "tidak cuma infrastruktur</code>\n\n"
+            "<i>Berlaku di percakapan baru berikutnya -- /new untuk langsung terapkan.</i>",
+        ), parse_mode="HTML")
+
+    if text.lower() in ("clear", "hapus", "none"):
+        cleared = clear_owner_scope()
+        return await update.message.reply_text(_t(lang,
+            "✅ Cleared." if cleared else "Nothing was set.",
+            "✅ Sudah dihapus." if cleared else "Memang belum ada yang diatur.",
+        ))
+
+    set_owner_scope(text)
+    await update.message.reply_text(_t(lang,
+        f"✅ <b>Recorded, just for you, just here.</b>\n\n{_tg_escape(text)}\n\n"
+        "<i>Takes effect on the next new conversation -- /new applies it now.</i>",
+        f"✅ <b>Tercatat, cuma untuk kamu, cuma di sini.</b>\n\n{_tg_escape(text)}\n\n"
+        "<i>Berlaku di percakapan baru berikutnya -- /new untuk langsung terapkan.</i>",
+    ), parse_mode="HTML")
+
+
 async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _authorized(update):
         return
@@ -4440,6 +4575,7 @@ Every reply ends with a "— by ..." tag. If it's ever NOT "{TIERS[0]['label']}"
 /update — check GitHub for a newer version and install it (PIN)
 /setbrief <what it looks after> — set the one-line environment brief
 /setscope <kind of assistant> — change the role itself, e.g. beyond infrastructure-only
+/setownerscope <extra text> — extra scope for YOU only, in YOUR DM only (owner-only)
 /logout — clear a sign-in (Gemini or Claude) so the next /start is a genuinely fresh one
 /boundaries — what the agent must never do (0 tokens)
 /addboundary <rule> — add a rule the agent may NEVER break (run it alone to see what that means)
@@ -4502,6 +4638,7 @@ Setiap balasan diakhiri tanda "— by ...". Kalau tandanya BUKAN "{TIERS[0]['lab
 /update — cek versi terbaru di GitHub dan pasang (pakai PIN)
 /setbrief <yang diurus> — atur brief lingkungan satu baris
 /setscope <jenis agent> — ubah perannya sendiri, mis. lebih luas dari infrastruktur saja
+/setownerscope <teks tambahan> — scope tambahan cuma untuk KAMU, cuma di DM KAMU (owner-only)
 /logout — hapus satu sign-in (Gemini atau Claude) supaya /start berikutnya benar-benar baru
 /boundaries — apa yang tidak boleh dilakukan agent (NOL token)
 /addboundary <aturan> — tambah aturan yang TIDAK BOLEH dilanggar agent (ketik sendirian untuk lihat penjelasannya)
@@ -6844,6 +6981,9 @@ async def _run_turn_inner(update: Update, context: ContextTypes.DEFAULT_TYPE, te
 
     forced_model = _read_model_overrides().get(chat_id)
     forced_tier = next((t for t in ALL_TIERS if t["model"] == forced_model), None) if forced_model else None
+    # Owner's extra scope only in their OWN private chat -- never a group,
+    # even one the owner is speaking in. See owner_scope_text()/run_combo.
+    owner_dm = _is_owner(update) and update.effective_chat.type == "private"
 
     lang = _chat_lang(update)
     try:
@@ -6854,7 +6994,8 @@ async def _run_turn_inner(update: Update, context: ContextTypes.DEFAULT_TYPE, te
         # finished. Every other blocking call in this file already goes
         # through an executor; the longest one in it did not.
         result, model, attempts = await asyncio.get_running_loop().run_in_executor(
-            None, functools.partial(run_combo, text, sess, active, forced_tier=forced_tier)
+            None, functools.partial(run_combo, text, sess, active,
+                                    forced_tier=forced_tier, owner_dm=owner_dm)
         )
     except Exception as exc:
         logger.exception("combo run failed")
@@ -7125,6 +7266,7 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(cmd_update_button, pattern="^upd:"))
     app.add_handler(CommandHandler("setbrief", cmd_setbrief))
     app.add_handler(CommandHandler("setscope", cmd_setscope))
+    app.add_handler(CommandHandler("setownerscope", cmd_setownerscope))
     app.add_handler(CommandHandler("addboundary", cmd_addboundary))
     app.add_handler(CommandHandler("rmboundary", cmd_rmboundary))
     app.add_handler(CommandHandler("snapshots", cmd_snapshots))
