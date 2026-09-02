@@ -5009,8 +5009,14 @@ async def cmd_gdrive(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         ))
     lines.append("")
     lines.append(_t(lang, "Tap one to use it here:", "Tap salah satu untuk dipakai di sini:"))
+    # The tick is bound to a name first, deliberately: a backslash escape
+    # INSIDE an f-string expression only became legal in Python 3.12 (PEP 701),
+    # so writing it inline made the whole module fail to import on 3.10/3.11 --
+    # versions install.sh still advertises, and what Debian 12 and Ubuntu 22.04
+    # ship. A syntax error at import is not a degraded feature; nothing runs.
+    tick = "\u2705 "
     rows = [[InlineKeyboardButton(
-        f"{'\u2705 ' if a == effective else ''}{a}", callback_data=f"gdrv:{a}",
+        f"{tick if a == effective else ''}{a}", callback_data=f"gdrv:{a}",
     )] for a in accounts]
     lines.append("")
     lines.append(_t(lang,

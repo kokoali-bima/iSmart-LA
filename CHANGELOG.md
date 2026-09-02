@@ -1,5 +1,53 @@
 # Changelog
 
+## v0.2b.48 -- the module would not import at all on Python 3.10 or 3.11
+
+Found by an external architecture review, verified here, and it is the kind of
+bug that is invisible from any machine new enough to run the code:
+
+    f"{'✅ ' if a == effective else ''}{a}"      # lite_agent.py:5013
+
+A backslash escape INSIDE an f-string expression only became legal in Python
+3.12 (PEP 701). On 3.10 and 3.11 that is a SyntaxError at import time -- so
+nothing runs at all. Not a degraded feature: no bot, no commands, and
+/update's own compile-check would have refused the deploy too.
+
+The versions that matters for: `install.sh` advertises "python3 (3.10+)",
+Ubuntu 22.04 ships 3.10, and Debian 12 -- which Proxmox VE 8 is built on --
+ships 3.11. Those are the most ordinary hosts imaginable for this bot.
+
+Honest note on verification: this could NOT be reproduced by running it. Every
+interpreter reachable from this project is already too new (dev box 3.14, bot
+host 3.12.3, Proxmox node 3.13.5), and `ast.parse(..., feature_version=(3,11))`
+is no substitute -- it does not emulate the older f-string tokenizer and
+happily accepts the broken line. So the fix rests on code inspection plus PEP
+701, and the report to the operator said exactly that rather than rounding it
+up to "confirmed".
+
+Fixed by binding the literal to a name first, which is valid on every version:
+
+    tick = "✅ "
+    f"{tick if a == effective else ''}{a}"
+
+Checked for siblings while in there: this was the ONLY such f-string in the
+whole project, and there is no other 3.11-or-3.12-only construct anywhere
+(`str.removeprefix` is 3.9, builtin generics are 3.9, and the module already
+uses `from __future__ import annotations`). So install.sh's existing "3.10+"
+claim becomes TRUE with this one line -- it needed no edit, it needed the code
+to catch up to it.
+
+New: `dev/test_py_compat.py`, 7 tests. Rather than asking an interpreter it
+cannot have, it walks the AST and reads the source text of every f-string
+expression directly -- identical behaviour on every Python version, no matrix
+and no CI required to be useful today. Verified both ways: the detector fires
+on the pre-fix file (pointing at lite_agent.py:5013 by name) and stays quiet
+on the fixed one, and it deliberately does NOT false-positive on a backslash
+sitting in the harmless LITERAL half of an f-string. It also cross-checks that
+what install.sh advertises is a version the code can actually meet.
+
+Full suite: 301/301 across 18 files.
+
+
 ## v0.2b.47 -- /setownerscope: extra scope, owner-only, DM-only
 
 Asked for directly, after discussing that a scoped-down agent refuses general
