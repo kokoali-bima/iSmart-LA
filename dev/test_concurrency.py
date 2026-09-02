@@ -57,7 +57,7 @@ TURN_SECONDS = 0.4
 def make_tracker():
     """A blocking fake run_combo that records overlap, like the real one would."""
     state = {"live": 0, "peak": 0, "order": []}
-    def fake(text, sess, active, forced_tier=None, owner_dm=False):
+    def fake(text, sess, active, forced_tier=None, **kw):
         state["live"] += 1
         state["peak"] = max(state["peak"], state["live"])
         state["order"].append(("start", text))

@@ -90,6 +90,22 @@ GEMINI_PROMPT_FILE = BASE_DIR / "GEMINI.md"
 MEMORY_FILE = BASE_DIR / "MEMORY.md"
 OWNER_SCOPE_FILE = BASE_DIR / "OWNER_SCOPE.md"
 LOG_FILE = BASE_DIR / "lite-agent.log"
+# One JSON line per completed turn. This project's whole claim is about cost,
+# but until now that cost only ever existed as a sentence inside a log line --
+# readable by a human scrolling, useless for adding up. The numbers were
+# already in hand (run_combo collects a usage block from both providers);
+# what was missing was writing them down as data. /spend then costs 0 tokens.
+LEDGER_FILE = BASE_DIR / "spend.jsonl"
+# Hard cap on what ONE turn may burn across the whole fallback chain, counting
+# tokens spent by tiers that failed. 0 = off, and that is the deliberate
+# default: this deployment's own ledger shows legitimate work reaching 110k on
+# a 7-node report and 750k on a long conversation, while yesterday's waste
+# events were ~120k each -- the ranges overlap, so a number picked before
+# measuring would either never fire or would kill real work. Measure with
+# /spend first, then set this. Checked BETWEEN tiers (see run_combo), because
+# that is the only point where stopping is still possible: tokens inside a
+# single CLI call are already spent by the time it returns.
+TURN_TOKEN_CEILING = int(os.environ.get("TURN_TOKEN_CEILING", "0") or 0)
 # Deterministic collectors: known questions answered by a script, no LLM
 # involved, so a repeat of an already-solved case costs zero tokens. See /status.
 RUN_SCHEDULED = BASE_DIR / "tools" / "run_scheduled.py"
@@ -2132,11 +2148,41 @@ def get_chat_state(sessions: dict, chat_id: str) -> dict:
 # Memory: MEMORY.md, edited ONLY via explicit /remember -- never automatically
 # --------------------------------------------------------------------------
 
-def load_memory_text() -> str:
-    if not MEMORY_FILE.exists():
-        return ""
-    text = MEMORY_FILE.read_text().strip()
-    return text
+# Per-chat memory. MEMORY.md stays as a SHARED base every chat still reads --
+# removing it would silently drop facts people already rely on -- but /remember
+# now writes into this chat's own file instead. Before, one file was shared by
+# every DM and every registered group, which directly contradicted the
+# multi-tenant model this project deliberately supports (per-group PINs, one
+# deployment shared between companies): a fact remembered in one company's
+# group was injected into another company's very next turn.
+MEMORY_DIR = BASE_DIR / "memory"
+_CHAT_ID_SAFE = re.compile(r"^-?\d+$")
+
+
+def _chat_memory_file(chat_id: Optional[str]) -> Optional[Path]:
+    """This chat's own memory file, or None when there is no usable chat id.
+    The id is validated rather than escaped -- a Telegram chat id is always an
+    optionally-negative integer, so anything else is a bug upstream and has no
+    business being turned into a filename."""
+    if not chat_id or not _CHAT_ID_SAFE.match(str(chat_id)):
+        return None
+    return MEMORY_DIR / f"{chat_id}.md"
+
+
+def load_memory_text(chat_id: Optional[str] = None) -> str:
+    """Shared base first, then this chat's own facts. chat_id=None returns only
+    the shared part -- for callers that genuinely have no chat context."""
+    parts = []
+    if MEMORY_FILE.exists():
+        shared = MEMORY_FILE.read_text().strip()
+        if shared:
+            parts.append(shared)
+    own = _chat_memory_file(chat_id)
+    if own and own.exists():
+        mine = own.read_text().strip()
+        if mine:
+            parts.append(mine)
+    return "\n\n".join(parts)
 
 
 def _brief_files() -> list[Path]:
@@ -2206,15 +2252,25 @@ def extract_learned(text: str) -> tuple[str, list[str]]:
     return LEARN_LINE_RE.sub("", text).strip(), facts
 
 
-def append_memory(fact: str) -> None:
+def append_memory(fact: str, chat_id: Optional[str] = None) -> bool:
+    """Record a fact for THIS chat only. Returns False when there is no usable
+    chat id -- refusing is better than falling back to the shared file, which
+    would leak it into every other chat: exactly the bug this replaced."""
+    path = _chat_memory_file(chat_id)
+    if path is None:
+        return False
     ts = _dt.datetime.now().strftime("%Y-%m-%d %H:%M")
-    if not MEMORY_FILE.exists():
-        MEMORY_FILE.write_text(
-            "# Memory\n\nCross-session facts, curated manually via /remember. "
-            "Never written to automatically.\n\n"
+    if not path.exists():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            f"# Memory -- chat {chat_id}\n\nCross-session facts for THIS chat, "
+            "curated manually via /remember. Never written to automatically, "
+            "and never visible to any other chat.\n\n",
+            encoding="utf-8",
         )
-    with MEMORY_FILE.open("a", encoding="utf-8") as f:
+    with path.open("a", encoding="utf-8") as f:
         f.write(f"- [{ts}] {fact}\n")
+    return True
 
 
 # --------------------------------------------------------------------------
@@ -2222,7 +2278,8 @@ def append_memory(fact: str) -> None:
 # --------------------------------------------------------------------------
 
 def _run_claude_once(prompt: str, session_id: Optional[str], session_name: str, model: str,
-                     timeout: Optional[int] = None, owner_dm: bool = False) -> dict:
+                     timeout: Optional[int] = None, owner_dm: bool = False,
+                     chat_id: Optional[str] = None) -> dict:
     env = os.environ.copy()
     if USE_GATEWAY:
         env["ANTHROPIC_BASE_URL"] = ANTHROPIC_BASE_URL
@@ -2248,7 +2305,7 @@ def _run_claude_once(prompt: str, session_id: Optional[str], session_name: str, 
     # --append-system-prompt call as MEMORY.md rather than a second one, since
     # whether Claude Code CLI accumulates repeated flags or lets the last one
     # win was never verified and isn't worth depending on either way.
-    memory_text = load_memory_text()
+    memory_text = load_memory_text(chat_id)
     extra_parts = [p for p in (memory_text, owner_scope_text() if owner_dm else "") if p]
     combined_extra = "\n\n".join(extra_parts)
     if combined_extra:
@@ -2279,15 +2336,16 @@ def _run_claude_once(prompt: str, session_id: Optional[str], session_name: str, 
 
 
 def run_claude(prompt: str, session_id: Optional[str], session_name: str, model: str,
-              timeout: Optional[int] = None, owner_dm: bool = False) -> dict:
+              timeout: Optional[int] = None, owner_dm: bool = False,
+              chat_id: Optional[str] = None) -> dict:
     """Run one Claude Code turn on an explicit model. Falls back to a fresh
     session if --resume fails (e.g. the referenced session expired)."""
     try:
-        return _run_claude_once(prompt, session_id, session_name, model, timeout, owner_dm)
+        return _run_claude_once(prompt, session_id, session_name, model, timeout, owner_dm, chat_id)
     except RuntimeError as exc:
         if session_id:
             logger.warning("resume with session=%s failed (%s), retrying fresh", session_id, exc)
-            return _run_claude_once(prompt, None, session_name, model, timeout, owner_dm)
+            return _run_claude_once(prompt, None, session_name, model, timeout, owner_dm, chat_id)
         raise
 
 
@@ -2295,7 +2353,8 @@ def run_claude(prompt: str, session_id: Optional[str], session_name: str, model:
 # agy (Antigravity CLI) invocation -- native Gemini access, fixed-price
 # --------------------------------------------------------------------------
 
-def _build_agy_prompt(prompt: str, include_env: bool = False, owner_dm: bool = False) -> str:
+def _build_agy_prompt(prompt: str, include_env: bool = False, owner_dm: bool = False,
+                      chat_id: Optional[str] = None) -> str:
     """agy has no --append-system-prompt equivalent, so context is folded into
     the prompt text itself.
 
@@ -2319,7 +2378,7 @@ def _build_agy_prompt(prompt: str, include_env: bool = False, owner_dm: bool = F
                 "[Working-environment instructions -- MUST be followed for this "
                 f"entire conversation:]\n{env_text}"
             )
-    memory_text = load_memory_text()
+    memory_text = load_memory_text(chat_id)
     if memory_text:
         parts.append(f"[Cross-session facts to remember:]\n{memory_text}")
     # Checked fresh every turn, unlike include_env above -- on purpose: a
@@ -2571,14 +2630,65 @@ def _chat_turn_lock(chat_id: str) -> asyncio.Lock:
     return lock
 
 
+# --------------------------------------------------------------------------
+# Token ledger -- the cost claim, written as data instead of prose
+# --------------------------------------------------------------------------
+
+def _ledger_append(row: dict) -> None:
+    """Append one turn to the ledger. Best-effort by design: a turn that
+    already cost real tokens must never be lost or failed because bookkeeping
+    hit a disk error."""
+    try:
+        row.setdefault("ts", _dt.datetime.now().isoformat(timespec="seconds"))
+        with LEDGER_FILE.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+    except Exception:
+        logger.warning("could not write the spend ledger", exc_info=True)
+
+
+def _ledger_read(days: int = 30) -> list[dict]:
+    """Rows from the last `days` days, newest last. Unreadable lines are
+    skipped rather than aborting the whole report -- a truncated final line
+    (a crash mid-write) must not make /spend useless."""
+    if not LEDGER_FILE.exists():
+        return []
+    cutoff = (_dt.datetime.now() - _dt.timedelta(days=days)).isoformat(timespec="seconds")
+    rows = []
+    try:
+        for line in LEDGER_FILE.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                r = json.loads(line)
+            except ValueError:
+                continue
+            if str(r.get("ts", "")) >= cutoff:
+                rows.append(r)
+    except OSError:
+        logger.warning("could not read the spend ledger", exc_info=True)
+    return rows
+
+
+def _int(v) -> int:
+    return v if isinstance(v, int) else 0
+
+
 def run_combo(prompt: str, sess: dict, session_name: str,
-              forced_tier: Optional[dict] = None, owner_dm: bool = False) -> tuple[dict, str, list[str]]:
+              forced_tier: Optional[dict] = None, owner_dm: bool = False,
+              trace: Optional[list] = None, chat_id: Optional[str] = None) -> tuple[dict, str, list[str]]:
     """Walk the TIERS chain in order, moving on only when a tier fails in a way
     another tier could plausibly survive.
 
     `sess` is this named session's {"claude": {model: id}, "agy": {model: id}}
     dict -- mutated in place with whichever tier's resume handle actually got
     used; the caller persists it afterward.
+
+    `trace`: optional list the caller owns; one structured dict is appended per
+    tier attempt (provider, model, ok/skipped, usage, tokens actually burned on
+    a failure). An out-parameter rather than a global on purpose -- turns run
+    concurrently since v0.2b.40, so a module-level collector would interleave
+    two chats' numbers into one row.
 
     `owner_dm`: True only when THIS turn is confirmed from the bot owner in
     their own private chat (never a group, even one the owner is speaking
@@ -2602,10 +2712,27 @@ def run_combo(prompt: str, sess: dict, session_name: str,
     if forced_tier is not None:
         chain = [forced_tier] + [t for t in TIERS if t["model"] != forced_tier["model"]]
 
+    burned = 0          # everything this turn has cost so far, failures included
+
     for tier in chain:
         provider, model = tier["provider"], tier["model"]
+        if TURN_TOKEN_CEILING and burned >= TURN_TOKEN_CEILING:
+            attempts.append(f"{provider}:{model} SKIPPED (turn ceiling)")
+            if trace is not None:
+                trace.append({"provider": provider, "model": model,
+                              "outcome": "skipped", "reason": "ceiling", "total": 0})
+            logger.warning("turn ceiling hit: %d/%d tokens burned, stopping the chain",
+                           burned, TURN_TOKEN_CEILING)
+            raise RuntimeError(
+                f"Turn stopped at the {TURN_TOKEN_CEILING:,}-token ceiling after "
+                f"burning {burned:,} across {len(attempts)} attempt(s). "
+                f"Raise TURN_TOKEN_CEILING or split the request into smaller steps."
+            )
         if not _tier_available(model):
             attempts.append(f"{provider}:{model} SKIPPED (cooldown)")
+            if trace is not None:
+                trace.append({"provider": provider, "model": model,
+                              "outcome": "skipped", "total": 0})
             continue
         try:
             if provider == "agy":
@@ -2615,11 +2742,22 @@ def run_combo(prompt: str, sess: dict, session_name: str,
                 # starting from nothing, which may be a later one even while an
                 # earlier one is mid-conversation.
                 parsed = _run_agy_once(
-                    _build_agy_prompt(prompt, include_env=(conv_id is None), owner_dm=owner_dm),
+                    _build_agy_prompt(prompt, include_env=(conv_id is None), owner_dm=owner_dm,
+                                      chat_id=chat_id),
                     model, conv_id
                 )
                 usage = parsed.get("usage", {}) or {}
                 attempts.append(f"agy:{model} OK ({usage.get('total_tokens', '?')} tok)")
+                if trace is not None:
+                    trace.append({
+                        "provider": "agy", "model": model, "outcome": "ok",
+                        "in": _int(usage.get("input_tokens")),
+                        "out": _int(usage.get("output_tokens")),
+                        "think": _int(usage.get("thinking_tokens")),
+                        "cache_read": _int(usage.get("cache_read_tokens")),
+                        "total": _int(usage.get("total_tokens")),
+                    })
+                burned += _int(usage.get("total_tokens"))
                 agy_convs[model] = parsed.get("conversation_id")
                 _note_tier_success(model)
                 global _agy_reauth_last_notice
@@ -2627,10 +2765,21 @@ def run_combo(prompt: str, sess: dict, session_name: str,
                 return _normalize_agy_result(parsed), model, attempts
 
             result = run_claude(prompt, claude_sessions.get(model), session_name, model,
-                               owner_dm=owner_dm)
+                               owner_dm=owner_dm, chat_id=chat_id)
             usage = result.get("usage", {}) or {}
             total = sum(v for v in usage.values() if isinstance(v, int))
             attempts.append(f"claude:{model} OK ({total} tok)")
+            if trace is not None:
+                trace.append({
+                    "provider": "claude", "model": model, "outcome": "ok",
+                    "in": _int(usage.get("input_tokens")),
+                    "out": _int(usage.get("output_tokens")),
+                    "cache_read": _int(usage.get("cache_read_input_tokens")),
+                    "cache_write": _int(usage.get("cache_creation_input_tokens")),
+                    "total": total,
+                    "cost_usd": result.get("total_cost_usd"),
+                })
+            burned += total
             claude_sessions[model] = result.get("session_id")
             _note_tier_success(model)
             return result, model, attempts
@@ -2638,6 +2787,18 @@ def run_combo(prompt: str, sess: dict, session_name: str,
         except Exception as exc:
             kind = _classify_failure(exc)
             attempts.append(f"{provider}:{model} FAILED/{kind} ({exc})")
+            # A failed tier still spent real tokens most of the time (agy
+            # reports them in its own error envelope). Those are the ones
+            # nobody could add up before, and the ones the ceiling most needs
+            # to count -- parsed OUTSIDE the trace block on purpose, since the
+            # ceiling must work whether or not a caller asked for a trace.
+            m = re.search(r"wasted_tokens=(\d+)", str(exc))
+            wasted = int(m.group(1)) if m else 0
+            if trace is not None:
+                trace.append({"provider": provider, "model": model,
+                              "outcome": "failed", "kind": kind,
+                              "wasted": wasted, "total": 0})
+            burned += wasted
             logger.warning("%s model=%s failed (%s): %s", provider, model, kind, exc)
             # Keep the resume handle unless the handle itself is suspect --
             # see _handle_survives. A timed-out conversation is still full of
@@ -3311,22 +3472,40 @@ async def cmd_remember(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             "Pakai: /remember <fakta yang mau disimpan permanen>",
         ))
         return
-    append_memory(fact)
-    await update.message.reply_text(_t(lang, f"\U0001f4dd Remembered: {fact}", f"\U0001f4dd Diingat: {fact}"))
+    if not append_memory(fact, str(update.effective_chat.id)):
+        return await update.message.reply_text(_t(lang,
+            "Couldn't store that -- this chat has no usable id.",
+            "Tidak bisa disimpan -- chat ini tidak punya id yang bisa dipakai."))
+    await update.message.reply_text(_t(lang,
+        f"\U0001f4dd Remembered <b>for this chat only</b>: {_tg_escape(fact)}",
+        f"\U0001f4dd Diingat <b>khusus chat ini</b>: {_tg_escape(fact)}"),
+        parse_mode="HTML")
 
 
 async def cmd_memory(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _authorized(update):
         return
-    text = load_memory_text()
-    if not text:
-        lang = _chat_lang(update)
+    lang = _chat_lang(update)
+    chat_id = str(update.effective_chat.id)
+    shared = MEMORY_FILE.read_text().strip() if MEMORY_FILE.exists() else ""
+    own_path = _chat_memory_file(chat_id)
+    own = own_path.read_text().strip() if own_path and own_path.exists() else ""
+    if not shared and not own:
         await update.message.reply_text(_t(lang,
-            "MEMORY.md is empty. Add facts with /remember <fact>.",
-            "MEMORY.md masih kosong. Tambah lewat /remember <fakta>.",
+            "Memory is empty. Add facts with /remember <fact>.",
+            "Memori masih kosong. Tambah lewat /remember <fakta>.",
         ))
         return
-    await _reply_chunked(update, text)
+    # Labelled on purpose: after per-chat isolation, "who else can see this?"
+    # is the first thing anyone should be able to answer at a glance.
+    parts = []
+    if own:
+        parts.append(_t(lang, "=== THIS CHAT ONLY ===",
+                              "=== KHUSUS CHAT INI ===") + "\n" + own)
+    if shared:
+        parts.append(_t(lang, "=== SHARED (every chat sees this) ===",
+                              "=== BERSAMA (semua chat melihat ini) ===") + "\n" + shared)
+    await _reply_chunked(update, "\n\n".join(parts))
 
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -4446,6 +4625,90 @@ async def cmd_setscope(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     ), parse_mode="HTML")
 
 
+def _fmt_tok(n: int) -> str:
+    if n >= 1_000_000:
+        return f"{n/1_000_000:.1f}M"
+    if n >= 1_000:
+        return f"{n/1_000:.0f}k"
+    return str(n)
+
+
+async def cmd_spend(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """What this deployment actually spent, read straight from the ledger.
+    Zero model tokens -- it is arithmetic over a file, not a question for a
+    model. `/spend 7` for the last 7 days (default 1, i.e. today-ish)."""
+    if not _authorized(update):
+        return
+    lang = _chat_lang(update)
+    try:
+        days = max(1, min(90, int(context.args[0]))) if context.args else 1
+    except (ValueError, IndexError):
+        days = 1
+
+    rows = _ledger_read(days)
+    if not rows:
+        return await update.message.reply_text(_t(lang,
+            f"\U0001f4b8 No turns recorded in the last {days} day(s).\n\n"
+            "<i>The ledger starts filling from the first turn after this version "
+            "was installed -- it cannot show history from before it existed.</i>",
+            f"\U0001f4b8 Belum ada giliran tercatat dalam {days} hari terakhir.\n\n"
+            "<i>Ledger mulai terisi dari giliran pertama setelah versi ini dipasang "
+            "-- riwayat sebelum ini memang tidak ada datanya.</i>",
+        ), parse_mode="HTML")
+
+    this_chat = str(update.effective_chat.id)
+    mine = [r for r in rows if str(r.get("chat")) == this_chat]
+
+    def totals(rs):
+        return (sum(_int(r.get("total")) for r in rs),
+                sum(_int(r.get("wasted")) for r in rs),
+                sum(r.get("cost_usd") or 0 for r in rs),
+                len(rs))
+
+    a_tok, a_waste, a_cost, a_n = totals(rows)
+    m_tok, m_waste, m_cost, m_n = totals(mine)
+
+    by_model: dict[str, list] = {}
+    for r in rows:
+        by_model.setdefault(r.get("label") or r.get("model") or "?", []).append(r)
+
+    lines = [_t(lang,
+        f"\U0001f4b8 <b>Spend, last {days} day(s)</b>",
+        f"\U0001f4b8 <b>Pemakaian, {days} hari terakhir</b>"), ""]
+    lines.append(_t(lang,
+        f"<b>All chats:</b> {_fmt_tok(a_tok)} tokens over {a_n} turn(s)",
+        f"<b>Semua chat:</b> {_fmt_tok(a_tok)} token dalam {a_n} giliran"))
+    if a_waste:
+        lines.append(_t(lang,
+            f"   ⚠️ wasted on failed tiers: <b>{_fmt_tok(a_waste)}</b> "
+            f"({a_waste*100//max(a_tok+a_waste,1)}%)",
+            f"   ⚠️ terbuang di tier gagal: <b>{_fmt_tok(a_waste)}</b> "
+            f"({a_waste*100//max(a_tok+a_waste,1)}%)"))
+    if a_cost:
+        lines.append(f"   \U0001f4b5 ${a_cost:.2f}")
+    lines.append("")
+    lines.append(_t(lang,
+        f"<b>This chat:</b> {_fmt_tok(m_tok)} tokens over {m_n} turn(s)",
+        f"<b>Chat ini:</b> {_fmt_tok(m_tok)} token dalam {m_n} giliran"))
+    if m_waste:
+        lines.append(_t(lang, f"   ⚠️ wasted: {_fmt_tok(m_waste)}",
+                              f"   ⚠️ terbuang: {_fmt_tok(m_waste)}"))
+    lines.append("")
+    lines.append(_t(lang, "<b>By tier</b> (all chats):", "<b>Per tier</b> (semua chat):"))
+    for label, rs in sorted(by_model.items(), key=lambda kv: -sum(_int(r.get("total")) for r in kv[1])):
+        t, w, c, n = totals(rs)
+        extra = _t(lang, f", {_fmt_tok(w)} wasted", f", {_fmt_tok(w)} terbuang") if w else ""
+        cost = f", ${c:.2f}" if c else ""
+        lines.append(f"  • {_tg_escape(label)}: {_fmt_tok(t)} / {n}x{extra}{cost}")
+
+    lines.append("")
+    lines.append(_t(lang,
+        "<i>0 model tokens -- read from the ledger, not asked to a model.</i>",
+        "<i>0 token model -- dibaca dari ledger, bukan ditanyakan ke model.</i>"))
+    logger.info("spend command served (0 model tokens, days=%d)", days)
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+
 async def cmd_setownerscope(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Extra scope that applies ONLY when the owner is speaking in their own
     private chat with the bot -- never in a group, even one the owner is
@@ -4564,8 +4827,9 @@ Every reply ends with a "— by ..." tag. If it's ever NOT "{TIERS[0]['label']}"
 /new — restart the ACTIVE session from scratch (conversation history reset, MEMORY.md untouched)
 /session <name> — create/switch to a named session, for keeping different cases separate
 /sessions — list all saved sessions
-/remember <fact> — save a fact PERMANENTLY, read in EVERY session & EVERY tier, even after many /new
-/memory — view current memory contents
+/remember <fact> — save a fact PERMANENTLY for THIS CHAT, read in EVERY session & EVERY tier, even after many /new
+/spend [days] — what this deployment actually spent, straight from the ledger (0 tokens)
+/memory — view memory: this chat's own facts, plus the shared base
 /schedules — everything that runs on a timer, and what it does (0 tokens)
 /unschedule <name> — remove a scheduled task
 /adopt — bring pre-existing cron entries under management
@@ -4627,8 +4891,9 @@ Setiap balasan diakhiri tanda "— by ...". Kalau tandanya BUKAN "{TIERS[0]['lab
 /new — mulai ulang sesi AKTIF dari nol (riwayat percakapan direset, MEMORY.md tetap ada)
 /session <nama> — buat/pindah ke sesi bernama, buat pisahin kasus berbeda
 /sessions — lihat semua sesi tersimpan
-/remember <fakta> — simpan fakta PERMANEN, ikut kebaca di SEMUA sesi & SEMUA tingkatan, walau sudah /new berkali-kali
-/memory — lihat isi memori saat ini
+/remember <fakta> — simpan fakta PERMANEN KHUSUS CHAT INI, kebaca di SEMUA sesi & tingkatan, walau sudah /new berkali-kali
+/spend [hari] — pemakaian token nyata, langsung dari ledger (NOL token)
+/memory — lihat memori: fakta milik chat ini, plus yang dipakai bersama
 /schedules — semua yang jalan terjadwal, dan isinya apa (NOL token)
 /unschedule <nama> — hapus satu task terjadwal
 /adopt — bawa cron lama ke dalam kelolaan bot
@@ -6990,6 +7255,8 @@ async def _run_turn_inner(update: Update, context: ContextTypes.DEFAULT_TYPE, te
     # Owner's extra scope only in their OWN private chat -- never a group,
     # even one the owner is speaking in. See owner_scope_text()/run_combo.
     owner_dm = _is_owner(update) and update.effective_chat.type == "private"
+    trace: list[dict] = []          # filled per tier attempt, written to the ledger below
+    started = _dt.datetime.now()
 
     lang = _chat_lang(update)
     try:
@@ -7001,7 +7268,8 @@ async def _run_turn_inner(update: Update, context: ContextTypes.DEFAULT_TYPE, te
         # through an executor; the longest one in it did not.
         result, model, attempts = await asyncio.get_running_loop().run_in_executor(
             None, functools.partial(run_combo, text, sess, active,
-                                    forced_tier=forced_tier, owner_dm=owner_dm)
+                                    forced_tier=forced_tier, owner_dm=owner_dm,
+                                    trace=trace, chat_id=chat_id)
         )
     except Exception as exc:
         logger.exception("combo run failed")
@@ -7157,6 +7425,28 @@ async def _run_turn_inner(update: Update, context: ContextTypes.DEFAULT_TYPE, te
         usage.get("cache_read_input_tokens"), usage.get("cache_creation_input_tokens"),
         " -> ".join(attempts),
     )
+    # The same turn, as data. Everything above is for a human reading a log;
+    # this is what /spend can add up without spending a token to do it.
+    answered = next((t for t in trace if t.get("outcome") == "ok"), {})
+    _ledger_append({
+        "chat": chat_id,
+        "session": active,
+        "model": model,
+        "label": label,
+        "provider": answered.get("provider"),
+        "in": _int(answered.get("in")),
+        "out": _int(answered.get("out")),
+        "think": _int(answered.get("think")),
+        "cache_read": _int(answered.get("cache_read")),
+        "cache_write": _int(answered.get("cache_write")),
+        "total": _int(answered.get("total")),
+        "cost_usd": answered.get("cost_usd"),
+        # Tokens burned by tiers that failed before this one answered -- the
+        # number that was previously only reachable by reading log prose.
+        "wasted": sum(_int(t.get("wasted")) for t in trace),
+        "tiers_tried": len(trace),
+        "secs": round((_dt.datetime.now() - started).total_seconds(), 1),
+    })
 
 
 # --------------------------------------------------------------------------
@@ -7273,6 +7563,7 @@ def main() -> None:
     app.add_handler(CommandHandler("setbrief", cmd_setbrief))
     app.add_handler(CommandHandler("setscope", cmd_setscope))
     app.add_handler(CommandHandler("setownerscope", cmd_setownerscope))
+    app.add_handler(CommandHandler("spend", cmd_spend))
     app.add_handler(CommandHandler("addboundary", cmd_addboundary))
     app.add_handler(CommandHandler("rmboundary", cmd_rmboundary))
     app.add_handler(CommandHandler("snapshots", cmd_snapshots))

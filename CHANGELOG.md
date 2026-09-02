@@ -1,5 +1,87 @@
 # Changelog
 
+## v0.2b.49 -- the cost claim becomes a measurement, and memory stops leaking between chats
+
+Four gaps an external review named, all closed in one release because they
+interlock: you cannot set a sane ceiling without first measuring, and the
+measurement is worth little if you cannot run the suite that protects it.
+
+### 1. Token ledger + /spend
+
+The project's whole thesis is about cost, but the cost only ever existed as a
+sentence inside a log line -- fine for a human scrolling, useless for adding
+up. The numbers were already in hand: run_combo collects a usage block from
+both providers. What was missing was writing them down as data.
+
+`spend.jsonl` now gets one JSON line per completed turn: chat, session, model,
+input/output/thinking/cache tokens, cost, seconds, tiers tried, and -- the
+number nobody could reach before -- `wasted`, the tokens burned by tiers that
+FAILED before one answered. `/spend [days]` reports it at **zero model
+tokens**, because it is arithmetic over a file rather than a question for a
+model.
+
+run_combo gained an optional `trace` list the caller owns. An out-parameter
+rather than a module-level collector on purpose: turns run concurrently since
+v0.2b.40, so a global would interleave two chats' numbers into one row.
+
+### 2. Per-turn token ceiling
+
+`TURN_TOKEN_CEILING` caps what ONE turn may burn across the whole fallback
+chain, counting failed tiers. Enforced BETWEEN tiers -- the only point where
+stopping is still possible, since tokens inside a single CLI call are already
+spent by the time it returns.
+
+Default is **0 (off)**, deliberately. This deployment's own ledger shows
+legitimate work reaching 110k on a 7-node report and 750k on a long
+conversation, while the waste events were ~120k each: the ranges overlap, so a
+number picked before measuring would either never fire or would kill real
+work. Measure with /spend first, then set it. That ordering is the whole
+reason these two shipped together.
+
+### 3. Per-chat memory isolation
+
+`MEMORY.md` was global -- every DM and every registered group shared one file.
+That directly contradicted the multi-tenant model this project deliberately
+supports (per-group PINs, one deployment shared between companies): a fact
+remembered in one company's group was injected into another company's very
+next turn. A defect, not a missing feature.
+
+`/remember` now writes to `memory/<chat_id>.md`. MEMORY.md stays as a SHARED
+base every chat still reads, so nothing anyone relies on disappeared, and
+`/memory` labels the two halves ("THIS CHAT ONLY" vs "SHARED") because after
+isolation, "who else can see this?" is the first question worth answering at a
+glance. The chat id is validated as an optionally-negative integer rather than
+escaped -- anything else is a bug upstream and has no business becoming a
+filename. A write with no usable id is refused rather than silently falling
+back to the shared file, which would recreate the exact leak.
+
+`chat_id` is threaded from `_run_turn_inner` through `run_combo` into both
+prompt builders, so each backend sees only its own chat's facts.
+
+### 4. One test runner
+
+`dev/run_all.py` runs every suite and prints one total; exit code is non-zero
+if any fail, which is also the shape a CI job would call. The suites were
+always good -- each documents the bug it covers with real pre-fix output --
+but running them took eighteen commands and a human adding up numbers. A suite
+that cannot run (missing optional dependency) is reported as SKIP with the
+reason rather than silently vanishing.
+
+While wiring it up, two older suites' `run_combo` mocks broke for the third
+release running -- they pinned an exact signature that has since gained
+`owner_dm`, `trace` and `chat_id`. Changed to `**kw`: harness-only, and it
+stops a passing product from failing its own tests every time a keyword is
+added.
+
+New: `dev/test_ledger_and_memory.py`, 24 tests -- ledger round-trip including
+a deliberately truncated final line (an unclean shutdown must not make /spend
+useless), the trace capturing a real 314,646-token waste envelope, the ceiling
+firing only when set and counting failed tiers, and cross-chat isolation
+proven both directions plus a path-traversal id being refused.
+
+Full suite: **325/325 across 19 suites**, in one command.
+
+
 ## v0.2b.48 -- the module would not import at all on Python 3.10 or 3.11
 
 Found by an external architecture review, verified here, and it is the kind of
