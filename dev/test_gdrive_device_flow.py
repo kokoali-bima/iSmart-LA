@@ -148,18 +148,30 @@ async def main():
     # No client yet -> the setup card, naming the exact client type and the
     # Publish step (skipping it is what causes the 7-day expiry).
     mod.GDRIVE_CLIENT_FILE.unlink(missing_ok=True)
+    # The DEFAULT with no client configured is now rclone's own verified
+    # sign-in, which needs no Google Cloud project at all -- creating one
+    # turned out to mean a branding page plus three published URLs, which
+    # stopped a real operator dead. The own-client setup card below is still
+    # available, it is just no longer the thing everyone has to walk into.
     with patch.object(mod, "_may_authorize_group_action", new=AsyncMock(return_value=True)), \
-         patch.object(mod, "_list_gdrive_accounts", return_value=[]):
+         patch.object(mod, "_list_gdrive_accounts", return_value=[]), \
+         patch.object(mod, "gdrive_rclone_start",
+                      return_value=(True, "https://accounts.google.com/o/oauth2/auth?x=1",
+                                    {"pid": 1, "state": "S", "log": "/x"})):
         u = upd()
         await mod.cmd_connectgdrive(u, ctx())
-    txt = sent(u)
-    check("with no OAuth client, /connectgdrive asks for one first",
-          "OAuth client" in txt or "client" in txt.lower())
+    check("with no OAuth client, /connectgdrive uses rclone's own sign-in "
+          "rather than demanding a Cloud project be created",
+          "accounts.google.com" in sent(u))
+    mod._gdrive_wizard.pop(111, None)
+
+    txt = mod._gdrive_client_setup_instructions("en")
+    check("the own-client setup card is still available for anyone who wants "
+          "their own OAuth app", "OAuth client" in txt or "client" in txt.lower())
     check("...naming the exact client type Google requires",
           "TV and Limited Input devices" in txt)
     check("...and the Publish step, whose omission causes the 7-day expiry",
           "Publish" in txt and "7" in txt)
-    mod._gdrive_wizard.pop(111, None)
 
     # A client that isn't a Google client id is refused before being stored.
     mod._gdrive_wizard[111] = {"step": "await_gdrive_client", "name": "gdrive",

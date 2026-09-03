@@ -1,5 +1,64 @@
 # Changelog
 
+## v0.2b.61 -- connecting Drive no longer needs a Google Cloud project
+
+The device flow in v0.2b.54 removed the terminal, but not the hard part.
+Setting up your own OAuth client turned out to mean: create a Cloud project,
+pick client type "TV and Limited Input devices", enable the Drive API, fill a
+Branding page, supply a homepage **and** a privacy policy **and** a terms of
+service URL, then press Publish -- and skipping Publish gets you
+"Error 403: access_denied" from your own account. A real operator was stopped
+at each of those in turn. For an ordinary user that is not a setup step, it is
+a wall.
+
+rclone ships a Google OAuth client of its own, already published and verified.
+`/connectgdrive` now uses it by default: **no Cloud project, no branding, no
+publishing, no three URLs, and no 7-day test-user expiry** -- and still no
+terminal. Open a link, approve, paste the address back. The same shape as
+signing in to Gemini or Claude here.
+
+The mechanism, verified end to end on a live host before any of it was
+written:
+
+- `rclone authorize drive --auth-no-open-browser` prints a LOCAL link, not a
+  Google one, and listens on 127.0.0.1:53682.
+- Fetching that local `/auth` path returns a 307 whose Location is the real
+  Google consent URL -- confirmed to carry rclone's client id and the
+  drive.file scope. That URL works on a phone.
+- Google then redirects the phone to 127.0.0.1, which the phone cannot reach,
+  but the address bar holds the code.
+- Replaying that same path against this host's own listener hands the code to
+  the waiting rclone: it answers "Success! All done." and proceeds to the token
+  exchange. A deliberately fake code produced exactly the expected
+  "invalid_grant", which is how the plumbing was proven without a real consent.
+
+The token then goes through the same `connect_gdrive_account()` a pasted token
+always did, so verification, the duplicate-root-folder guard and rollback are
+unchanged.
+
+Details worth the care:
+
+- The code is accepted in every shape someone actually pastes from a phone
+  address bar: the whole redirect URL, just the query string, or the bare code.
+- The card says the page **will fail to load** and that this is expected --
+  otherwise the one screen that looks like an error is the one that means it
+  worked.
+- A bad paste keeps the same link usable rather than sending them back to the
+  start.
+- A leftover `rclone authorize` is killed first: it still owns port 53682, and
+  the next attempt would fail with nothing explaining why.
+- The authorize log is deleted afterwards -- it holds a live refresh token
+  until it is gone.
+- Every failure path removes its temp directory. Two of them did not, caught
+  by a run that left three behind.
+
+Anyone who has already built their own OAuth client keeps the device flow;
+this adds a path rather than removing one. `/connectgdrive manual` still
+exists too.
+
+Full suite: **570/570 across 29 suites** on the real Linux target.
+
+
 ## v0.2b.60 -- access_denied now names the cause that actually produces it
 
 An operator hit "Akses diblokir: ismart belum menyelesaikan proses verifikasi

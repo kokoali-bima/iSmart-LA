@@ -55,6 +55,7 @@ import functools
 import datetime as _dt
 import hashlib
 import hmac
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -4647,6 +4648,48 @@ def _gdrive_client_setup_instructions(lang: str) -> str:
     )
 
 
+async def _gdrive_begin_rclone(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                               lang: str, name: str) -> None:
+    """The default sign-in: rclone's own published OAuth client, no Google
+    Cloud project of any kind. A link to open and a value to paste back --
+    the same shape as signing in to Gemini or Claude here."""
+    chat_id = update.effective_chat.id
+    loop = asyncio.get_running_loop()
+    ok, result, handle = await loop.run_in_executor(None, gdrive_rclone_start)
+    if not ok:
+        _gdrive_wizard.pop(chat_id, None)
+        return await update.message.reply_text(_t(lang,
+            f"⚠️ Could not start the sign-in: {result}",
+            f"⚠️ Tidak bisa memulai sign-in: {result}"))
+
+    state = _gdrive_wizard.get(chat_id)
+    if state is not None:
+        state["step"] = "await_rclone_code"
+        state["handle"] = handle
+        state["expires"] = _dt.datetime.now().timestamp() + GDRIVE_TOKEN_WIZARD_TTL
+
+    await update.message.reply_text(_t(lang,
+        f"🔗 <b>Connect Google Drive</b> (<code>{_tg_escape(name)}</code>)\n\n"
+        f"1. Open this link and approve access:\n<code>{_tg_escape(result)}</code>\n\n"
+        "2. Your browser will then land on a page that <b>fails to load</b> "
+        "(<i>127.0.0.1 refused to connect</i>, or similar). <b>That is expected</b> "
+        "— the approval already worked.\n\n"
+        "3. Copy the whole address from the browser's address bar on that "
+        "failed page, and send it here as your next message.\n\n"
+        "<i>No Google Cloud project needed — this uses rclone's own verified "
+        "sign-in.</i>\n\nSend /cancel to stop.",
+        f"🔗 <b>Hubungkan Google Drive</b> (<code>{_tg_escape(name)}</code>)\n\n"
+        f"1. Buka link ini lalu setujui aksesnya:\n<code>{_tg_escape(result)}</code>\n\n"
+        "2. Setelah itu browser akan mendarat di halaman yang <b>gagal dimuat</b> "
+        "(<i>127.0.0.1 menolak koneksi</i>, atau semacamnya). <b>Itu memang "
+        "wajar</b> — persetujuannya sudah berhasil.\n\n"
+        "3. Salin seluruh alamat di address bar browser pada halaman gagal itu, "
+        "lalu kirim ke sini sebagai pesan berikutnya.\n\n"
+        "<i>Tidak perlu project Google Cloud — ini memakai sign-in milik rclone "
+        "yang sudah terverifikasi.</i>\n\nKirim /cancel untuk berhenti.",
+    ), parse_mode="HTML", disable_web_page_preview=True)
+
+
 async def _gdrive_begin_device(update: Update, context: ContextTypes.DEFAULT_TYPE,
                                lang: str, name: str) -> None:
     """Ask Google for a device code, show the card, and start waiting.
@@ -4837,9 +4880,7 @@ async def _handle_gdrive_wizard_input(update: Update, context: ContextTypes.DEFA
         if read_gdrive_client():
             await _gdrive_begin_device(update, context, lang, name)
         else:
-            state["step"] = "await_gdrive_client"
-            await update.message.reply_text(
-                _gdrive_client_setup_instructions(lang), parse_mode="HTML")
+            await _gdrive_begin_rclone(update, context, lang, name)
         return True
 
     if state["step"] == "await_gdrive_client":
@@ -4896,6 +4937,31 @@ async def _handle_gdrive_wizard_input(update: Update, context: ContextTypes.DEFA
         write_gdrive_client(parts[0], parts[1])
         state["expires"] = _dt.datetime.now().timestamp() + GDRIVE_TOKEN_WIZARD_TTL
         await _gdrive_begin_device(update, context, lang, state["name"])
+        return True
+
+    if state["step"] == "await_rclone_code":
+        handle = state.get("handle") or {}
+        loop = asyncio.get_running_loop()
+        ok, result = await loop.run_in_executor(
+            None, gdrive_rclone_finish, handle, text)
+        if not ok:
+            # Left in place on purpose: a mistyped paste should let them try
+            # again with the same link, not send them back to the start.
+            return await update.message.reply_text(_t(lang,
+                f"⚠️ {result}", f"⚠️ {result}"))
+        name = state.get("name") or "gdrive"
+        ok, detail = await loop.run_in_executor(
+            None, connect_gdrive_account, name, result)
+        await loop.run_in_executor(None, gdrive_rclone_cleanup, handle)
+        _gdrive_wizard.pop(chat_id, None)
+        safe = _tg_escape(str(detail))
+        await update.message.reply_text(
+            _t(lang, f"✅ <b>{_tg_escape(name)}</b> connected. {safe}",
+                     f"✅ <b>{_tg_escape(name)}</b> terhubung. {safe}")
+            if ok else
+            _t(lang, f"⚠️ Could not finish: {safe}",
+                     f"⚠️ Tidak bisa menyelesaikan: {safe}"),
+            parse_mode="HTML")
         return True
 
     if state["step"] == "device_pending":
@@ -6398,8 +6464,7 @@ async def cmd_connectgdrive(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         if read_gdrive_client():
             await _gdrive_begin_device(update, context, lang, name)
         else:
-            await update.message.reply_text(
-                _gdrive_client_setup_instructions(lang), parse_mode="HTML")
+            await _gdrive_begin_rclone(update, context, lang, name)
         return
 
     # A second+ account: ask for a short label first so /gdrive's picker stays
@@ -6427,6 +6492,182 @@ async def cmd_connectgdrive(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
 def _rclone_run(*args: str, timeout: int = 60) -> subprocess.CompletedProcess:
     return subprocess.run([RCLONE_BIN, *args], capture_output=True, text=True, timeout=timeout)
+
+
+RCLONE_AUTH_PORT = 53682          # rclone's own fixed loopback port
+RCLONE_AUTH_START_TIMEOUT = 20    # seconds to wait for it to print its state
+RCLONE_AUTH_FINISH_TIMEOUT = 60
+
+
+def _rclone_installed() -> bool:
+    return shutil.which(RCLONE_BIN) is not None or Path(RCLONE_BIN).exists()
+
+
+def _http_redirect_location(url: str) -> Optional[str]:
+    """GET a URL and return its Location header WITHOUT following it."""
+    class _NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, req, fp, code, msg, headers, newurl):
+            raise _RedirectCaught(newurl)
+
+    opener = urllib.request.build_opener(_NoRedirect)
+    try:
+        opener.open(url, timeout=15)
+    except _RedirectCaught as hop:
+        return hop.location
+    except Exception:
+        logger.warning("could not read the rclone auth redirect", exc_info=True)
+    return None
+
+
+class _RedirectCaught(Exception):
+    def __init__(self, location: str):
+        super().__init__(location)
+        self.location = location
+
+
+def gdrive_rclone_start(scope: str = "drive.file") -> tuple[bool, str, dict]:
+    """Start rclone's own OAuth flow and return the Google consent URL.
+
+    This is what removes the hardest part of setting Drive up. rclone ships a
+    Google OAuth client of its own, already published and verified, so nobody
+    has to create a Google Cloud project, fill in a branding page, supply a
+    homepage/privacy-policy/terms URL, or press Publish -- and there is no
+    7-day test-user token expiry either. Every one of those blocked a real
+    operator before this existed.
+
+    The trick, verified end to end before this was written: `rclone authorize`
+    run headless starts a tiny web server on 127.0.0.1:53682 and prints a
+    LOCAL url, not a Google one. Fetching that local /auth path returns a 307
+    whose Location IS the real Google consent URL -- which can be handed to a
+    phone. When Google then redirects the phone back to 127.0.0.1 the phone
+    cannot reach it, but the address bar holds the code, and replaying that
+    same path against THIS host's own listener hands the code to the waiting
+    rclone (confirmed: it answers "Success! All done." and proceeds to the
+    token exchange).
+
+    Returns (ok, auth_url_or_error, handle).
+    """
+    if not _rclone_installed():
+        return False, ("rclone isn't installed on this host. Install it with: "
+                       "curl https://rclone.org/install.sh | sudo bash"), {}
+
+    # A leftover authorize from an abandoned attempt still owns the port, and
+    # the next start would fail with nothing explaining why. Best-effort:
+    # pkill is not present everywhere, and its absence must not be the thing
+    # that stops a sign-in.
+    try:
+        subprocess.run(["pkill", "-f", "rclone authorize"], capture_output=True)
+    except Exception:
+        pass
+
+    staging = Path(tempfile.mkdtemp(prefix="isla_rcauth_"))
+    out = staging / "authorize.log"
+
+    def _give_up(message: str) -> tuple[bool, str, dict]:
+        # Every failure below leaves a directory behind otherwise. That is how
+        # 485 stale directories once accumulated on a real server.
+        shutil.rmtree(staging, ignore_errors=True)
+        return False, message, {}
+
+    try:
+        proc = subprocess.Popen(
+            [RCLONE_BIN, "authorize", "drive", "--drive-scope", scope,
+             "--auth-no-open-browser"],
+            stdout=out.open("wb"), stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL, start_new_session=True)
+    except Exception as exc:
+        return _give_up(f"could not start rclone: {exc}")
+
+    deadline = time.time() + RCLONE_AUTH_START_TIMEOUT
+    state = ""
+    while time.time() < deadline:
+        time.sleep(0.5)
+        try:
+            text = out.read_text(errors="replace")
+        except OSError:
+            continue
+        m = re.search(r"state=([A-Za-z0-9_-]+)", text)
+        if m:
+            state = m.group(1)
+            break
+        if proc.poll() is not None:
+            proc_out = text.strip()[-300:] or "rclone exited immediately"
+            return _give_up(proc_out)
+    if not state:
+        proc.kill()
+        return _give_up("rclone did not produce a sign-in link in time")
+
+    auth_url = _http_redirect_location(
+        f"http://127.0.0.1:{RCLONE_AUTH_PORT}/auth?state={state}")
+    if not auth_url or "accounts.google.com" not in auth_url:
+        proc.kill()
+        return _give_up("rclone started but did not hand back a Google link")
+
+    return True, auth_url, {"pid": proc.pid, "state": state, "log": str(out)}
+
+
+def _extract_oauth_code(pasted: str) -> str:
+    """The code, from whatever the person actually sent.
+
+    They are copying out of a phone address bar showing a failed page, so what
+    arrives might be the whole redirect URL, a query string, or just the code.
+    Accepting only one of those shapes would fail the person at the very last
+    step, having done everything right.
+    """
+    pasted = pasted.strip()
+    m = re.search(r"[?&]code=([^&\s]+)", pasted)
+    if m:
+        return urllib.parse.unquote(m.group(1))
+    # A bare code: Google's look like "4/0Ab..." -- no spaces, no scheme.
+    if pasted and " " not in pasted and "://" not in pasted:
+        return pasted
+    return ""
+
+
+def gdrive_rclone_finish(handle: dict, pasted: str) -> tuple[bool, str]:
+    """Hand the code to the waiting rclone and return its token JSON."""
+    code = _extract_oauth_code(pasted)
+    if not code:
+        return False, ("I couldn't find a code in that. Copy the whole address "
+                       "from the browser bar -- the page will look broken, "
+                       "which is expected -- or just the part after code=.")
+    state = handle.get("state", "")
+    try:
+        urllib.request.urlopen(
+            f"http://127.0.0.1:{RCLONE_AUTH_PORT}/"
+            f"?state={urllib.parse.quote(state)}&code={urllib.parse.quote(code)}",
+            timeout=20).read()
+    except Exception as exc:
+        return False, f"could not hand the code to rclone: {exc}"
+
+    log = Path(handle.get("log", ""))
+    deadline = time.time() + RCLONE_AUTH_FINISH_TIMEOUT
+    while time.time() < deadline:
+        time.sleep(0.5)
+        try:
+            text = log.read_text(errors="replace")
+        except OSError:
+            continue
+        m = re.search(r'(\{"access_token".*?\})\s*$', text, re.S | re.M)
+        if m:
+            return True, m.group(1)
+        if "Fatal error" in text or "invalid_grant" in text:
+            return False, ("Google rejected that code. It is single-use and "
+                           "expires quickly -- run /connectgdrive again for a "
+                           "fresh link.")
+    return False, "rclone did not return a token in time"
+
+
+def gdrive_rclone_cleanup(handle: dict) -> None:
+    """The log holds a live refresh token until it is gone."""
+    try:
+        if handle.get("pid"):
+            os.kill(handle["pid"], 9)
+    except (OSError, ProcessLookupError):
+        pass
+    log = handle.get("log")
+    if log:
+        shutil.rmtree(Path(log).parent, ignore_errors=True)
 
 
 def read_gdrive_client() -> dict:

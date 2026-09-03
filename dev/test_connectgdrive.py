@@ -199,20 +199,21 @@ check("rclone itself rejecting the token is reported plainly", ok is False)
 # --- 6. cmd_connectgdrive: first account vs. a labelled second one --------
 async def main():
     mod._gdrive_wizard.clear()
-    with patch.object(mod, "_list_gdrive_accounts", return_value=[]):
+    # Changed deliberately, twice. v0.2b.54 replaced "paste the token rclone
+    # printed" with Google's device flow; v0.2b.61 replaced THAT as the default
+    # with rclone's own verified sign-in, because setting up a Cloud client
+    # turned out to require a branding page plus three published URLs, which
+    # stopped a real operator dead. A first account now goes straight to a
+    # Google link, with no Cloud project of any kind.
+    with patch.object(mod, "_list_gdrive_accounts", return_value=[]), \
+         patch.object(mod, "_gdrive_begin_rclone", new=AsyncMock()) as begin:
         u = upd()
         await mod.cmd_connectgdrive(u, ctx())
     state = mod._gdrive_wizard.get(OWNER)
-    # Changed deliberately: the default path is now Google's device flow (open
-    # a URL, type a code), so a first account no longer lands on "paste the
-    # token rclone printed". With no OAuth client stored yet it stops to ask
-    # for one first.
-    check("first-ever account skips the label step and starts the device flow",
-          state is not None and state["step"] == "await_gdrive_client"
-          and state["name"] == "gdrive")
-    txt = u.message.reply_text.call_args[0][0]
-    check("...and asks for an OAuth client instead of a pasted rclone token",
-          "TV and Limited Input devices" in txt and "rclone authorize" not in txt)
+    check("first-ever account skips the label step and starts the sign-in",
+          begin.await_count == 1 and state is not None and state["name"] == "gdrive")
+    check("...using rclone's own client, not asking the operator to build one",
+          begin.await_args[0][3] == "gdrive")
     mod._gdrive_wizard.clear()
 
     # The paste-a-token path is still reachable on purpose -- drive.file only
@@ -255,13 +256,20 @@ async def main():
     with patch.object(mod, "_list_gdrive_accounts", return_value=["gdrive"]):
         u4 = upd(); await mod.cmd_connectgdrive(u4, ctx())
     u5 = upd(text="ClientA")
-    with patch.object(mod, "_list_gdrive_accounts", return_value=["gdrive"]):
+    # The sign-in start is stubbed so this covers the LABEL logic. Without it
+    # the label step runs straight into the real rclone sign-in, which on a
+    # host with no rclone fails and clears the wizard -- leaving this asserting
+    # about a state that no longer exists, for reasons nothing to do with
+    # labels.
+    with patch.object(mod, "_list_gdrive_accounts", return_value=["gdrive"]), \
+         patch.object(mod, "_gdrive_begin_rclone", new=AsyncMock()) as begin:
         consumed = await mod._handle_wizard_input(u5, ctx())
     state5 = mod._gdrive_wizard.get(OWNER)
     check("a valid label consumes the message and advances to the sign-in step",
-          consumed is True and state5 is not None
-          and state5["step"] in ("await_gdrive_client", "device_pending"))
-    check("...with the sanitised name recorded", state5["name"] == "gdrive_ClientA")
+          consumed is True and begin.await_count == 1)
+    check("...with the sanitised name recorded, and carried into the sign-in",
+          state5 is not None and state5["name"] == "gdrive_ClientA"
+          and begin.await_args[0][3] == "gdrive_ClientA")
     mod._gdrive_wizard.clear()
 
     with patch.object(mod, "_list_gdrive_accounts", return_value=["gdrive"]):
