@@ -7,7 +7,7 @@ A report doesn't have to stop at the chat: it can land straight in a shared
 [Google Drive](#google-drive-optional) folder too, connected the same explicit way as
 everything else here -- through Telegram, not a config file.
 
-> **Status: v0.2b.51 -- early/beta.** Built and battle-tested against a real production
+> **Status: v0.2b.52 -- early/beta.** Built and battle-tested against a real production
 > Proxmox VE cluster over several days of iteration, including a live-fire test of the
 > unlock/PIN/snapshot flow against real infrastructure. Works well; still has known
 > rough edges (see [Known limitations](#known-limitations)).
@@ -73,6 +73,20 @@ down, this is the map.
 - `/graduate` turns a case just solved into a reusable script that costs **0 tokens**
   to run again -- always triggered by a human once, never something the agent
   decides on its own is worth saving.
+
+**Extendable through MCP, without extending this codebase**
+- Both CLIs underneath already speak [MCP](#mcp-servers-optional), so a
+  registered server's tools become available to the agent with no new agent
+  code -- including on the cheap default tier, not just the expensive one.
+- A working server ships in the repo: read-only, locked to one folder, pure
+  standard-library Python, nothing to install.
+- Registering one is PIN-gated like `/addserver`, because an MCP server can
+  act on the agent's behalf -- and the model can never register one itself.
+
+**Hardened as part of installing, not as a follow-up task**
+- The systemd unit ships sandboxed (`systemd-analyze security`: **5.8 MEDIUM**,
+  down from **9.6 UNSAFE**), and `install.sh` locks every secret and state
+  file to owner-only -- see [Hardening](#hardening-applied-at-install-time).
 
 **Reports don't have to stay in the chat**
 - The agent can write a file and hand it back through Telegram, or -- see
@@ -317,6 +331,9 @@ Ollama, say), since something has to translate between protocols.
 | `/agentstatus` | tiny probe each | Live check: is each tier actually up right now? |
 | `/providers` | **0 tokens** | Which AI tiers are configured, and which are healthy |
 | `/usemodel [name]` | owner/admin | Force a specific tier for this chat (Opus, Gemini Pro-high, ...); `auto` for the default chain |
+| `/addmcp <name> <cmd> [args]` | owner/admin + PIN | Register an MCP server -- run it bare for a ready-to-use, no-install example |
+| `/rmmcp <name>` | owner/admin | Withdraw one (no PIN -- it only reduces capability) |
+| `/mcpservers` | **0 tokens** | What MCP servers are registered |
 | `/gdrive` | owner/admin, **0 tokens** | Pick (or show) which connected Drive account this room uploads to |
 | `/lang` (or `/language`) | owner/admin, **0 tokens** | Set/show this chat's language for the bot's own fixed replies (`en`/`id`) |
 | `/mode` | **0 tokens** | Read-only right now, or able to change things? |
@@ -527,6 +544,104 @@ needs no Google Cloud project of your own) is being retired sometime in 2026 and
 can occasionally hit a shared rate limit under global load (rclone retries with
 backoff automatically). If it stops working, the fix is creating your own
 `client_id` — see rclone's docs linked above.
+
+### MCP servers (optional)
+
+[MCP](https://modelcontextprotocol.io) is an open protocol for giving a model
+new capabilities -- read a database, reach an internal API, browse a document
+store -- through a small separate program called an MCP server. **Both** CLIs
+underneath this bot already speak it, so registering one here inherits that
+whole ecosystem without a line of new agent code.
+
+```
+/addmcp reports python3 tools/mcp_readonly_fs.py /root/lite-agent/reports
+/mcpservers          what is registered  (0 tokens)
+/rmmcp reports       withdraw one
+```
+
+**A working default ships with this repo.** `tools/mcp_readonly_fs.py` is a
+read-only, path-locked MCP server in pure standard-library Python -- no `pip
+install`, no `npx`, no Node.js, nothing to install at all beyond the `python3`
+this project already requires. It gives the model two tools (`list_files`,
+`read_file`) scoped to exactly one folder. Everything outside that folder is
+refused: a `..` segment, an absolute path elsewhere, or a symlink pointing
+out are all turned away, and files over 200 KB are refused rather than
+silently truncated.
+
+Nothing restricts you to it. MCP is a wire protocol, not a language or a
+package -- any server that speaks it works, including the npm-published ones:
+
+```
+/addmcp sentry npx -y @sentry/mcp-server        # needs Node.js on this host
+```
+
+Node.js is **not** installed for you. This project installs what it actually
+uses, and a bot with no npm-based MCP server registered has no reason to carry
+a JavaScript runtime.
+
+**How it is gated, and why.** `/addmcp` is locked exactly like `/addserver`:
+owner anywhere, or a registered group's own admin, PIN required. That is
+deliberate -- an MCP server can read and write on the agent's behalf, so
+adding one is handing out real trust, and it is a decision a person makes,
+never one the model can make for itself. `/rmmcp` needs no PIN, for the same
+reason `/addboundary` doesn't: it only ever *reduces* what the agent can do.
+A registered server grants its whole tool set (`mcp__<name>`), the same
+granularity `/addserver` already uses for a whole machine.
+
+The registry lives in `mcp_servers.json`, in the exact shape Claude Code's
+`--mcp-config` expects, so it is handed over unmodified; agy keeps MCP servers
+in its own persistent config instead, so registrations are pushed to it with
+`agy mcp add`. If agy is missing or too old for the subcommand, that is logged
+and the Claude side still works.
+
+### Hardening (applied at install time)
+
+This host is worth more than any single machine it manages: it holds the
+Telegram bot token, the PIN hash, and the SSH keys that reach every managed
+node. So hardening is **step 8 of installing**, not a page in the docs someone
+gets to eventually.
+
+| | before | after |
+|---|---|---|
+| `systemd-analyze security lite-agent` | **9.6 UNSAFE** | **5.8 MEDIUM** |
+| `sessions.json`, `spend.jsonl` | `644` -- world-readable | `600` |
+
+What the installed systemd unit does: `/usr`, `/boot` and `/etc` are read-only
+to the service (`ProtectSystem=full`); no device access; kernel tunables,
+modules, logs, cgroups, the clock and the hostname are all off limits; it
+cannot create setuid files, schedule realtime, change its execution domain, or
+create namespaces; only the socket families it genuinely uses are permitted;
+no writable-executable memory; and `UMask=0077`, so the state files it creates
+are owner-only rather than world-readable.
+
+What `install.sh` does beyond that: `chmod 600` on every secret and state file
+already on disk (`UMask` only governs *new* files, so anything an earlier
+version wrote keeps its old mode -- which is exactly how a real deployment
+ended up with world-readable conversation state), `chmod 700` on the per-chat
+memory directory and `~/.ssh`, and a printed note that this bot needs **no
+inbound ports at all**, with the two-line `ufw` command if the host is exposed.
+
+Three directives are deliberately left **off**, and the unit file says why
+next to each. Briefly: `NoNewPrivileges` removes exactly the setuid escalation
+`/update`'s `sudo -n systemctl restart` depends on (the bot would update itself
+and never come back on a non-root install); `ProtectHome` was measured to break
+both the install directory and the `~/.ssh` write-mode key swap outright on a
+root deployment; and `PrivateTmp` hides the sign-in tmux sessions from an
+operator trying to see what a stuck login is actually showing.
+
+Every directive here -- including the ones that are on -- was checked against
+the real workload on a live host before shipping, with a probe that wrote to
+the install directory, rewrote `~/.ssh`, resolved DNS, opened outbound TLS,
+spawned both CLIs, reached tmux and made the `sudo` hop: 10/10 under the final
+unit. Two initial assumptions turned out to be wrong and the measurements
+overruled them -- `MemoryDenyWriteExecute` was assumed to break the Node-based
+CLIs and does not (a real Claude turn *and* a real agy turn both completed
+under it, so it is enabled), while `ProtectHome` was assumed merely awkward and
+in fact breaks the install.
+
+Existing deployments get this by re-running `./install.sh` (it is idempotent),
+or `sudo systemctl daemon-reload && sudo systemctl restart lite-agent` after
+an `/update` that brings the new unit file.
 
 ### Updating (`/update`)
 

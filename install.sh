@@ -206,7 +206,7 @@ say "Step 6/7 -- Environment brief (SOUL.md / GEMINI.md)"
 ok "Briefs in place. /start will ask what this agent looks after."
 
 # ------------------------------------------------------------------------------
-say "Step 7/7 -- systemd service"
+say "Step 7/8 -- systemd service"
 # ------------------------------------------------------------------------------
 SERVICE_FILE="/etc/systemd/system/lite-agent.service"
 sed \
@@ -216,6 +216,41 @@ sed \
   "$INSTALL_DIR/systemd/lite-agent.service.template" | sudo tee "$SERVICE_FILE" >/dev/null
 sudo systemctl daemon-reload
 ok "systemd unit installed at ${SERVICE_FILE}."
+
+# ------------------------------------------------------------------------------
+say "Step 8/8 -- basic hardening"
+# ------------------------------------------------------------------------------
+# This host is worth more than any single machine it manages: it holds the
+# Telegram bot token, the PIN hash, and the SSH keys that reach every managed
+# node. So hardening is part of installing, not a page in the docs someone
+# gets to later.
+#
+# The systemd unit written above carries the sandbox half (ProtectSystem,
+# MemoryDenyWriteExecute, UMask=0077 and the rest -- each one verified against
+# the real workload, see the comments in systemd/lite-agent.service.template).
+# What is left is the files already on disk: UMask only governs files created
+# from now on, so anything written by an earlier version keeps whatever mode
+# it had. On a real deployment that meant sessions.json and spend.jsonl sitting
+# at 644 -- every chat's conversation state and token history readable by any
+# account on the box.
+HARDENED=0
+for f in .env pin.json sessions.json sessions.json.bak spend.jsonl          allowed_groups.json servers.json schedules.json snapshots.json          setup_state.json model_overrides.json chat_language.json          gdrive_room_accounts.json mcp_servers.json MEMORY.md OWNER_SCOPE.md; do
+  if [ -f "$INSTALL_DIR/$f" ]; then
+    chmod 600 "$INSTALL_DIR/$f" 2>/dev/null && HARDENED=$((HARDENED + 1))
+  fi
+done
+[ -d "$INSTALL_DIR/memory" ] && chmod 700 "$INSTALL_DIR/memory" 2>/dev/null
+# Credentials the CLIs and rclone keep in $HOME. Never created by this script,
+# but a wrong mode here is worth as much to an attacker as the bot's own files.
+[ -d "$HOME/.ssh" ] && chmod 700 "$HOME/.ssh" 2>/dev/null
+for c in "$HOME/.config/rclone/rclone.conf" "$HOME/.claude.json"; do
+  [ -f "$c" ] && chmod 600 "$c" 2>/dev/null
+done
+ok "Secrets and state locked to owner-only (${HARDENED} file(s) in ${INSTALL_DIR})."
+say "  Sandbox: systemd-analyze security lite-agent   (expect ~5.8 MEDIUM, was 9.6 UNSAFE)"
+say "  This bot needs NO inbound ports. If this host is reachable from outside,"
+say "  a firewall allowing only SSH in is worth the two minutes:"
+say "    sudo ufw default deny incoming && sudo ufw allow OpenSSH && sudo ufw enable"
 
 echo ""
 echo "${BOLD}${GREEN}Done.${RESET} Start it:"

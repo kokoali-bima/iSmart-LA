@@ -90,6 +90,26 @@ SYSTEM_PROMPT_FILE = BASE_DIR / "SOUL.md"
 GEMINI_PROMPT_FILE = BASE_DIR / "GEMINI.md"
 MEMORY_FILE = BASE_DIR / "MEMORY.md"
 OWNER_SCOPE_FILE = BASE_DIR / "OWNER_SCOPE.md"
+# BOTH CLIs already speak MCP natively, so this inherits the whole MCP tool
+# ecosystem without a single line of new agent code. Verified live before
+# being wired in, not assumed from docs -- and the first assumption made here
+# was wrong, which is why it was checked:
+#
+#   claude -- takes --mcp-config per invocation. A hand-rolled stdio probe
+#             server plus a real tools/call round-trip returned the exact
+#             marker string, with "permission_denials":[] confirming that
+#             --allowedTools "mcp__<server>" genuinely grants access.
+#   agy    -- was assumed to have no MCP support at all. It does: an `agy mcp`
+#             subcommand with add/remove/list, writing to agy's OWN persistent
+#             config rather than taking a flag. Confirmed with a real Gemini
+#             turn that used a registered server's tools and read back the
+#             right value from a real file.
+#
+# That difference matters for cost: agy is the DEFAULT, cheapest tier, so
+# without the agy half, MCP tools would only ever be reachable on the
+# expensive escalation path -- exactly backwards.
+MCP_CONFIG_FILE = BASE_DIR / "mcp_servers.json"
+_MCP_NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 LOG_FILE = BASE_DIR / "lite-agent.log"
 # One JSON line per completed turn. This project's whole claim is about cost,
 # but until now that cost only ever existed as a sentence inside a log line --
@@ -506,7 +526,7 @@ _pin_sessions: dict[str, dict] = {}
 # back to owner-AND-private-DM, the strict default (see cmd_pin_key).
 PIN_ACTIONS_ALLOWED_IN_GROUP = frozenset({
     "new_pin_capture", "new_pin_confirm", "change_pin_start", "schedule_install",
-    "unlock", "unlock_and_resume", "addserver", "update", "rmboundary",
+    "unlock", "unlock_and_resume", "addserver", "update", "rmboundary", "addmcp",
     "new_group_pin_capture", "new_group_pin_confirm", "change_group_pin_start",
 })
 _pin_lockout_until: float = 0.0
@@ -1668,6 +1688,75 @@ def clear_owner_scope() -> bool:
 
 
 # --------------------------------------------------------------------------
+# MCP servers -- registered here, loaded by Claude Code via --mcp-config
+# --------------------------------------------------------------------------
+
+def read_mcp_servers() -> dict:
+    """{"name": {"command": ..., "args": [...]}}. The file on disk is kept in
+    the EXACT shape --mcp-config expects (a top-level {"mcpServers": {...}}
+    object) so it can be handed to the CLI unmodified -- this just unwraps it
+    for callers here."""
+    if not MCP_CONFIG_FILE.exists():
+        return {}
+    try:
+        return json.loads(MCP_CONFIG_FILE.read_text()).get("mcpServers", {})
+    except Exception:
+        logger.warning("mcp_servers.json unreadable, ignoring", exc_info=True)
+        return {}
+
+
+def _write_mcp_servers(servers: dict) -> None:
+    MCP_CONFIG_FILE.write_text(json.dumps({"mcpServers": servers}, indent=2))
+
+
+def _sync_agy_mcp(argv: list[str]) -> None:
+    """agy keeps MCP servers in its OWN persistent config (`agy mcp add`),
+    with no per-invocation flag like claude's --mcp-config -- so the registry
+    has to be pushed to it rather than handed over at call time.
+
+    Best-effort on purpose: agy may not be installed, may not be signed in,
+    or may be an older build without the subcommand. None of that should stop
+    a registration the Claude side will honour perfectly well, so a failure is
+    logged and swallowed rather than raised."""
+    try:
+        proc = subprocess.run([AGY_BIN, "mcp", *argv], capture_output=True,
+                              text=True, timeout=30)
+        if proc.returncode != 0:
+            logger.warning("agy mcp %s failed (%s): %s", argv[0], proc.returncode,
+                           (proc.stderr or proc.stdout or "")[-200:])
+    except (OSError, subprocess.SubprocessError):
+        logger.warning("could not reach agy to sync MCP config", exc_info=True)
+
+
+def register_mcp_server(name: str, command: str, args: list[str]) -> None:
+    servers = read_mcp_servers()
+    servers[name] = {"command": command, "args": args}
+    _write_mcp_servers(servers)
+    logger.warning("MCP server registered: %s -> %s %s", name, command, " ".join(args))
+    _sync_agy_mcp(["add", name, command, *args])
+
+
+def remove_mcp_server(name: str) -> bool:
+    servers = read_mcp_servers()
+    if name not in servers:
+        return False
+    del servers[name]
+    _write_mcp_servers(servers)
+    logger.warning("MCP server removed: %s", name)
+    _sync_agy_mcp(["remove", name])
+    return True
+
+
+def _mcp_allowed_tools_suffix() -> str:
+    """"mcp__<name>" per registered server -- grants the WHOLE server's tools,
+    the same granularity /addserver already grants for a whole machine, not
+    a per-tool allowlist. Empty string when nothing is registered, so callers
+    can always just concatenate it onto ALLOWED_TOOLS."""
+    names = sorted(read_mcp_servers())
+    return ",".join(f"mcp__{n}" for n in names)
+
+
+# --------------------------------------------------------------------------
 # Self-update
 # --------------------------------------------------------------------------
 SERVICE_NAME = os.environ.get("SERVICE_NAME", "lite-agent")
@@ -2292,12 +2381,23 @@ def _run_claude_once(prompt: str, session_id: Optional[str], session_name: str, 
         env.pop("ANTHROPIC_API_KEY", None)
     env["ANTHROPIC_MODEL"] = model
 
+    allowed_tools = ALLOWED_TOOLS
+    mcp_suffix = _mcp_allowed_tools_suffix()
     cmd = [
         CLAUDE_BIN, "-p", prompt,
         "--system-prompt-file", str(SYSTEM_PROMPT_FILE),
         "--output-format", "json",
-        "--allowedTools", ALLOWED_TOOLS,
     ]
+    if mcp_suffix:
+        # --mcp-config takes the SAME {"mcpServers": {...}} shape the file on
+        # disk is already stored in -- handed to the CLI unmodified, no
+        # translation layer to keep in sync. Granting "mcp__<server>" (not a
+        # per-tool allowlist) matches the granularity /addserver already uses
+        # for a whole machine: the operator who registered the server via PIN
+        # is the one who decided it's trusted, not this call site.
+        cmd += ["--mcp-config", str(MCP_CONFIG_FILE)]
+        allowed_tools = f"{allowed_tools},{mcp_suffix}"
+    cmd += ["--allowedTools", allowed_tools]
 
     # Checked fresh every turn, same as agy's _build_agy_prompt -- a group
     # conversation must never carry this even if the owner once spoke in it,
@@ -4710,6 +4810,124 @@ async def cmd_spend(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
 
+# MCP is a wire protocol (JSON-RPC over stdio), not tied to any language --
+# this stdlib default satisfies it fully (verified live against the real
+# claude CLI: a genuine tools/list + tools/call round-trip, permission
+# granted, zero denials), so it needs nothing installed beyond the python3
+# this whole project already requires. A server that only ships via npm
+# still works the same way (see README "MCP servers") -- Node.js just isn't
+# something this installs for you unasked.
+_MCP_EXAMPLE = "python3 tools/mcp_readonly_fs.py <folder>"
+
+
+async def cmd_addmcp(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Register an MCP server Claude Code may load via --mcp-config. Gated
+    exactly like /addserver -- owner anywhere, or a registered group's own
+    admin, PIN required -- because this grants a genuinely new trust surface:
+    an MCP server can read and write on the agent's behalf, and the model
+    must never be the one deciding to add one for itself."""
+    if not _may_run_setup(update):
+        return
+    lang = _chat_lang(update)
+    if not _is_owner(update) and not await _is_group_admin(update, context):
+        return await update.message.reply_text(_t(lang,
+            "🔒 Bot owner or a group admin only.", "🔒 Cuma pemilik bot atau admin grup."))
+
+    args = context.args or []
+    if len(args) < 2 or not _MCP_NAME_RE.match(args[0]):
+        existing = ", ".join(sorted(read_mcp_servers())) or _t(lang, "(none yet)", "(belum ada)")
+        return await update.message.reply_text(_t(lang,
+            "Usage: <code>/addmcp &lt;name&gt; &lt;command&gt; [args...]</code>\n\n"
+            "<b>Ready-to-use default</b> -- stdlib only, no pip/npx install, read-only, "
+            "locked to one folder, costs nothing to run:\n"
+            f"<pre>/addmcp reports {_tg_escape(_MCP_EXAMPLE)}</pre>\n"
+            "Gives the model two tools scoped to that one folder: list its files, read "
+            "one. Nothing outside it is ever reachable -- see "
+            "<code>tools/mcp_readonly_fs.py</code>'s own docstring for exactly how.\n\n"
+            f"Currently registered: {existing}",
+            "Pakai: <code>/addmcp &lt;nama&gt; &lt;perintah&gt; [argumen...]</code>\n\n"
+            "<b>Default siap pakai</b> -- cuma stdlib, tidak perlu install pip/npx, "
+            "read-only, terkunci ke satu folder, tidak ada biaya jalan:\n"
+            f"<pre>/addmcp reports {_tg_escape(_MCP_EXAMPLE)}</pre>\n"
+            "Kasih model dua tool terbatas ke satu folder itu: lihat isinya, baca satu "
+            "file. Di luar folder itu tidak pernah terjangkau -- lihat docstring "
+            "<code>tools/mcp_readonly_fs.py</code> untuk detail caranya.\n\n"
+            f"Terdaftar sekarang: {existing}",
+        ), parse_mode="HTML")
+
+    name, command, rest = args[0], args[1], args[2:]
+    if name in read_mcp_servers():
+        return await update.message.reply_text(_t(lang,
+            f"'{name}' is already registered -- /rmmcp it first to replace.",
+            f"'{name}' sudah terdaftar -- /rmmcp dulu untuk mengganti."))
+
+    payload = {"name": name, "command": command, "args": rest}
+    summary = f"{command} {' '.join(rest)}".strip()
+    if pin_is_set(update.effective_chat.id):
+        await request_pin(update, "addmcp", payload, _t(lang,
+            f"🔌 Adding MCP server <b>{_tg_escape(name)}</b>:\n<code>{_tg_escape(summary)}</code>\n\n"
+            "This grants the model a new tool surface -- it can read and, depending on "
+            "the server, write on your behalf.",
+            f"🔌 Menambah server MCP <b>{_tg_escape(name)}</b>:\n<code>{_tg_escape(summary)}</code>\n\n"
+            "Ini memberi model permukaan tool baru -- bisa membaca dan, tergantung "
+            "servernya, menulis atas nama Anda.",
+        ))
+    else:
+        await update.message.reply_text(_t(lang,
+            "⚠️ No PIN is set, so this isn't protected yet. Set one with /setpin "
+            "when you're done.",
+            "⚠️ Belum ada PIN, jadi ini belum terlindungi. Atur satu dengan /setpin "
+            "kalau sudah selesai.",
+        ))
+        register_mcp_server(name, command, rest)
+        await update.message.reply_text(_t(lang,
+            f"🔌 <b>{_tg_escape(name)}</b> registered.\n\n"
+            "<i>Takes effect on the next new conversation -- /new applies it now.</i>",
+            f"🔌 <b>{_tg_escape(name)}</b> terdaftar.\n\n"
+            "<i>Berlaku di percakapan baru berikutnya -- /new untuk langsung terapkan.</i>",
+        ), parse_mode="HTML")
+
+
+async def cmd_rmmcp(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """No PIN -- removing a server only ever REDUCES the model's tool surface,
+    the same direction /removeserver and /addboundary already leave free."""
+    if not _may_run_setup(update):
+        return
+    lang = _chat_lang(update)
+    if not _is_owner(update) and not await _is_group_admin(update, context):
+        return await update.message.reply_text(_t(lang,
+            "🔒 Bot owner or a group admin only.", "🔒 Cuma pemilik bot atau admin grup."))
+    name = (context.args[0] if context.args else "").strip()
+    if not name or not remove_mcp_server(name):
+        return await update.message.reply_text(_t(lang,
+            "Usage: /rmmcp <name>\nSee names with /mcpservers",
+            "Pakai: /rmmcp <nama>\nLihat nama di /mcpservers"))
+    await update.message.reply_text(_t(lang,
+        f"🔌 Removed: {_tg_escape(name)}\n\n<i>Takes effect on the next new conversation -- /new applies it now.</i>",
+        f"🔌 Dihapus: {_tg_escape(name)}\n\n<i>Berlaku di percakapan baru berikutnya -- /new untuk langsung terapkan.</i>",
+    ), parse_mode="HTML")
+
+
+async def cmd_mcpservers(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Zero tokens -- reads the registry file directly, same as /servers."""
+    if not _authorized(update):
+        return
+    lang = _chat_lang(update)
+    servers = read_mcp_servers()
+    if not servers:
+        return await update.message.reply_text(_t(lang,
+            "No MCP servers registered. /addmcp to add one -- run it bare for a "
+            "ready-to-use example.",
+            "Belum ada server MCP terdaftar. /addmcp untuk menambah -- jalankan "
+            "kosong untuk contoh siap pakai.",
+        ))
+    lines = [_t(lang, "🔌 <b>MCP servers</b>", "🔌 <b>Server MCP</b>"), ""]
+    for name, spec in sorted(servers.items()):
+        cmdline = f"{spec.get('command', '?')} {' '.join(spec.get('args', []))}".strip()
+        lines.append(f"• <b>{_tg_escape(name)}</b> — <code>{_tg_escape(cmdline)}</code>")
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+
 async def cmd_setownerscope(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Extra scope that applies ONLY when the owner is speaking in their own
     private chat with the bot -- never in a group, even one the owner is
@@ -5758,6 +5976,16 @@ async def _pin_verified(update: Update, context: ContextTypes.DEFAULT_TYPE,
 
     if action == "addserver":
         await _begin_addserver(update, query)
+        return
+
+    if action == "addmcp":
+        register_mcp_server(payload["name"], payload["command"], payload["args"])
+        await query.edit_message_text(_t(lang,
+            f"🔌 <b>{_tg_escape(payload['name'])}</b> registered.\n\n"
+            "<i>Takes effect on the next new conversation -- /new applies it now.</i>",
+            f"🔌 <b>{_tg_escape(payload['name'])}</b> terdaftar.\n\n"
+            "<i>Berlaku di percakapan baru berikutnya -- /new untuk langsung terapkan.</i>",
+        ), parse_mode="HTML")
         return
 
     if action == "schedule_install":
@@ -7599,6 +7827,9 @@ def main() -> None:
     app.add_handler(CommandHandler("addserver", cmd_addserver))
     app.add_handler(CommandHandler("servers", cmd_servers))
     app.add_handler(CommandHandler("removeserver", cmd_removeserver))
+    app.add_handler(CommandHandler("addmcp", cmd_addmcp))
+    app.add_handler(CommandHandler("rmmcp", cmd_rmmcp))
+    app.add_handler(CommandHandler("mcpservers", cmd_mcpservers))
     app.add_handler(CallbackQueryHandler(cmd_server_button, pattern="^srv:"))
     app.add_handler(CallbackQueryHandler(cmd_needwrite_button, pattern="^nw:"))
     app.add_handler(CommandHandler("agentstatus", cmd_agentstatus))

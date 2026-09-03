@@ -1,5 +1,78 @@
 # Changelog
 
+## v0.2b.52 -- MCP support, and hardening that ships with the install
+
+Two of the three remaining review items, both finished the same way: verify
+against the real thing first, and let the measurement overrule the assumption
+when they disagree. They disagreed twice here.
+
+### MCP
+
+Claude Code and agy BOTH already speak MCP, so this inherits the whole tool
+ecosystem without a line of new agent code. Verified live before any of it was
+wired in -- a hand-rolled stdio server, a real tools/list + tools/call round
+trip returning the exact marker string, "permission_denials":[] confirming
+that --allowedTools "mcp__<server>" genuinely grants access.
+
+The first assumption made here was wrong and got caught: agy was assumed to
+have no MCP support at all. It has an `agy mcp` subcommand (add/remove/list),
+writing to its own persistent config rather than taking a per-call flag. That
+mattered -- agy is the DEFAULT, cheapest tier, so without the agy half, MCP
+tools would only ever have been reachable on the expensive escalation path,
+exactly backwards. Confirmed with a real Gemini turn that used a registered
+server's tools and read the right value out of a real file.
+
+`/addmcp <name> <command> [args...]`, gated exactly like /addserver -- owner
+anywhere, or a registered group's own admin, PIN required -- because an MCP
+server can read and write on the agent's behalf, and the model must never be
+the one deciding to add one. `/rmmcp` needs no PIN, for the same reason
+/addboundary doesn't: it only ever reduces capability. `/mcpservers` lists,
+0 tokens.
+
+New: `tools/mcp_readonly_fs.py`, a read-only path-locked MCP server in pure
+stdlib Python -- no pip, no npx, no Node.js, nothing to install beyond the
+python3 this project already requires. Two tools scoped to one folder; a `..`
+segment, an absolute path elsewhere, and a symlink pointing out are all
+refused, files over 200 KB refused rather than truncated. It is the default
+/addmcp suggests. Any standard MCP server works, npm-published ones included;
+Node.js just isn't installed for you.
+
+### Hardening
+
+A fresh install used to leave the service at `systemd-analyze security`
+**9.6 UNSAFE**, and on the real deployment sessions.json and spend.jsonl sat
+at mode **644** -- every chat's conversation state and token history readable
+by any account on the box. Now **5.8 MEDIUM** and 600, applied as step 8 of
+install.sh rather than documented as homework.
+
+Every directive was checked against the real workload on a live host with a
+probe exercising what the bot genuinely does -- write its own directory,
+read AND rewrite ~/.ssh for the write-mode key swap, DNS, outbound TLS, spawn
+both CLIs, tmux, the `sudo -n systemctl` hop /update depends on. 10/10 under
+the final unit.
+
+The second wrong assumption: MemoryDenyWriteExecute was documented as
+unusable because both CLIs run on Node.js and a JIT needs W+X memory. Measured
+instead -- a real Claude turn returned "is_error":false at exit 0 under it, and
+a real agy turn completed too. It is enabled on that evidence. Meanwhile
+ProtectHome, assumed merely awkward, actually breaks a root install outright
+(OSError 30 on both the install directory and ~/.ssh), and NoNewPrivileges
+removes exactly the setuid escalation /update's sudo restart depends on. Both
+stay off, with the reason written next to them in the unit file.
+
+install.sh also chmods every pre-existing secret and state file (UMask only
+governs new ones), chmod 700 on the memory directory and ~/.ssh, and prints
+the ufw line -- this bot needs no inbound ports at all.
+
+### Also
+
+- Fixed: spend.jsonl leaked into the repo from four test suites. LEDGER_FILE
+  and MEMORY_DIR are BASE_DIR-relative, so a suite's `os.environ["HOME"]`
+  sandbox never covered them.
+
+Full suite: **423/423 across 24 suites** on the real Linux target.
+
+
 ## v0.2b.51 -- CI, and a real blind spot found while wiring it up
 
 The last open item from Fase 0 of the review-driven work: `dev/run_all.py`

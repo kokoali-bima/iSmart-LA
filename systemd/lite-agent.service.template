@@ -14,5 +14,81 @@ ExecStart=__INSTALL_DIR__/venv/bin/python __INSTALL_DIR__/lite_agent.py
 Restart=on-failure
 RestartSec=5
 
+# ---------------------------------------------------------------------------
+# Basic hardening, applied at install time so a fresh deployment is never
+# unprotected while someone gets around to it. This host holds the Telegram
+# bot token, the PIN hash, and the SSH keys that reach every managed machine,
+# so it is worth more than any single node it manages.
+#
+# Everything below was verified to leave the real workload working -- reading
+# and rewriting ~/.ssh, spawning both CLIs, DNS, outbound TLS -- not just
+# accepted by systemd's parser. `systemd-analyze security lite-agent` scores
+# the result.
+# ---------------------------------------------------------------------------
+
+# /usr, /boot and /etc become read-only to this service. It writes only to its
+# own install directory and to the CLI credential directories under $HOME.
+ProtectSystem=full
+# No device access is ever needed here -- sockets and files only.
+PrivateDevices=yes
+# Kernel, clock, cgroup and hostname surfaces this never legitimately touches.
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+# Cannot acquire setuid/setgid bits, schedule realtime, change its own
+# execution domain, or leave SysV IPC objects behind.
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+RemoveIPC=yes
+# The socket families actually in use: TCP/IP out, AF_UNIX for local sockets
+# (tmux, the CLIs' own IPC), AF_NETLINK because glibc's getaddrinfo() uses it
+# to enumerate local interfaces -- dropping it breaks DNS in a way that looks
+# like a network fault rather than a sandbox denial.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+# Blocks pages that are writable and executable at once. Assumed at first to
+# be unusable here, since both CLIs run on Node.js and a JIT normally needs
+# W+X -- then measured instead of assumed: a real Claude inference turn under
+# this returned "is_error":false at exit 0, and agy behaved identically with
+# it and without it. Enabled on the evidence.
+MemoryDenyWriteExecute=yes
+# Files this service creates -- sessions.json, spend.jsonl, memory/, the
+# learned-facts file -- are owner-only rather than world-readable. Without
+# this, anything else on the box can read a chat's whole conversation state.
+UMask=0077
+# Only the machine's native ABI; a 32-bit syscall path on a 64-bit host is a
+# classic way around a filter.
+SystemCallArchitectures=native
+# No namespace creation. Verified not to disturb either CLI's own operation.
+RestrictNamespaces=yes
+
+# --- Deliberately NOT set. Each one WOULD break something real here, and a
+# --- broken bot is worse than a slightly larger surface. Listed so the
+# --- absence reads as a decision rather than an oversight:
+#
+#   NoNewPrivileges=yes
+#       /update restarts the service with `sudo -n systemctl restart`, and
+#       sudo works by being setuid-root. Measured both ways: under a ROOT
+#       install this is harmless (already uid 0, nothing to escalate) and the
+#       sudo hop still succeeded -- but on a non-root install it takes away
+#       exactly the escalation sudo depends on, and the bot would update
+#       itself and then never come back. Left off so one template is safe for
+#       both; a root-only deployment can add it and gain a little.
+#
+#   ProtectHome=yes|read-only
+#       Measured: with ProtectHome=read-only the probe failed on BOTH
+#       "write to its own install directory" and "read AND write ~/.ssh"
+#       (OSError 30, read-only file system) -- because a root install lives
+#       under /root, which counts as home. The write-mode key swap and both
+#       CLIs' credentials (~/.claude, ~/.gemini) all sit inside it.
+#
+#   PrivateTmp=yes
+#       The Gemini/Claude sign-in flows drive tmux. A private /tmp hides those
+#       sessions from an operator trying to attach from a shell to see what a
+#       stuck login is actually showing.
+
 [Install]
 WantedBy=multi-user.target
