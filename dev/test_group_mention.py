@@ -40,6 +40,16 @@ mod = importlib.util.module_from_spec(spec)
 sys.modules["la"] = mod
 spec.loader.exec_module(mod)
 
+# LEDGER_FILE/MEMORY_DIR/MEMORY_FILE are BASE_DIR-relative (the module's own
+# directory), NOT HOME-relative -- overriding HOME above does not sandbox
+# them, and drive() below calls handle_message(), which reaches _run_turn()
+# for anything that passes the mention/reply gate. See test_concurrency.py
+# for the live confirmation: without this, running against a real checkout
+# wrote spend.jsonl straight into the repo directory.
+mod.LEDGER_FILE = scratch / "spend.jsonl"
+mod.MEMORY_DIR = scratch / "memory"
+mod.MEMORY_FILE = scratch / "MEMORY.md"
+
 BOT_ID = 777
 BOT_USERNAME = "bscloud_agent_bot"
 OWNER = 111

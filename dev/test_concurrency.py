@@ -36,6 +36,17 @@ mod = importlib.util.module_from_spec(spec)
 sys.modules["la"] = mod
 spec.loader.exec_module(mod)
 
+# LEDGER_FILE/MEMORY_DIR/MEMORY_FILE are BASE_DIR-relative (the module's own
+# directory), NOT HOME-relative -- overriding HOME above does not sandbox
+# them. This suite drives real _run_turn() calls (only run_combo is mocked),
+# which write a real ledger row per turn. Without this, running it against a
+# real checkout (SRC pointing at the actual repo, not a scratch copy) wrote
+# spend.jsonl straight into the repo directory -- confirmed live: exactly
+# that file turned up in `git status` after a local run.
+mod.LEDGER_FILE = scratch / "spend.jsonl"
+mod.MEMORY_DIR = scratch / "memory"
+mod.MEMORY_FILE = scratch / "MEMORY.md"
+
 results = []
 def check(name, cond):
     results.append((name, bool(cond)))
