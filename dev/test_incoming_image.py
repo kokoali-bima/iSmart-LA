@@ -167,6 +167,136 @@ async def main():
           "on a disk nobody is watching", not old.exists())
     check("...while recent ones are kept", Path(written[0]).exists())
 
+    # --- tagging the bot while sending a picture, in a GROUP ---------------
+    # Asked directly: "bagaimana agar bisa nge tag bot ketika kirim gambar?"
+    # The honest answer was that you could not. Telegram puts a photo's text
+    # in msg.caption and its mentions in msg.caption_entities, while the group
+    # gate looked only at msg.text/msg.entities -- so an @mention on a
+    # screenshot matched nothing, the message was not a reply either, and
+    # handle_message returned without a word. The same silent-drop as before,
+    # just moved into groups.
+    BOT = "bscloud_agent_bot"
+
+    def group_photo(caption, entities, photo=True):
+        ent = [SimpleNamespace(type="mention", offset=o, length=l) for o, l in entities]
+        msg = SimpleNamespace(text=None, caption=caption, caption_entities=ent,
+                              entities=None, reply_to_message=None,
+                              photo=[SimpleNamespace(file_id="BIG", file_size=9)] if photo else None,
+                              document=None, reply_text=AsyncMock())
+        return SimpleNamespace(message=msg, effective_message=msg, callback_query=None,
+                               effective_user=SimpleNamespace(id=111),
+                               effective_chat=SimpleNamespace(id=-999, type="supergroup",
+                                                              title="g"))
+
+    def gctx(written):
+        return SimpleNamespace(
+            bot=SimpleNamespace(username=BOT, id=777,
+                                get_file=AsyncMock(return_value=tg_file(written)),
+                                send_chat_action=AsyncMock(), send_message=AsyncMock()),
+            args=[])
+
+    mod.ALLOWED_GROUP_IDS = {-999}
+    cap = f"@{BOT} tolong lihat ini"
+    u = group_photo(cap, [(0, len(BOT) + 1)])
+    got = {}
+    async def cap_turn(update, context, text, **kw):
+        got["text"] = text
+    written = []
+    with patch.object(mod, "_run_turn", side_effect=cap_turn),          patch.object(mod, "_handle_wizard_input", new=AsyncMock(return_value=False)),          patch.object(mod, "_handle_server_input", new=AsyncMock(return_value=False)):
+        await mod.handle_message(u, gctx(written))
+
+    check("tagging the bot in a photo's CAPTION wakes it in a group -- the "
+          "mention lives in caption_entities, which the gate used to ignore",
+          "text" in got)
+    check("...the caption survives as the question",
+          "tolong lihat ini" in got.get("text", ""))
+    check("...with the @mention itself stripped, not left in the prompt",
+          BOT not in got.get("text", ""))
+    check("...and the image is still attached for the model to read",
+          str(mod.INCOMING_MEDIA_DIR) in got.get("text", ""))
+
+    # A photo with NO mention and no reply must still be ignored in a group,
+    # or every picture posted in a busy room costs a turn.
+    u2 = group_photo("just chatting", [])
+    with patch.object(mod, "_run_turn", side_effect=AssertionError("must not answer")),          patch.object(mod, "_handle_wizard_input", new=AsyncMock(return_value=False)),          patch.object(mod, "_handle_server_input", new=AsyncMock(return_value=False)):
+        await mod.handle_message(u2, gctx([]))
+    check("an untagged photo in a group is still ignored -- the gate is not "
+          "loosened, only taught where captions keep their mentions", True)
+
+    # The mention is stripped BEFORE the image note is attached: entity
+    # offsets index the original message, so rewriting first would misalign
+    # them the moment anything is prepended rather than appended.
+    src2 = Path(SRC).read_text(encoding="utf-8")
+    i_strip = src2.index("_strip_entity(text, *mention_span)")
+    i_note = src2.index("The user attached an image")
+    check("the @mention is stripped before the text is rewritten, so the "
+          "offsets still index the string they were measured against",
+          i_strip < i_note)
+
+    # --- THE case reported: someone ELSE posted the picture ----------------
+    # "kalau ada gambar dikirim orang lain di group, kita tag ke bot, botnya
+    # ga respons". Your reply carries no photo at all -- the photo is on the
+    # message you replied to -- so looking only at your own message found
+    # nothing. And when the reply was nothing but "@botname", stripping the
+    # mention left an empty string and the handler returned without a word.
+    def reply_to_photo(caption_text, entities, replied_has_photo=True):
+        ent = [SimpleNamespace(type="mention", offset=o, length=l) for o, l in entities]
+        replied = SimpleNamespace(
+            text=None, caption=None, caption_entities=None, entities=None,
+            photo=[SimpleNamespace(file_id="THEIRS", file_size=9000)] if replied_has_photo else None,
+            document=None, reply_to_message=None,
+            from_user=SimpleNamespace(id=555))
+        msg = SimpleNamespace(text=caption_text, caption=None, caption_entities=None,
+                              entities=ent, photo=None, document=None,
+                              reply_to_message=replied, reply_text=AsyncMock())
+        return SimpleNamespace(message=msg, effective_message=msg, callback_query=None,
+                               effective_user=SimpleNamespace(id=111),
+                               effective_chat=SimpleNamespace(id=-999, type="supergroup",
+                                                              title="g"))
+
+    mod.ALLOWED_GROUP_IDS = {-999}
+    BOT2 = "bscloud_agent_bot"
+
+    def gctx2(written):
+        return SimpleNamespace(
+            bot=SimpleNamespace(username=BOT2, id=777,
+                                get_file=AsyncMock(return_value=tg_file(written)),
+                                send_chat_action=AsyncMock(), send_message=AsyncMock()),
+            args=[])
+
+    got2 = {}
+    async def cap2(update, context, text, **kw):
+        got2["text"] = text
+    w = []
+    u = reply_to_photo(f"@{BOT2} ini kenapa ya", [(0, len(BOT2) + 1)])
+    with patch.object(mod, "_run_turn", side_effect=cap2),          patch.object(mod, "_handle_wizard_input", new=AsyncMock(return_value=False)),          patch.object(mod, "_handle_server_input", new=AsyncMock(return_value=False)):
+        await mod.handle_message(u, gctx2(w))
+    check("replying to SOMEONE ELSE'S photo with an @mention picks up that "
+          "photo -- it is on the replied-to message, not on yours",
+          str(mod.INCOMING_MEDIA_DIR) in got2.get("text", ""))
+    check("...and your words come through as the question",
+          "ini kenapa ya" in got2.get("text", ""))
+
+    # A reply that is ONLY the mention: used to strip to empty and return in
+    # silence, which is exactly what "botnya ga respons" looked like.
+    got3 = {}
+    async def cap3(update, context, text, **kw):
+        got3["text"] = text
+    u2 = reply_to_photo(f"@{BOT2}", [(0, len(BOT2) + 1)])
+    with patch.object(mod, "_run_turn", side_effect=cap3),          patch.object(mod, "_handle_wizard_input", new=AsyncMock(return_value=False)),          patch.object(mod, "_handle_server_input", new=AsyncMock(return_value=False)):
+        await mod.handle_message(u2, gctx2([]))
+    check("a reply that is ONLY the @mention still answers, instead of "
+          "stripping to an empty string and returning in silence",
+          "text" in got3)
+    check("...asking about the image it found", str(mod.INCOMING_MEDIA_DIR) in got3.get("text", ""))
+
+    # No photo anywhere: a bare mention with nothing to look at stays quiet,
+    # rather than sending the model an empty prompt.
+    u3 = reply_to_photo(f"@{BOT2}", [(0, len(BOT2) + 1)], replied_has_photo=False)
+    with patch.object(mod, "_run_turn", side_effect=AssertionError("nothing to ask about")),          patch.object(mod, "_handle_wizard_input", new=AsyncMock(return_value=False)),          patch.object(mod, "_handle_server_input", new=AsyncMock(return_value=False)):
+        await mod.handle_message(u3, gctx2([]))
+    check("a bare mention with no image anywhere still costs nothing", True)
+
     failed = [n for n, ok in results if not ok]
     print(f"\n{len(results) - len(failed)}/{len(results)} passed")
     if failed:

@@ -1,5 +1,44 @@
 # Changelog
 
+## v0.2b.63 -- tagging the bot on a picture, in a group
+
+Asked directly: "bagaimana agar bisa nge tag bot ketika kirim gambar?" The
+honest answer was that you could not, for two separate reasons, and a third
+made the bot look dead rather than merely unhelpful.
+
+**1. A caption's mentions live somewhere else.** Telegram puts a photo's text
+in `msg.caption` and its mentions in `msg.caption_entities`. The group gate
+read only `msg.text` / `msg.entities`, so @-mentioning the bot while posting a
+screenshot matched nothing, the message was not a reply either, and
+`handle_message` returned without a word.
+
+**2. The picture is usually not on your message.** The reported case:
+*"kalau ada gambar dikirim orang lain di group, kita tag ke bot, botnya ga
+respons"* -- someone else posts the screenshot and you reply to it tagging the
+bot. Your reply carries no photo at all. The image lookup now falls back to
+the message being replied to, which is where it actually is.
+
+**3. A reply that is only "@botname" answered nothing.** Stripping the mention
+left an empty string, and the handler returned in silence -- indistinguishable
+from a broken bot. With an image present the question now defaults sensibly
+instead; with no image anywhere it still stays quiet, rather than sending the
+model an empty prompt.
+
+Also fixed while in there: the mention was being stripped **after** the text
+had been rewritten with the image note. The entity offsets Telegram supplies
+index the original message, so that only worked because the note happened to
+be appended rather than prepended -- accidental correctness that would break
+the first time anyone reordered it. Stripping now happens first.
+
+Two suites needed their mocks widened rather than the production code
+loosened: a real `telegram.Message` always carries `caption_entities`, `photo`
+and `document` (None when absent), so a stand-in that omits them is the thing
+that is wrong. Weakening the code with `getattr()` to suit a mock would have
+been fixing the wrong end.
+
+Full suite: **598/598 across 30 suites** on the real Linux target.
+
+
 ## v0.2b.62 -- token waste found by reading a real deployment's log
 
 Two costs, both measured on production rather than reasoned about, plus one

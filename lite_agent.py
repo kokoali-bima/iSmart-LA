@@ -3273,10 +3273,20 @@ def _group_mention_span(update: Update, context: ContextTypes.DEFAULT_TYPE) -> O
     what Telegram recognizes as addressing the bot, nothing looser."""
     msg = update.message
     bot_username = (context.bot.username or "").lower()
-    if not msg or not msg.entities or not bot_username:
+    if not msg or not bot_username:
         return None
-    text = msg.text or ""
-    for ent in msg.entities:
+    # A photo's caption is NOT msg.text, and its mentions are NOT msg.entities
+    # -- Telegram puts them in caption/caption_entities instead. Looking only
+    # at the text pair meant that @-mentioning the bot while sending a
+    # screenshot to a group did nothing at all: the gate saw no mention, the
+    # message was not a reply, and handle_message returned without a word.
+    # Reported as "bagaimana agar bisa nge tag bot ketika kirim gambar?" --
+    # the honest answer at the time being that you could not.
+    entities = msg.entities or msg.caption_entities
+    text = msg.text or msg.caption or ""
+    if not entities:
+        return None
+    for ent in entities:
         if ent.type != "mention":
             continue
         mention = _entity_text(text, ent.offset, ent.length)
@@ -8593,13 +8603,28 @@ async def _save_incoming_image(update: Update, context: ContextTypes.DEFAULT_TYP
     msg = update.effective_message
     if msg is None:
         return None
-    file_id = size = None
-    if msg.photo:
-        # Telegram sends several sizes, ascending; the last is the largest.
-        best = msg.photo[-1]
-        file_id, size = best.file_id, best.file_size
-    elif msg.document and (msg.document.mime_type or "").startswith("image/"):
-        file_id, size = msg.document.file_id, msg.document.file_size
+
+    def _pick(m) -> tuple[Optional[str], Optional[int]]:
+        if m is None:
+            return None, None
+        if m.photo:
+            # Telegram sends several sizes, ascending; the last is the largest.
+            best = m.photo[-1]
+            return best.file_id, best.file_size
+        if m.document and (m.document.mime_type or "").startswith("image/"):
+            return m.document.file_id, m.document.file_size
+        return None, None
+
+    file_id, size = _pick(msg)
+    if not file_id:
+        # The picture is very often in the message being REPLIED to rather than
+        # this one: someone else posts a screenshot in a group and you reply to
+        # it tagging the bot. Reported exactly that way -- "kalau ada gambar
+        # dikirim orang lain di group, kita tag ke bot, botnya ga respons".
+        # Looking only at the sender's own message meant the bot answered about
+        # an image it had never been given, or, when the reply was nothing but
+        # the @mention, said nothing at all.
+        file_id, size = _pick(getattr(msg, "reply_to_message", None))
     if not file_id:
         return None
     if size and size > MAX_INCOMING_MEDIA_BYTES:
@@ -8667,6 +8692,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         _prune_incoming_media()
 
     text = update.message.text or update.message.caption or ""
+
+    # Strip the "@botname" BEFORE anything rewrites the text. The entity
+    # offsets Telegram gave us index the ORIGINAL message; they are only still
+    # valid while the string is untouched. Doing it after the image note is
+    # attached happens to work because that note is appended, which is exactly
+    # the kind of accidental correctness that breaks the first time someone
+    # prepends instead.
+    if mention_span is not None:
+        text = _strip_entity(text, *mention_span).strip()
+
     if image_path is not None:
         question = text.strip() or _t(_chat_lang(update),
             "Describe this image and tell me anything notable about it.",
@@ -8682,10 +8717,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             "attachment. Send it as an image, or describe it in text.",
             "Saya bisa membaca gambar (screenshot, foto), tapi bukan lampiran "
             "jenis ini. Kirim sebagai gambar, atau jelaskan dalam teks."))
-    if mention_span is not None:
-        # Drop the "@botname" itself so the model sees a clean question
-        # ("weather today?") rather than the mention as part of the prompt.
-        text = _strip_entity(text, *mention_span).strip()
+
+    # Nothing left to act on -- but a bare "@botname" with no other word is a
+    # real thing people send, and returning here is what made the bot look
+    # dead. It is only genuinely empty when there was no image either; with
+    # one, the block above has already supplied a question.
     if not text.strip():
         return
     await _run_turn(update, context, text)

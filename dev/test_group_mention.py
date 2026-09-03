@@ -80,8 +80,12 @@ def ctx():
 def group_update(text, entities=None, reply_from=None, chat_id=GROUP):
     reply_to = None
     if reply_from is not None:
-        reply_to = SimpleNamespace(from_user=SimpleNamespace(id=reply_from))
-    msg = SimpleNamespace(text=text, caption=None, photo=None, document=None,
+        # A real telegram.Message always has these, None when absent --
+        # the image lookup now checks the replied-to message too.
+        reply_to = SimpleNamespace(from_user=SimpleNamespace(id=reply_from),
+                                   photo=None, document=None)
+    msg = SimpleNamespace(text=text, caption=None, caption_entities=None,
+                          photo=None, document=None,
                           entities=entities or [], reply_to_message=reply_to,
                           reply_text=AsyncMock())
     return SimpleNamespace(
@@ -92,7 +96,8 @@ def group_update(text, entities=None, reply_from=None, chat_id=GROUP):
 
 
 def private_update(text):
-    msg = SimpleNamespace(text=text, caption=None, photo=None, document=None,
+    msg = SimpleNamespace(text=text, caption=None, caption_entities=None,
+                          photo=None, document=None,
                           entities=[], reply_to_message=None, reply_text=AsyncMock())
     return SimpleNamespace(
         message=msg, effective_message=msg, callback_query=None,
