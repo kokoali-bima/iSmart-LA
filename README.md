@@ -7,7 +7,7 @@ A report doesn't have to stop at the chat: it can land straight in a shared
 [Google Drive](#google-drive-optional) folder too, connected the same explicit way as
 everything else here -- through Telegram, not a config file.
 
-> **Status: v0.2b.59 -- early/beta.** Built and battle-tested against a real production
+> **Status: v0.2b.60 -- early/beta.** Built and battle-tested against a real production
 > Proxmox VE cluster over several days of iteration, including a live-fire test of the
 > unlock/PIN/snapshot flow against real infrastructure. Works well; still has known
 > rough edges (see [Known limitations](#known-limitations)).
@@ -502,8 +502,7 @@ project, and walks through creating it. It is stored `chmod 600` on the server,
 never committed anywhere, and one client serves the whole deployment — every
 person still authorises their **own** Google account through it.
 
-One step in that setup genuinely matters: press **Publish app** on the consent
-screen. An app left in "Testing" gets a refresh token that **Google expires after
+One step in that setup genuinely matters: **Google Auth Platform → Audience → Publish app**. Note that choosing User type "External" is NOT the same thing -- an app can be External and still sit in Testing, where Google refuses every account not on its test-user list, including your own, with `Error 403: access_denied`. An app left in "Testing" gets a refresh token that **Google expires after
 7 days**, and no amount of keep-alive can prevent that — it is a revocation, and
 refreshing requires a live refresh token. Publishing needs no review for a
 non-sensitive scope.

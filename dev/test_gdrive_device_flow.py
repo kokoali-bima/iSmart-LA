@@ -325,6 +325,32 @@ async def main():
     check("junk input is refused with the suffix to look for, not stored",
           begin.await_count == 0 and "apps.googleusercontent.com" in sent(u))
 
+    # --- access_denied is ambiguous, and the ambiguity misdirects ---------
+    # Google returns access_denied both when someone declines AND when the app
+    # is still in "Testing", where it blocks every account not on the
+    # test-user list -- the developer's own included. Reported live as
+    # "Akses diblokir ... Error 403: access_denied" from an operator who had
+    # declined nothing. A message saying only "you declined it" sends them
+    # looking in exactly the wrong place.
+    mod._gdrive_wizard[111] = {"step": "device_pending", "name": "gdrive",
+                               "expires": mod._dt.datetime.now().timestamp() + 900}
+    c = ctx()
+    with patch.object(mod, "gdrive_device_poll_once", return_value=("denied", {})),          patch.object(mod.asyncio, "sleep", new=AsyncMock()):
+        await mod._gdrive_device_wait(c, 111, "gdrive", "en",
+                                      {"device_code": "dc", "interval": 0, "expires_in": 900})
+    said = c.bot.send_message.call_args[0][1] if c.bot.send_message.call_args else ""
+    check("access_denied names the Testing-status cause, not only 'you declined'",
+          "Testing" in said)
+    check("...and gives the exact fix, in the console's CURRENT menu names",
+          "Publish app" in said and "Audience" in said)
+
+    setup = mod._gdrive_client_setup_instructions("en")
+    check("the setup card also uses the current console path, not the "
+          "renamed-away 'OAuth consent screen'",
+          "Audience" in setup and "OAuth consent screen" not in setup)
+    check("...and warns that skipping Publish causes access_denied, so the "
+          "error is recognisable when it happens", "access_denied" in setup)
+
     failed = [n for n, ok in results if not ok]
     print(f"\n{len(results) - len(failed)}/{len(results)} passed")
     if failed:

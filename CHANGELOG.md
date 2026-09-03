@@ -1,5 +1,34 @@
 # Changelog
 
+## v0.2b.60 -- access_denied now names the cause that actually produces it
+
+An operator hit "Akses diblokir: ismart belum menyelesaikan proses verifikasi
+Google / Error 403: access_denied" while connecting Drive, having declined
+nothing.
+
+Google returns `access_denied` for two very different situations: someone
+refusing in the browser, and an app still in **Testing** publishing status,
+where Google blocks every account not on its test-user list -- the developer's
+own account included. The reply said only "Access was declined in the browser",
+which sends the reader looking in exactly the wrong place.
+
+It now names the Testing-status cause and gives the fix in the console's
+current menu path: **Google Auth Platform → Audience → Publish app**.
+
+The setup card was also still saying "OAuth consent screen", which Google has
+since renamed, and did not warn that skipping Publish produces this specific
+error. Both fixed, so the error is recognisable when it happens rather than
+looking like a fault in the bot.
+
+Worth recording because it is a genuinely easy confusion, and both settings sit
+on the same console page: **User type "External" is not the same as publishing
+the app.** External decides *who may* use it; publishing status decides whether
+Testing's test-user restriction applies at all. An app can be External and
+still refuse its own developer.
+
+Full suite: **545/545 across 28 suites** on the real Linux target.
+
+
 ## v0.2b.59 -- a screenshot sent to the bot is answered, not swallowed
 
 Reported from a real session: a screenshot of a Google Cloud console page,

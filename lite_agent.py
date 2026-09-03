@@ -4618,10 +4618,12 @@ def _gdrive_client_setup_instructions(lang: str) -> str:
         "3. Application type: <b>TV and Limited Input devices</b>\n"
         "   <i>(this exact type — Desktop or Web will be rejected)</i>\n"
         "4. Enable the <b>Google Drive API</b> for that project\n"
-        "5. On the OAuth consent screen, press <b>Publish app</b>\n"
+        "5. <b>Google Auth Platform → Audience → Publish app</b>\n"
         "   <i>(no Google review needed — this only asks for drive.file, a "
-        "non-sensitive scope. Skipping this leaves the app in Testing, where "
-        "Google expires the login every 7 days.)</i>\n\n"
+        "non-sensitive scope. Skip it and the app stays in Testing, where "
+        "Google blocks every account not on its test-user list — your own "
+        "included, with \"Error 403: access_denied\" — and expires the login "
+        "every 7 days.)</i>\n\n"
         "Then send both values here as one message, separated by a space:\n"
         "<code>&lt;client_id&gt; &lt;client_secret&gt;</code>\n\n"
         "Send /cancel to stop.",
@@ -4633,10 +4635,12 @@ def _gdrive_client_setup_instructions(lang: str) -> str:
         "3. Application type: <b>TV and Limited Input devices</b>\n"
         "   <i>(harus tipe ini — Desktop atau Web akan ditolak)</i>\n"
         "4. Aktifkan <b>Google Drive API</b> untuk project itu\n"
-        "5. Di OAuth consent screen, tekan <b>Publish app</b>\n"
+        "5. <b>Google Auth Platform → Audience → Publish app</b>\n"
         "   <i>(tidak perlu review Google — ini cuma minta drive.file yang "
-        "non-sensitive. Kalau dilewati, app tetap berstatus Testing dan Google "
-        "mematikan login-nya tiap 7 hari.)</i>\n\n"
+        "non-sensitive. Kalau dilewati, app tetap berstatus Testing: Google "
+        "memblokir semua akun yang tidak terdaftar sebagai test user — "
+        "termasuk akun Anda sendiri, dengan \"Error 403: access_denied\" — "
+        "dan login-nya mati tiap 7 hari.)</i>\n\n"
         "Lalu kirim kedua nilainya di sini dalam satu pesan, dipisah spasi:\n"
         "<code>&lt;client_id&gt; &lt;client_secret&gt;</code>\n\n"
         "Kirim /cancel untuk berhenti.",
@@ -4724,8 +4728,31 @@ async def _gdrive_device_wait(context: ContextTypes.DEFAULT_TYPE, chat_id: int,
             interval += 5
             continue
         if state == "denied":
-            return await done(_t(lang, "✖️ Access was declined in the browser.",
-                                       "✖️ Aksesnya ditolak di browser."))
+            # Google sends access_denied for a refusal AND for an app still in
+            # "Testing" publishing status, where it blocks every account that
+            # is not on the test-user list -- including the developer's own.
+            # Reported live: "Akses diblokir: ismart belum menyelesaikan proses
+            # verifikasi Google / Error 403: access_denied", from an operator
+            # who had not declined anything. Saying only "you declined" would
+            # send them looking in exactly the wrong place.
+            return await done(_t(lang,
+                "✖️ Google refused the sign-in (access_denied).\n\n"
+                "If you did not decline it yourself, the usual cause is the "
+                "OAuth app still being in <b>Testing</b>, where Google blocks "
+                "every account that is not on its test-user list — your own "
+                "included.\n\n"
+                "Fix: Google Cloud console → <b>Google Auth Platform</b> → "
+                "<b>Audience</b> → <b>Publish app</b>. No Google review is "
+                "needed for this scope. Then run /connectgdrive again.",
+                "✖️ Google menolak sign-in-nya (access_denied).\n\n"
+                "Kalau Anda tidak menolaknya sendiri, penyebab tersering "
+                "adalah OAuth app-nya masih berstatus <b>Testing</b> — di "
+                "status itu Google memblokir semua akun yang tidak terdaftar "
+                "sebagai test user, termasuk akun Anda sendiri.\n\n"
+                "Perbaikan: Google Cloud console → <b>Google Auth Platform</b> "
+                "→ <b>Audience</b> → <b>Publish app</b>. Tidak perlu review "
+                "Google untuk scope ini. Lalu jalankan /connectgdrive lagi.",
+            ))
         if state == "expired":
             return await done(_t(lang,
                 "⌛ That code expired. Run /connectgdrive again.",
