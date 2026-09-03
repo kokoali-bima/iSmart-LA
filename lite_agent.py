@@ -4816,14 +4816,56 @@ async def _handle_gdrive_wizard_input(update: Update, context: ContextTypes.DEFA
         return True
 
     if state["step"] == "await_gdrive_client":
-        parts = text.split()
-        if len(parts) != 2 or not parts[0].endswith(".apps.googleusercontent.com"):
+        # Deliberately forgiving about shape. These two values get copied out
+        # of a Google Cloud console page, and demanding "exactly two words,
+        # id first" rejected every natural way of doing that: pasting them in
+        # the other order, keeping the "Client ID:" labels, or sending one
+        # then the other. Reported from a real session as simply "ga bisa2
+        # nambah gdrive" -- the person could not tell what the bot wanted.
+        #
+        # So: find the id by its unmistakable suffix wherever it appears, take
+        # the remaining token as the secret, and if only the id arrived, ask
+        # for the secret next rather than throwing the id away.
+        tokens = [t.strip().strip(",;") for t in text.split() if t.strip()]
+        found_id = next((t for t in tokens
+                         if t.endswith(".apps.googleusercontent.com")), None)
+        # Drop only tokens that ARE a label, never ones that merely end in a
+        # label word -- an earlier cut used endswith() and silently swallowed
+        # the secret itself, since a real one can end in any letters at all.
+        LABELS = {"client", "id", "secret", "clientid", "client_id",
+                  "client_secret", "your", "the"}
+        rest = [t for t in tokens
+                if t != found_id and t.lower().strip(":=") not in LABELS]
+
+        if found_id:
+            state["client_id"] = found_id
+        if not state.get("client_id"):
             await update.message.reply_text(_t(lang,
-                "Send the client id and secret as one message, separated by a "
-                "space. The id ends in .apps.googleusercontent.com — or /cancel.",
-                "Kirim client id dan secret dalam satu pesan, dipisah spasi. "
-                "Id-nya berakhiran .apps.googleusercontent.com — atau /cancel."))
+                "I couldn't find a client ID in that. It's the long value "
+                "ending in <code>.apps.googleusercontent.com</code> — paste it "
+                "here (the secret can come in the same message or the next "
+                "one), or /cancel.",
+                "Saya tidak menemukan client ID di situ. Itu nilai panjang yang "
+                "berakhiran <code>.apps.googleusercontent.com</code> — tempel di "
+                "sini (secret-nya boleh menyusul di pesan berikutnya), atau "
+                "/cancel.",
+            ), parse_mode="HTML")
             return True
+
+        secret = state.get("client_secret") or (rest[0] if rest else "")
+        if not secret:
+            state["client_secret"] = ""
+            state["expires"] = _dt.datetime.now().timestamp() + GDRIVE_TOKEN_WIZARD_TTL
+            await update.message.reply_text(_t(lang,
+                "Got the client ID. Now send the <b>client secret</b> — the "
+                "shorter value on the same Google page, usually starting with "
+                "<code>GOCSPX-</code>.",
+                "Client ID sudah masuk. Sekarang kirim <b>client secret</b>-nya "
+                "— nilai yang lebih pendek di halaman Google yang sama, biasanya "
+                "diawali <code>GOCSPX-</code>.",
+            ), parse_mode="HTML")
+            return True
+        parts = [state["client_id"], secret]
         write_gdrive_client(parts[0], parts[1])
         state["expires"] = _dt.datetime.now().timestamp() + GDRIVE_TOKEN_WIZARD_TTL
         await _gdrive_begin_device(update, context, lang, state["name"])
@@ -6075,12 +6117,12 @@ async def cmd_gdrive(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     accounts = _list_gdrive_accounts()
     if not accounts:
         await update.message.reply_text(_t(lang,
-            "\U0001f4c1 No Google Drive account is connected yet. Ask the operator to "
-            "connect one (see README \u201cGoogle Drive\u201d) -- a one-time step done "
-            "directly on the host, not through Telegram.",
-            "\U0001f4c1 Belum ada akun Google Drive yang terhubung. Minta operator untuk "
-            "hubungkan satu (lihat README \u201cGoogle Drive\u201d) -- langkah sekali-jalan "
-            "langsung di host, bukan lewat Telegram.",
+            "\U0001f4c1 No Google Drive account is connected yet.\n\n"
+            "Run /connectgdrive to add one -- it is a link to open and a "
+            "short code to type, no terminal needed.",
+            "\U0001f4c1 Belum ada akun Google Drive yang terhubung.\n\n"
+            "Jalankan /connectgdrive untuk menambah -- cukup buka satu link "
+            "dan ketik kode pendek, tidak perlu terminal.",
         ))
         return
     chat_id = str(update.effective_chat.id)
@@ -6283,11 +6325,25 @@ async def cmd_connectgdrive(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         return
     lang = _chat_lang(update)
     chat_id = update.effective_chat.id
-    if chat_id in _gdrive_wizard:
+    # Running /connectgdrive again is the clearest possible signal that the
+    # person wants to start over. Refusing until a 15-minute TTL expires --
+    # or until they happen to think of /cancel -- leaves them stuck with no
+    # way forward and nothing on screen explaining why. Reported from a real
+    # session: an abandoned setup card at the first step made every later
+    # /connectgdrive answer "already connecting one".
+    #
+    # The one case worth protecting is a sign-in already waiting on Google,
+    # where restarting would throw away a code that is about to be approved.
+    pending = _gdrive_wizard.get(chat_id)
+    if pending and pending.get("step") == "device_pending":
         await update.message.reply_text(_t(lang,
-            "Already connecting one -- finish that (or /cancel) first.",
-            "Sedang menghubungkan satu -- selesaikan itu dulu (atau /cancel)."))
+            "A sign-in is already waiting for you to approve it in the browser. "
+            "Finish it, or /cancel to start over.",
+            "Sudah ada sign-in yang menunggu Anda setujui di browser. "
+            "Selesaikan itu, atau /cancel untuk mengulang."))
         return
+    if pending:
+        _gdrive_wizard.pop(chat_id, None)
 
     # The paste-a-token path is still here on purpose: drive.file only reaches
     # files the bot itself created, so anyone who needs the agent to write into

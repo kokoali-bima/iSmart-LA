@@ -239,9 +239,16 @@ async def main():
     with patch.object(mod, "_list_gdrive_accounts", return_value=["gdrive"]):
         u3 = upd()
         await mod.cmd_connectgdrive(u3, ctx())
-    refusal = u3.message.reply_text.call_args[0][0].lower()
-    check("starting a second connect while one is already pending is refused",
-          "already" in refusal or "sedang" in refusal)
+    again = u3.message.reply_text.call_args[0][0].lower()
+    # Changed deliberately: this used to refuse until a 15-minute TTL expired.
+    # Reported from a real session -- an abandoned setup card meant every later
+    # /connectgdrive answered "already connecting one", with no way forward and
+    # nothing on screen explaining why. Re-running the command is the clearest
+    # signal someone wants to start over, so it now restarts. (A sign-in
+    # already awaiting approval in the browser is still protected; that case is
+    # covered in test_gdrive_device_flow.py.)
+    check("re-running /connectgdrive restarts instead of refusing",
+          "already connecting" not in again and "sedang menghubungkan" not in again)
     mod._gdrive_wizard.clear()
 
     # --- 7. the label step, end to end -------------------------------------

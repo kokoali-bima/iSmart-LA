@@ -1,5 +1,39 @@
 # Changelog
 
+## v0.2b.58 -- three bugs that made connecting a Drive account impossible
+
+Reported from a real session as simply "ga bisa2 nambah gdrive". All three
+were in shipped code, and together they left no way through:
+
+**`/gdrive` sent people to the wrong place.** With no account connected it
+still said to ask the operator to connect one "directly on the host, not
+through Telegram" -- text written before /connectgdrive existed, and stale
+since v0.2b.54 made it a link and a code in Telegram. It now points at
+/connectgdrive.
+
+**`/connectgdrive` refused instead of restarting.** Abandoning the setup at
+its first step left wizard state behind, and every later /connectgdrive
+answered "already connecting one -- finish that (or /cancel) first" for the
+next 15 minutes. Re-running the command is the clearest possible signal that
+someone wants to start over, so it now does. The one case still protected is a
+sign-in already awaiting approval in the browser, where restarting would throw
+away a code that is about to be used.
+
+**The client-id paste was rejected in every natural shape.** The check demanded
+exactly two whitespace-separated tokens with the id first. Pasting them in the
+other order, keeping the console's "Client ID:" labels, or sending the id and
+then the secret all failed -- and the error did not make the required shape
+obvious. It now finds the id by its unmistakable suffix wherever it appears,
+takes the remaining token as the secret, and if only the id arrived, asks for
+the secret next instead of discarding what it already has.
+
+Caught while testing that last fix: the first cut dropped any token *ending*
+in a label word, which silently swallowed the secret itself -- a real secret
+can end in any letters at all. It now drops only tokens that ARE a label.
+
+Full suite: **527/527 across 27 suites** on the real Linux target.
+
+
 ## v0.2b.57 -- disconnect a Drive account from Telegram, and an alphabetical /help
 
 **`/gdrive` can now disconnect an account.** Prompted by an operator finding an

@@ -245,6 +245,86 @@ async def main():
     check("a dead sign-in is reported as such, with what to do about it",
           not ok and "connectgdrive" in detail)
 
+    # --- the three ways this got someone stuck in a real session ----------
+    # Reported as "ga bisa2 nambah gdrive": /gdrive told them to ask an
+    # operator to do it on the host, /connectgdrive answered "already
+    # connecting one" forever, and the client-id paste kept being rejected.
+    mod._gdrive_wizard.clear()
+    mod.GDRIVE_CLIENT_FILE.unlink(missing_ok=True)
+
+    with patch.object(mod, "_may_authorize_group_action", new=AsyncMock(return_value=True)),          patch.object(mod, "_list_gdrive_accounts", return_value=[]):
+        u = upd(); await mod.cmd_gdrive(u, ctx())
+    empty = sent(u)
+    check("/gdrive with no account points at /connectgdrive, instead of telling "
+          "the operator to go and do it on the host (stale since v0.2b.54)",
+          "/connectgdrive" in empty)
+    check("...and does not still claim it cannot be done through Telegram",
+          "not through Telegram" not in empty and "bukan lewat Telegram" not in empty)
+
+    # An abandoned wizard must not lock the command out.
+    with patch.object(mod, "_may_authorize_group_action", new=AsyncMock(return_value=True)),          patch.object(mod, "_list_gdrive_accounts", return_value=[]):
+        mod._gdrive_wizard[111] = {"step": "await_gdrive_client", "name": "gdrive",
+                                   "expires": mod._dt.datetime.now().timestamp() + 900}
+        u = upd(); await mod.cmd_connectgdrive(u, ctx())
+    check("re-running /connectgdrive after abandoning it RESTARTS instead of "
+          "refusing -- the refusal left people stuck for 15 minutes with no "
+          "way forward", "already" not in sent(u).lower() and "sedang" not in sent(u).lower())
+
+    # ...but a sign-in already waiting on Google is worth protecting.
+    with patch.object(mod, "_may_authorize_group_action", new=AsyncMock(return_value=True)),          patch.object(mod, "_list_gdrive_accounts", return_value=[]):
+        mod._gdrive_wizard[111] = {"step": "device_pending", "name": "gdrive",
+                                   "expires": mod._dt.datetime.now().timestamp() + 900}
+        u = upd(); await mod.cmd_connectgdrive(u, ctx())
+    check("...while a sign-in already awaiting approval is NOT thrown away",
+          "waiting" in sent(u).lower() or "menunggu" in sent(u).lower())
+    mod._gdrive_wizard.clear()
+
+    # The client paste, in every shape someone actually copies it.
+    CID = "1234567890-abcdef.apps.googleusercontent.com"
+    for label, msg in (
+        ("id then secret, space separated", f"{CID} GOCSPX-secret"),
+        ("secret FIRST, reversed", f"GOCSPX-secret {CID}"),
+        ("on two lines", CID + "\n" + "GOCSPX-secret"),
+        ("with the console's labels", f"Client ID: {CID} Client secret: GOCSPX-secret"),
+    ):
+        mod.GDRIVE_CLIENT_FILE.unlink(missing_ok=True)
+        mod._gdrive_wizard[111] = {"step": "await_gdrive_client", "name": "gdrive",
+                                   "expires": mod._dt.datetime.now().timestamp() + 900}
+        u = upd(); u.message.text = msg
+        with patch.object(mod, "_gdrive_begin_device", new=AsyncMock()) as begin:
+            await mod._handle_gdrive_wizard_input(u, ctx())
+        stored = mod.read_gdrive_client()
+        check(f"client paste accepted: {label}",
+              begin.await_count == 1 and stored.get("client_id") == CID
+              and stored.get("client_secret") == "GOCSPX-secret")
+
+    # And across two messages, keeping the id rather than discarding it.
+    mod.GDRIVE_CLIENT_FILE.unlink(missing_ok=True)
+    mod._gdrive_wizard[111] = {"step": "await_gdrive_client", "name": "gdrive",
+                               "expires": mod._dt.datetime.now().timestamp() + 900}
+    u = upd(); u.message.text = CID
+    with patch.object(mod, "_gdrive_begin_device", new=AsyncMock()) as begin:
+        await mod._handle_gdrive_wizard_input(u, ctx())
+    check("sending only the ID asks for the secret next, instead of rejecting "
+          "and throwing the ID away",
+          begin.await_count == 0 and "secret" in sent(u).lower())
+    u2 = upd(); u2.message.text = "GOCSPX-secret"
+    with patch.object(mod, "_gdrive_begin_device", new=AsyncMock()) as begin:
+        await mod._handle_gdrive_wizard_input(u2, ctx())
+    check("...and the secret in the NEXT message completes it",
+          begin.await_count == 1
+          and mod.read_gdrive_client().get("client_id") == CID)
+
+    # Something that is not a client id at all still gets a useful answer.
+    mod.GDRIVE_CLIENT_FILE.unlink(missing_ok=True)
+    mod._gdrive_wizard[111] = {"step": "await_gdrive_client", "name": "gdrive",
+                               "expires": mod._dt.datetime.now().timestamp() + 900}
+    u = upd(); u.message.text = "hello what do you want"
+    with patch.object(mod, "_gdrive_begin_device", new=AsyncMock()) as begin:
+        await mod._handle_gdrive_wizard_input(u, ctx())
+    check("junk input is refused with the suffix to look for, not stored",
+          begin.await_count == 0 and "apps.googleusercontent.com" in sent(u))
+
     failed = [n for n, ok in results if not ok]
     print(f"\n{len(results) - len(failed)}/{len(results)} passed")
     if failed:
