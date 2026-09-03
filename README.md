@@ -7,7 +7,7 @@ A report doesn't have to stop at the chat: it can land straight in a shared
 [Google Drive](#google-drive-optional) folder too, connected the same explicit way as
 everything else here -- through Telegram, not a config file.
 
-> **Status: v0.2b.55 -- early/beta.** Built and battle-tested against a real production
+> **Status: v0.2b.56 -- early/beta.** Built and battle-tested against a real production
 > Proxmox VE cluster over several days of iteration, including a live-fire test of the
 > unlock/PIN/snapshot flow against real infrastructure. Works well; still has known
 > rough edges (see [Known limitations](#known-limitations)).
@@ -673,7 +673,17 @@ CLIs and does not (a real Claude turn *and* a real agy turn both completed
 under it, so it is enabled), while `ProtectHome` was assumed merely awkward and
 in fact breaks the install.
 
-**Existing deployments get it from `/update`.** The unit systemd actually runs
+**Existing deployments get it automatically, at startup.** Hardening is applied
+every time the bot starts, not only during `/update` -- because an update is
+carried out by the *old* version's code, so a fix to the update path can never
+apply itself and always lands one release late. That is not hypothetical: it
+happened here, and a server sat on the newest release with an unhardened unit
+while the fix for it was installed and idle. If the running unit turns out to
+be out of date, the bot refreshes it and restarts **once** (the service, not
+the machine) so the sandbox actually takes effect; that restart is conditional
+on the unit having genuinely changed, so it cannot loop.
+
+**`/update` applies it too.** The unit systemd actually runs
 is the copy in `/etc/systemd/system`, not the template in the repo, so
 `/update` re-renders and reinstalls it before restarting -- otherwise a
 release that hardens the unit would land in the checkout while the service

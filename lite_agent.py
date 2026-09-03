@@ -2026,6 +2026,51 @@ def refresh_systemd_unit() -> str:
         shutil.rmtree(staging, ignore_errors=True)
 
 
+def apply_hardening_on_start() -> None:
+    """Bring this install up to the hardening the running code expects.
+
+    Lives at STARTUP, not only in /update, because an update is carried out by
+    the OLD version's code -- so any fix to the update flow can never apply
+    itself, and always lands one release late. That is not a theory: v0.2b.53
+    added the unit refresh and v0.2b.55 the permission sweep, the operator
+    updated all the way to v0.2b.55, and NEITHER ran, because v0.2b.52 was the
+    code doing the updating. The server sat on the newest release with a 9.6
+    UNSAFE unit and world-readable sessions.json.
+
+    Running it here makes it self-healing: however the code arrived -- /update,
+    install.sh, a manual git pull -- the next start converges. Both halves are
+    no-ops when there is nothing to fix, which is the normal case.
+    """
+    try:
+        harden_state_files()
+    except Exception:
+        logger.warning("state-file hardening failed on start", exc_info=True)
+
+    try:
+        status = refresh_systemd_unit()
+    except Exception:
+        logger.warning("unit refresh failed on start", exc_info=True)
+        return
+    if status != "refreshed":
+        if status not in ("unchanged", "no template in this checkout"):
+            logger.warning("systemd unit refresh on start: %s", status)
+        return
+
+    # The unit on disk is now correct, but THIS process is still running under
+    # the old one -- a sandbox only applies at start. One restart picks it up.
+    # Self-limiting rather than a loop: refresh_systemd_unit() reports
+    # "refreshed" only when the content actually differed, so after this the
+    # next start sees "unchanged" and does nothing.
+    logger.warning("systemd unit was out of date and has been refreshed; "
+                   "restarting once so the sandbox actually applies")
+    try:
+        subprocess.Popen(["sudo", "-n", "systemctl", "--no-block",
+                          "restart", SERVICE_NAME])
+    except Exception:
+        logger.warning("could not restart to apply the refreshed unit -- it "
+                       "will take effect on the next restart", exc_info=True)
+
+
 def _read_update_state() -> dict:
     if UPDATE_STATE_FILE.exists():
         try:
@@ -8476,6 +8521,7 @@ def main() -> None:
     app.add_error_handler(on_error)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
+    apply_hardening_on_start()
     logger.info("Lite Agent starting (allowed users: %s)", ALLOWED_USER_IDS or "ANY (no allowlist!)")
     # drop_pending_updates=False: a transient crash (network blip, etc.) is
     # recovered by systemd's Restart=on-failure in seconds, but with the old

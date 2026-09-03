@@ -188,6 +188,37 @@ if os.name != "nt":
 else:
     print("SKIP - POSIX file modes are not meaningful on Windows")
 
+# --- hardening must be self-healing at STARTUP, not only during /update ----
+# An update is carried out by the OLD version's code, so a fix to the update
+# flow can never apply itself and always lands one release late. Observed for
+# real: v0.2b.53 added the unit refresh, v0.2b.55 the permission sweep, the
+# operator updated all the way to v0.2b.55, and NEITHER ran -- v0.2b.52 was the
+# code doing the updating. The server sat on the newest release with a 9.6
+# UNSAFE unit and world-readable sessions.json.
+check("hardening is applied at startup too, so it self-heals however the code "
+      "arrived (/update, install.sh, or a manual git pull)",
+      hasattr(mod, "apply_hardening_on_start"))
+check("...and startup actually calls it", "apply_hardening_on_start()" in src)
+check("...before the bot announces it is starting, so a failure lands in the "
+      "same log lines an operator already reads",
+      re.search(r"apply_hardening_on_start\(\)\s*\n\s*logger\.info\(\"Lite Agent starting",
+                src) is not None)
+
+# The restart it triggers must be self-limiting. refresh_systemd_unit() reports
+# "refreshed" ONLY when the content actually differed, so once written the next
+# start sees "unchanged" -- verified live on a real host: three consecutive
+# startups triggered exactly one restart.
+check("the restart is conditional on the unit having actually changed, which "
+      "is what stops it being a restart loop",
+      re.search(r'status != "refreshed"[\s\S]{0,1200}?systemctl', src) is not None)
+# "reboot" appears legitimately in user-facing snapshot text, so the check is
+# on what is EXECUTED, not on the word appearing anywhere in the file.
+_EXEC_CALLS = re.findall(r"(?:Popen|subprocess\.run)\(\[[^\]]*\]", src)
+check("...and it restarts the SERVICE, never the machine",
+      "systemctl" in src
+      and not any("reboot" in c or "shutdown" in c or "poweroff" in c
+                  for c in _EXEC_CALLS))
+
 failed = [n for n, ok in results if not ok]
 print(f"\n{len(results) - len(failed)}/{len(results)} passed")
 if failed:

@@ -1,5 +1,49 @@
 # Changelog
 
+## v0.2b.56 -- hardening applies itself at startup, not only during /update
+
+The operator updated to v0.2b.55 and neither the unit refresh (v0.2b.53) nor
+the permission sweep (v0.2b.55) ran. The server sat on the newest release with
+a **9.6 UNSAFE** systemd unit and world-readable sessions.json, while the code
+containing both fixes was installed and idle.
+
+The cause is a bootstrap problem, and it is structural rather than a slip: an
+update is carried out by the OLD version's code. v0.2b.52 was running when
+/update fetched v0.2b.55, so v0.2b.52's update path executed -- and it has
+neither function. **Any fix to the update flow can never apply itself, and
+always lands one release late.** That is the third time this shape of gap has
+bitten this project (v0.2b.52 -> 53 -> 55), each time as "a fix that only lives
+on the install path never reaches a server that is already running".
+
+`apply_hardening_on_start()` now runs both at startup, so the install converges
+however the code arrived -- /update, install.sh, or a manual git pull. Both
+halves are no-ops when there is nothing to fix.
+
+When the unit was genuinely out of date it also restarts once, because a
+sandbox only takes effect at start: refreshing the file alone would leave the
+running process under the old unit with nothing saying so. That restart is
+self-limiting rather than a loop -- refresh_systemd_unit() reports "refreshed"
+only when the content actually differed, so the next start sees "unchanged".
+Verified live on a real host: three consecutive startups triggered **exactly
+one** restart, with the unit ending up hardened 3/3 and no placeholders left.
+It restarts the service, never the machine.
+
+Two measurement errors of my own were caught and corrected while testing this,
+both worth recording because each produced a confident wrong answer:
+
+- Patching `subprocess.Popen` to count restarts also neutered `subprocess.run`
+  (which uses Popen internally), so `sudo cp` and `daemon-reload` silently ran
+  `true`. The unit never got written, every call therefore reported "refreshed"
+  again, and the harness announced 12 restarts and an unhardened unit. The
+  instrument was broken, not the code -- narrowing the patch to the restart
+  call alone gave the real answer: 1.
+- A test asserted "reboot" appears nowhere in the source. It does, legitimately,
+  in user-facing snapshot text. The check now looks at what is actually
+  EXECUTED rather than at the word appearing anywhere in the file.
+
+Full suite: **489/489 across 26 suites** on the real Linux target.
+
+
 ## v0.2b.55 -- findings from a full sweep of the running deployment
 
 Nothing here came from a test failing. All four came from reading the real
