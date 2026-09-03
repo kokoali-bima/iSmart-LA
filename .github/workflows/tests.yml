@@ -1,0 +1,38 @@
+name: tests
+
+# The review that led to this workflow flagged a real bug and it stayed real
+# until dev/run_all.py's own compile gate was added: lite_agent.py used to
+# contain an f-string with a backslash inside its expression, legal only
+# since Python 3.12 (PEP 701) -- a SyntaxError on 3.10/3.11, the exact
+# versions install.sh advertises ("python3 (3.10+)") and what Ubuntu 22.04
+# (3.10) and Debian 12 / Proxmox VE 8 (3.11) ship. Nothing reachable from this
+# project's own development machines was ever old enough to catch it by
+# running the code -- this matrix exists specifically to be.
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.10 is install.sh's stated floor; 3.13 is what a live Proxmox node
+        # in this project's own cluster actually runs today. Covering both
+        # ends is the point -- a number picked without checking either would
+        # just be a guess.
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run the full suite
+        run: python3 dev/run_all.py lite_agent.py

@@ -33,6 +33,24 @@ if not SRC.exists():
     print(f"cannot find the module under test: {SRC}")
     sys.exit(2)
 
+# A module that fails to even PARSE makes every single suite below fail with
+# the exact same shape as a suite that's merely missing an optional
+# dependency -- both exit non-zero with no "N/M passed" tally. Proven live:
+# with a broken module in place, 19 of 20 suites SKIPped with "SyntaxError",
+# the one suite that doesn't import the module at all reported a clean 15/15,
+# and this script printed TOTAL 15/15 at exit code 0 -- green, while the
+# product could not run at all. This is exactly the failure mode a version
+# matrix exists to catch (see the f-string fix this project shipped after an
+# external review), so it cannot be allowed to hide behind "SKIP". Checked
+# once, up front, as a hard failure distinct from a per-suite skip.
+compile_check = subprocess.run([sys.executable, "-m", "py_compile", str(SRC)],
+                               capture_output=True, text=True)
+if compile_check.returncode != 0:
+    print(f"{SRC.name} does not even compile on {sys.version.split()[0]} -- "
+          f"stopping before running any suite (a real result would be meaningless):\n")
+    print(compile_check.stderr.strip() or compile_check.stdout.strip())
+    sys.exit(1)
+
 suites = sorted(DEV.glob("test_*.py"))
 if not suites:
     print("no test_*.py found in dev/")

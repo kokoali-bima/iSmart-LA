@@ -1,5 +1,51 @@
 # Changelog
 
+## v0.2b.51 -- CI, and a real blind spot found while wiring it up
+
+The last open item from Fase 0 of the review-driven work: `dev/run_all.py`
+already existed and already returned a non-zero exit code on failure -- the
+shape a CI job needs -- so this should have been a pure wrapping exercise.
+Verifying it first instead of trusting that surfaced something worse.
+
+**The bug, proven live before being fixed:** a module that fails to even
+PARSE makes every suite exit non-zero with no "N/M passed" tally -- the exact
+same shape `run_all.py` already treated as a harmless SKIP ("a missing
+optional dependency, say"). Reintroduced the pre-v0.2b.48 broken f-string
+into a scratch copy and ran the real suite against it: 19 of 20 suites
+SKIPped with "SyntaxError", the one suite that never imports the module at
+all (`test_cli_login.py`, which only touches `tools/cli_login.py`) reported a
+clean 15/15, and `run_all.py` printed **"TOTAL 15/15" at exit code 0** --
+green, while the product could not run at all. That is precisely the failure
+mode a Python-version CI matrix exists to catch, so shipping it with this
+blind spot intact would have meant CI could go green on the exact class of
+bug this whole line of work was about.
+
+Fixed with a compile check up front: `python3 -m py_compile <module>`, run
+once before any suite is attempted, treated as a hard failure distinct from a
+per-suite skip. Proven both directions with the same reintroduced-breakage
+test: the broken module now stops the run before any suite executes, with the
+real `SyntaxError` shown; the genuine, working module is unaffected.
+
+`.github/workflows/tests.yml`: matrix across Python 3.10 (install.sh's stated
+floor) through 3.13 (what a live node in this project's own Proxmox cluster
+actually runs), `ubuntu-latest`, `pip install -r requirements.txt` then
+`python3 dev/run_all.py lite_agent.py`.
+
+New: `dev/test_run_all.py`, 10 tests -- each one runs `run_all.py` as a real
+subprocess against an isolated scratch `dev/` directory it builds itself
+(never the real one), because running it against the real `dev/` would make
+the inner `run_all.py` discover and re-execute this very test file, which
+would do the same thing again: unbounded recursive process spawning. Covers
+the broken-module case, a valid-but-empty module still letting suites run, a
+genuinely failing fake suite still failing the run, and the real
+`lite_agent.py` passing the gate.
+
+Full suite: **345/345 across 21 suites**, verified on the actual Linux target
+(a stale mirror check briefly showed 20/335 because production was still on
+v0.2b.49 and had not yet pulled `test_network_timeouts.py` from v0.2b.50 --
+resolved by confirming the deployed commit directly rather than assuming).
+
+
 ## v0.2b.50 -- Telegram network timeouts were too tight for this link
 
 Asked directly why so many commands were erroring last night. The screenshot
