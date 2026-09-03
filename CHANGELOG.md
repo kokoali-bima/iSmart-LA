@@ -1,5 +1,51 @@
 # Changelog
 
+## v0.2b.62 -- token waste found by reading a real deployment's log
+
+Two costs, both measured on production rather than reasoned about, plus one
+suspected bug that turned out not to exist.
+
+**The agy timeout was throwing away work that would have finished.** Across 91
+real successful agy turns: median 21s, p90 171s, max 538s -- against a 280s
+timeout. Cutting a run short there is not a cheap failure: agy does the whole
+job and only then reports "timeout waiting for response", so everything it
+burned is discarded. Individual cases lost 261k, 392k and 411k tokens;
+**859,218 across eight failures** in that one log. The turn then falls through
+to a pricier tier which starts COLD, since each tier keeps its own history --
+so the replacement answer costs more AND knows less than the one thrown away.
+Raised to 900s (print-timeout 870s), which clears the observed maximum with
+room to spare. With a 21s median this changes almost nothing for ordinary
+turns; a genuinely long one now waits instead of being paid for twice.
+
+**An expensive conversation said nothing about being expensive.** In the same
+log, one session's input went from 10 tokens on its first turn to **506,250 on
+its 95th**, with no /new in between -- while the median prompt actually typed
+there was 352 characters. The size is accumulated history, so it is invisible
+from where the person sits, and it recurs on every further turn. A turn whose
+input crosses `TURN_COST_HINT_TOKENS` (200k, tunable, 0 disables) now says so,
+with the real number, **once per session** -- it stays true until /new, so
+repeating it every turn would nag rather than inform.
+
+**sessions.json is now written atomically.** A plain `write_text()`
+interrupted by a crash or a full disk leaves truncated JSON, and
+`load_sessions()` then quietly "starts fresh" -- which is not one lost chat
+but *every* chat's history at once, each re-sending its whole brief on the
+next message with nothing said about it. Written through a temp file and
+`os.replace()`.
+
+**And one bug that wasn't there.** The first instinct was that concurrent
+turns (concurrent since v0.2b.40) race on load->modify->save. Checked instead
+of assumed: all six such sequences in the file are `await`-free, so no
+coroutine can interleave them. A `threading.RLock` was drafted and removed --
+coroutines share one thread and an RLock is reentrant per thread, so it would
+have let both straight through while implying protection that was not there. A
+lock that protects nothing is worse than no lock. What is left is a comment at
+each site naming the real reason it is safe, so a future edit that adds an
+`await` there knows exactly what it would break.
+
+Full suite: **587/587 across 30 suites** on the real Linux target.
+
+
 ## v0.2b.61 -- connecting Drive no longer needs a Google Cloud project
 
 The device flow in v0.2b.54 removed the terminal, but not the hard part.

@@ -59,6 +59,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import threading
 import tempfile
 import shutil
 import getpass
@@ -134,6 +135,10 @@ LEDGER_FILE = BASE_DIR / "spend.jsonl"
 # that is the only point where stopping is still possible: tokens inside a
 # single CLI call are already spent by the time it returns.
 TURN_TOKEN_CEILING = int(os.environ.get("TURN_TOKEN_CEILING", "0") or 0)
+# When one turn's input crosses this, say so once. 200k is well clear of an
+# ordinary turn on the deployment this was measured on, and well under the
+# 506k a single unbroken session reached there. 0 disables the hint.
+TURN_COST_HINT_TOKENS = int(os.environ.get("TURN_COST_HINT_TOKENS", "200000") or 0)
 # Deterministic collectors: known questions answered by a script, no LLM
 # involved, so a repeat of an already-solved case costs zero tokens. See /status.
 RUN_SCHEDULED = BASE_DIR / "tools" / "run_scheduled.py"
@@ -324,8 +329,24 @@ AGY_MODEL_FALLBACK = os.environ.get("AGY_MODEL_FALLBACK", "gemini-3.1-pro-low")
 # agy's own --print-timeout (default 5m); our subprocess timeout is set a bit
 # above it so agy reports its own clean "timeout waiting for response" JSON
 # instead of us hard-killing it mid-response with no usage data to log.
-AGY_PRINT_TIMEOUT = os.environ.get("AGY_PRINT_TIMEOUT", "280s")
-AGY_TIMEOUT = int(os.environ.get("AGY_TIMEOUT_SECONDS", "300"))
+# Raised from 280s/300s on measured evidence, not caution. Across 91 real
+# successful agy turns on a production deployment: median 21s, p90 171s, max
+# 538s -- so the old 280s cut off the tail of work that WOULD have finished,
+# and none of them came close to 900s.
+#
+# The cost of cutting it short is not a cheap failure. agy does the whole job
+# first and only then reports "timeout waiting for response", so the run is
+# discarded having already burned everything: 261k, 392k, 411k tokens in
+# individual cases, 859,218 across the eight failures in that log. The turn
+# then falls through to a pricier tier which starts COLD -- each tier keeps
+# its own history -- so the replacement answer is both more expensive and
+# less informed than the one that was thrown away.
+#
+# A slow turn now waits longer before failing over. With a 21s median that
+# affects almost nothing, and waiting is plainly better than paying twice for
+# a worse answer.
+AGY_PRINT_TIMEOUT = os.environ.get("AGY_PRINT_TIMEOUT", "870s")
+AGY_TIMEOUT = int(os.environ.get("AGY_TIMEOUT_SECONDS", "900"))
 # Telegram Bot API's own upload limit for bot-sent documents.
 TELEGRAM_MAX_FILE_BYTES = 50 * 1024 * 1024
 # python-telegram-bot's default HTTP timeouts (~5s read/write) are tuned for
@@ -2390,17 +2411,49 @@ def _empty_session() -> dict:
 # expensive/unreliable, so tiers are never allowed to share history.
 
 
+# Guards the file against a writer in an executor thread, which is where
+# run_combo already runs. It does NOT make a load->modify->save sequence
+# atomic against another coroutine -- coroutines share one thread, and an
+# RLock is reentrant per thread, so it would let both straight through. What
+# actually keeps those sequences safe is that none of them contains an
+# `await`; see the note at the turn's own reload.
+_sessions_lock = threading.RLock()
+
+
 def load_sessions() -> dict:
-    if SESSIONS_FILE.exists():
-        try:
-            return json.loads(SESSIONS_FILE.read_text())
-        except Exception:
-            logger.warning("sessions.json unreadable, starting fresh", exc_info=True)
-    return {}
+    with _sessions_lock:
+        if SESSIONS_FILE.exists():
+            try:
+                return json.loads(SESSIONS_FILE.read_text(encoding="utf-8"))
+            except Exception:
+                logger.warning("sessions.json unreadable, starting fresh", exc_info=True)
+        return {}
 
 
 def save_sessions(sessions: dict) -> None:
-    SESSIONS_FILE.write_text(json.dumps(sessions, indent=2))
+    """Write atomically. A plain write_text() that dies partway leaves
+    truncated JSON, and load_sessions() then quietly "starts fresh" -- which
+    is not one lost chat but EVERY chat's history at once, each of them
+    re-sending its full brief on the next message, with nothing said about it.
+    os.replace() is atomic on POSIX, so a reader sees either the old file or
+    the new one and never a half-written one."""
+    with _sessions_lock:
+        tmp = SESSIONS_FILE.with_suffix(".json.tmp")
+        try:
+            tmp.write_text(json.dumps(sessions, indent=2), encoding="utf-8")
+            os.replace(tmp, SESSIONS_FILE)
+        except OSError:
+            logger.warning("could not save sessions.json", exc_info=True)
+            tmp.unlink(missing_ok=True)
+
+
+def update_chat_session(chat_id: str, mutate) -> None:
+    """Re-read, apply `mutate(sessions)`, and write -- all under one lock, so
+    a concurrent turn in another chat cannot be overwritten in between."""
+    with _sessions_lock:
+        sessions = load_sessions()
+        mutate(sessions)
+        save_sessions(sessions)
 
 
 def get_chat_state(sessions: dict, chat_id: str) -> dict:
@@ -8762,14 +8815,47 @@ async def _run_turn_inner(update: Update, context: ContextTypes.DEFAULT_TYPE, te
                 except Exception:
                     logger.warning("could not deliver the Gemini re-auth notice", exc_info=True)
 
-    # re-load in case /session or /remember ran concurrently -- unlikely with
-    # single-user polling, but avoid clobbering another chat's write.
+    # Re-read rather than reuse the copy from earlier in the turn: /session or
+    # /remember may have written in between.
+    #
+    # This block is safe from a concurrent turn for one reason only, and it is
+    # worth naming: there is no `await` between this load and the save below,
+    # so no other coroutine can interleave. Turns HAVE been concurrent since
+    # v0.2b.40 (checked: all six load->save sequences in this file are
+    # await-free). Introduce an await here and two turns finishing together
+    # will both read this state, the second write dropping the first chat's
+    # update -- costing it its conversation handle and a full re-sent brief,
+    # the most expensive thing this bot does.
     sessions = load_sessions()
     state = get_chat_state(sessions, chat_id)
     # Which tier actually answered is what /graduate needs to find the case's
     # history later -- each tier keeps its own, so "the last one" is the only
     # reliable pointer to where the work actually happened.
     sess["last_model"] = model
+
+    # A conversation that has grown expensive costs the same again on EVERY
+    # further turn, and nothing tells the person paying. Measured on a real
+    # deployment: one session's input went from 10 tokens on its first turn to
+    # 506,250 on its 95th, with no /new in between -- and the median user
+    # prompt in that same log was 352 characters. The size is history, not
+    # anything they typed, so it is invisible from where they sit.
+    #
+    # Said ONCE per session, when it first crosses the line: after that it
+    # stays crossed until /new, and repeating it every turn would be nagging
+    # rather than informing.
+    _u = result.get("usage", {}) or {}
+    turn_in = (_int(_u.get("input_tokens")) + _int(_u.get("cache_read_tokens"))
+               + _int(_u.get("cache_read_input_tokens")))
+    cost_note = ""
+    if (TURN_COST_HINT_TOKENS and turn_in >= TURN_COST_HINT_TOKENS
+            and not sess.get("cost_hint_shown")):
+        sess["cost_hint_shown"] = True
+        cost_note = _t(lang,
+            f"\n\n<i>This conversation now costs ~{turn_in // 1000}k tokens per "
+            f"turn, and will keep doing so. /new when the topic changes.</i>",
+            f"\n\n<i>Percakapan ini sekarang ~{turn_in // 1000}rb token per "
+            f"giliran, dan akan terus segitu. /new kalau ganti topik.</i>")
+
     state["sessions"][active] = sess
     save_sessions(sessions)
 
@@ -8810,7 +8896,8 @@ async def _run_turn_inner(update: Update, context: ContextTypes.DEFAULT_TYPE, te
     for attempt in (1, 2):
         try:
             if clean_text:
-                await _reply_chunked(update, clean_text, tag_html=f"— <i>by {label}</i>")
+                await _reply_chunked(update, clean_text,
+                                     tag_html=f"— <i>by {label}</i>{cost_note}")
             sent_hashes: set[str] = set()
             for path in media_paths:
                 await _send_media_file(update, path, sent_hashes)
