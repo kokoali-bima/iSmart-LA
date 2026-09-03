@@ -55,6 +55,9 @@ import functools
 import datetime as _dt
 import hashlib
 import hmac
+import urllib.error
+import urllib.parse
+import urllib.request
 import tempfile
 import shutil
 import getpass
@@ -146,6 +149,21 @@ RCLONE_CONF = Path.home() / ".config" / "rclone" / "rclone.conf"
 # /gdrive before anything uploads, so a file never lands in an account
 # nobody meant to use for that room.
 GDRIVE_ROOM_ACCOUNTS_FILE = BASE_DIR / "gdrive_room_accounts.json"
+# The OAuth client the Drive device-flow sign-in speaks to. Deliberately NOT
+# shipped in the repo and never committed: it belongs to the operator's own
+# Google Cloud project, the same way the bot token does. One client serves the
+# whole deployment -- each person still authorises their OWN Google account
+# through it.
+GDRIVE_CLIENT_FILE = BASE_DIR / "gdrive_oauth_client.json"
+GDRIVE_DEVICE_CODE_URL = "https://oauth2.googleapis.com/device/code"
+GDRIVE_TOKEN_URL = "https://oauth2.googleapis.com/token"
+# Verified against Google's own documentation before being chosen: the device
+# flow supports a LIMITED scope list, and of the Drive scopes only
+# drive.appdata and drive.file are on it -- full "drive" is not. drive.file is
+# also classed non-sensitive, so publishing the client needs no Google review.
+# It is what connect_gdrive_account() already used anyway, so nothing about
+# what the bot can reach changes here: only how the token is obtained.
+GDRIVE_DEVICE_SCOPE = "https://www.googleapis.com/auth/drive.file"
 
 # --------------------------------------------------------------------------
 # Per-chat language for the bot's OWN fixed text (command replies) -- separate
@@ -4438,6 +4456,167 @@ async def _begin_cli_login(update: Update, query, provider: str) -> None:
     ), parse_mode="HTML", disable_web_page_preview=True)
 
 
+def _gdrive_client_setup_instructions(lang: str) -> str:
+    return _t(lang,
+        "🔑 <b>One-time setup: your own Google OAuth client</b>\n\n"
+        "Asked once per deployment, never again. It stays on this server and "
+        "is never committed anywhere — like the bot token.\n\n"
+        "1. Open <code>https://console.cloud.google.com/apis/credentials</code>\n"
+        "2. Create a project (any name), then <b>Create credentials → OAuth client ID</b>\n"
+        "3. Application type: <b>TV and Limited Input devices</b>\n"
+        "   <i>(this exact type — Desktop or Web will be rejected)</i>\n"
+        "4. Enable the <b>Google Drive API</b> for that project\n"
+        "5. On the OAuth consent screen, press <b>Publish app</b>\n"
+        "   <i>(no Google review needed — this only asks for drive.file, a "
+        "non-sensitive scope. Skipping this leaves the app in Testing, where "
+        "Google expires the login every 7 days.)</i>\n\n"
+        "Then send both values here as one message, separated by a space:\n"
+        "<code>&lt;client_id&gt; &lt;client_secret&gt;</code>\n\n"
+        "Send /cancel to stop.",
+        "🔑 <b>Setup sekali saja: OAuth client milik Anda sendiri</b>\n\n"
+        "Ditanya sekali per deployment, tidak akan diminta lagi. Tersimpan di "
+        "server ini dan tidak pernah ikut ke mana pun — seperti token bot.\n\n"
+        "1. Buka <code>https://console.cloud.google.com/apis/credentials</code>\n"
+        "2. Buat project (nama bebas), lalu <b>Create credentials → OAuth client ID</b>\n"
+        "3. Application type: <b>TV and Limited Input devices</b>\n"
+        "   <i>(harus tipe ini — Desktop atau Web akan ditolak)</i>\n"
+        "4. Aktifkan <b>Google Drive API</b> untuk project itu\n"
+        "5. Di OAuth consent screen, tekan <b>Publish app</b>\n"
+        "   <i>(tidak perlu review Google — ini cuma minta drive.file yang "
+        "non-sensitive. Kalau dilewati, app tetap berstatus Testing dan Google "
+        "mematikan login-nya tiap 7 hari.)</i>\n\n"
+        "Lalu kirim kedua nilainya di sini dalam satu pesan, dipisah spasi:\n"
+        "<code>&lt;client_id&gt; &lt;client_secret&gt;</code>\n\n"
+        "Kirim /cancel untuk berhenti.",
+    )
+
+
+async def _gdrive_begin_device(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                               lang: str, name: str) -> None:
+    """Ask Google for a device code, show the card, and start waiting.
+
+    The wait is a bounded, deterministic poll of a request THIS person just
+    made, with a hard deadline Google itself sets (expires_in) -- the same
+    shape as the existing sign-in waits, not a background agent deciding
+    anything on its own.
+    """
+    chat_id = update.effective_chat.id
+    loop = asyncio.get_running_loop()
+    ok, body = await loop.run_in_executor(None, gdrive_device_start)
+    if not ok:
+        _gdrive_wizard.pop(chat_id, None)
+        detail = str(body.get("error_description", "unknown"))
+        return await update.message.reply_text(_t(lang,
+            f"⚠️ Google refused to start the sign-in: {detail}",
+            f"⚠️ Google menolak memulai sign-in: {detail}",
+        ))
+
+    url = body.get("verification_url") or body.get("verification_uri") or "https://google.com/device"
+    code = body.get("user_code", "")
+    mins = max(1, int(body.get("expires_in", 900)) // 60)
+    state = _gdrive_wizard.get(chat_id)
+    if state is not None:
+        state["step"] = "device_pending"
+    await update.message.reply_text(_t(lang,
+        f"🔗 <b>Connect Google Drive</b> (<code>{_tg_escape(name)}</code>)\n\n"
+        f"1. Open <code>{_tg_escape(url)}</code> on any device — your phone is fine\n"
+        f"2. Enter this code:\n\n<code>{_tg_escape(code)}</code>\n\n"
+        "3. Approve access. I pick it up automatically — nothing to paste back.\n\n"
+        f"<i>The code is good for about {mins} minutes. No terminal needed.</i>\n\n"
+        "Send /cancel to stop.",
+        f"🔗 <b>Hubungkan Google Drive</b> (<code>{_tg_escape(name)}</code>)\n\n"
+        f"1. Buka <code>{_tg_escape(url)}</code> di perangkat apa pun — HP juga bisa\n"
+        f"2. Masukkan kode ini:\n\n<code>{_tg_escape(code)}</code>\n\n"
+        "3. Setujui aksesnya. Hasilnya saya ambil sendiri — tidak ada yang perlu ditempel balik.\n\n"
+        f"<i>Kodenya berlaku sekitar {mins} menit. Tidak perlu terminal.</i>\n\n"
+        "Kirim /cancel untuk berhenti.",
+    ), parse_mode="HTML", disable_web_page_preview=True)
+
+    asyncio.create_task(_gdrive_device_wait(context, chat_id, name, lang, body))
+
+
+async def _gdrive_device_wait(context: ContextTypes.DEFAULT_TYPE, chat_id: int,
+                              name: str, lang: str, body: dict) -> None:
+    """Poll until approved, refused, or the code dies. Never runs longer than
+    Google's own expires_in, and stops the moment the wizard is cancelled."""
+    device_code = body.get("device_code", "")
+    interval = max(5, int(body.get("interval", 5)))
+    deadline = _dt.datetime.now().timestamp() + int(body.get("expires_in", 900))
+    loop = asyncio.get_running_loop()
+
+    async def done(text: str) -> None:
+        _gdrive_wizard.pop(chat_id, None)
+        try:
+            await context.bot.send_message(chat_id, text, parse_mode="HTML")
+        except Exception:
+            logger.warning("could not report the Drive sign-in result", exc_info=True)
+
+    while _dt.datetime.now().timestamp() < deadline:
+        await asyncio.sleep(interval)
+        # Cancelled, or superseded by another /connectgdrive: stop quietly.
+        st = _gdrive_wizard.get(chat_id)
+        if not st or st.get("step") != "device_pending":
+            return
+        try:
+            state, payload = await loop.run_in_executor(
+                None, gdrive_device_poll_once, device_code)
+        except Exception:
+            logger.warning("Drive device poll failed", exc_info=True)
+            continue
+
+        if state == "pending":
+            continue
+        if state == "slow_down":
+            # Google asking to back off is not an error -- honour it, or the
+            # next few polls get rejected outright.
+            interval += 5
+            continue
+        if state == "denied":
+            return await done(_t(lang, "✖️ Access was declined in the browser.",
+                                       "✖️ Aksesnya ditolak di browser."))
+        if state == "expired":
+            return await done(_t(lang,
+                "⌛ That code expired. Run /connectgdrive again.",
+                "⌛ Kodenya kedaluwarsa. Jalankan /connectgdrive lagi."))
+        if state == "error":
+            detail = _tg_escape(str(payload.get("error_description")
+                                    or payload.get("error") or "unknown"))
+            return await done(_t(lang, f"⚠️ Sign-in failed: {detail}",
+                                       f"⚠️ Sign-in gagal: {detail}"))
+
+        # Approved. A token with no refresh_token would work for an hour and
+        # then quietly stop -- Google omits it when this account has already
+        # authorised this same client before, so say exactly that rather than
+        # storing something with an hour to live.
+        if not payload.get("refresh_token"):
+            return await done(_t(lang,
+                "⚠️ Google returned no refresh token, so this would stop working "
+                "within the hour. That usually means this account already "
+                "authorised this client -- revoke it at "
+                "myaccount.google.com/permissions and try again.",
+                "⚠️ Google tidak mengirim refresh token, jadi ini akan berhenti "
+                "bekerja dalam sejam. Biasanya karena akun ini sudah pernah "
+                "mengizinkan client yang sama -- cabut di "
+                "myaccount.google.com/permissions lalu coba lagi."))
+
+        # Hand the token to the SAME path a pasted token took, so verification,
+        # the duplicate-root-folder guard and rollback behave identically
+        # however the token was obtained.
+        ok, detail = await loop.run_in_executor(
+            None, connect_gdrive_account, name, gdrive_token_to_rclone(payload))
+        safe = _tg_escape(str(detail))
+        if ok:
+            logger.warning("Drive account connected via device flow: %s", name)
+            return await done(_t(lang,
+                f"✅ <b>{_tg_escape(name)}</b> connected. {safe}",
+                f"✅ <b>{_tg_escape(name)}</b> terhubung. {safe}"))
+        return await done(_t(lang, f"⚠️ Could not finish: {safe}",
+                                   f"⚠️ Tidak bisa menyelesaikan: {safe}"))
+
+    await done(_t(lang, "⌛ Timed out waiting for approval. Run /connectgdrive again.",
+                        "⌛ Kelamaan menunggu persetujuan. Jalankan /connectgdrive lagi."))
+
+
 async def _handle_gdrive_wizard_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     """A separate small wizard from _wizard/_server_wizard -- its two steps
     (label, then token) don't overlap either of those in shape, and keeping
@@ -4474,10 +4653,35 @@ async def _handle_gdrive_wizard_input(update: Update, context: ContextTypes.DEFA
                 f"'{_tg_escape(name)}' already exists -- pick a different label, or /cancel.",
                 f"'{_tg_escape(name)}' sudah ada -- pilih label lain, atau /cancel."))
             return True
-        state["step"], state["name"] = "await_gdrive_token", name
+        state["name"] = name
         state["expires"] = _dt.datetime.now().timestamp() + GDRIVE_TOKEN_WIZARD_TTL
-        await update.message.reply_text(
-            _gdrive_connect_instructions(lang, name), parse_mode="HTML")
+        if read_gdrive_client():
+            await _gdrive_begin_device(update, context, lang, name)
+        else:
+            state["step"] = "await_gdrive_client"
+            await update.message.reply_text(
+                _gdrive_client_setup_instructions(lang), parse_mode="HTML")
+        return True
+
+    if state["step"] == "await_gdrive_client":
+        parts = text.split()
+        if len(parts) != 2 or not parts[0].endswith(".apps.googleusercontent.com"):
+            await update.message.reply_text(_t(lang,
+                "Send the client id and secret as one message, separated by a "
+                "space. The id ends in .apps.googleusercontent.com — or /cancel.",
+                "Kirim client id dan secret dalam satu pesan, dipisah spasi. "
+                "Id-nya berakhiran .apps.googleusercontent.com — atau /cancel."))
+            return True
+        write_gdrive_client(parts[0], parts[1])
+        state["expires"] = _dt.datetime.now().timestamp() + GDRIVE_TOKEN_WIZARD_TTL
+        await _gdrive_begin_device(update, context, lang, state["name"])
+        return True
+
+    if state["step"] == "device_pending":
+        # The waiter owns this step; anything typed here is just noise.
+        await update.message.reply_text(_t(lang,
+            "Still waiting for you to approve it in the browser. /cancel to stop.",
+            "Masih menunggu Anda menyetujuinya di browser. /cancel untuk berhenti."))
         return True
 
     # step == "await_gdrive_token"
@@ -5561,6 +5765,65 @@ async def cmd_usemodel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     ), parse_mode="HTML")
 
 
+def check_gdrive_account(name: str, timeout: int = 30) -> tuple[bool, str]:
+    """Is this Drive remote still usable RIGHT NOW? Zero model tokens -- it is
+    one rclone call, no model involved.
+
+    Worth having even though rclone refreshes access tokens by itself: the
+    refresh token underneath can still die, and every way it dies is silent.
+    Access revoked at myaccount.google.com, the OAuth client deleted, the
+    Google password changed, or -- the one this project ran into head-on --
+    an OAuth client left in "Testing" publishing status, where Google expires
+    the refresh token after 7 days no matter how healthy the connection looks.
+    Without a check, the first sign of any of that is a report that silently
+    never arrives.
+    """
+    try:
+        probe = _rclone_run("lsd", f"{name}:", timeout=timeout)
+    except Exception as exc:
+        return False, f"could not run rclone: {exc}"
+    if probe.returncode == 0:
+        return True, "ok"
+    err = (probe.stderr or probe.stdout or "").strip()
+    low = err.lower()
+    if "token" in low and ("expired" in low or "invalid" in low or "revoked" in low):
+        return False, "the sign-in has expired or been revoked -- /connectgdrive again"
+    if "quota" in low or "rate" in low:
+        return False, "Google is rate-limiting or the quota is exhausted"
+    return False, err[:200] or f"rclone exited {probe.returncode}"
+
+
+def check_all_gdrive_accounts() -> list[tuple[str, bool, str]]:
+    return [(n, *check_gdrive_account(n)) for n in _list_gdrive_accounts()]
+
+
+async def cmd_gdrivestatus(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Live health of every connected Drive account. 0 model tokens."""
+    if not _authorized(update):
+        return
+    lang = _chat_lang(update)
+    accounts = _list_gdrive_accounts()
+    if not accounts:
+        return await update.message.reply_text(_t(lang,
+            "📁 No Google Drive account is connected. /connectgdrive to add one.",
+            "📁 Belum ada akun Google Drive terhubung. /connectgdrive untuk menambah."))
+    await context.bot.send_chat_action(update.effective_chat.id, "typing")
+    loop = asyncio.get_running_loop()
+    rows = await loop.run_in_executor(None, check_all_gdrive_accounts)
+    lines = [_t(lang, "📁 <b>Google Drive</b>", "📁 <b>Google Drive</b>"), ""]
+    for name, ok, detail in rows:
+        mark = "🟢" if ok else "🔴"
+        lines.append(f"{mark} <b>{_tg_escape(name)}</b>"
+                     + ("" if ok else f" — {_tg_escape(detail)}"))
+    client = read_gdrive_client()
+    if not client:
+        lines.append("")
+        lines.append(_t(lang,
+            "<i>No OAuth client set up, so /connectgdrive will ask for one first.</i>",
+            "<i>Belum ada OAuth client, jadi /connectgdrive akan menanyakannya dulu.</i>"))
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+
 async def cmd_gdrive(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Pick (or show) which connected Drive account this room uploads to.
     Connecting an account itself is still a one-time step done directly on
@@ -5645,7 +5908,10 @@ async def cmd_gdrive_button(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
 
 GDRIVE_TOKEN_WIZARD_TTL = 900
-# chat_id -> {"step": "await_gdrive_label" | "await_gdrive_token", "name": str|None, "expires": ts}
+# chat_id -> {"step": "await_gdrive_label" | "await_gdrive_client" |
+#             "device_pending" | "await_gdrive_token", "name": str|None,
+#             "expires": ts}. "await_gdrive_token" is only reached via
+# `/connectgdrive manual` now -- see the note in cmd_connectgdrive.
 _gdrive_wizard: dict[int, dict] = {}
 
 
@@ -5702,14 +5968,22 @@ def _gdrive_connect_instructions(lang: str, name: str) -> str:
 async def cmd_connectgdrive(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Start connecting a NEW Google Drive account, explicitly through Telegram.
 
-    Google's OAuth for a Drive scope has no single portable link the way
-    Gemini/Claude's sign-in does -- rclone's own authorize flow binds a
-    listener on 127.0.0.1 on whichever machine runs it, so it must be run on a
-    machine the operator controls, not this server. What this DOES move into
-    Telegram, and what used to be the risky part done by hand: picking a
-    remote name, editing rclone.conf's TOML by hand, and remembering to check
-    for a duplicate root folder if the same account gets connected twice.
-    Every connect is now attempted, verified, and logged with who did it.
+    Uses Google's OAuth device flow -- open a URL, type a code, done -- so
+    this finally matches how signing in to Gemini and Claude already works
+    here. It replaces having to run `rclone authorize` in a terminal on your
+    own PC and paste the token back, which was the one part of setup that
+    still needed a machine other than this one.
+
+    Why it can work at all, checked against Google's documentation rather
+    than assumed: the device flow supports only a limited scope list, and of
+    the Drive scopes just drive.appdata and drive.file are on it. drive.file
+    is what connect_gdrive_account() already asked for, so nothing about the
+    bot's reach changes -- only how the token is obtained. drive.file is also
+    non-sensitive, so the operator's own OAuth client needs no Google review
+    to be published.
+
+    The paste-a-token path is kept as a fallback for anyone who needs the
+    full `drive` scope to reach folders the bot did not create itself.
     """
     if not await _may_authorize_group_action(update, context):
         return
@@ -5721,15 +5995,34 @@ async def cmd_connectgdrive(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             "Sedang menghubungkan satu -- selesaikan itu dulu (atau /cancel)."))
         return
 
+    # The paste-a-token path is still here on purpose: drive.file only reaches
+    # files the bot itself created, so anyone who needs the agent to write into
+    # a folder they made by hand still needs a full-"drive" token, and that
+    # scope is not one Google's device flow will issue.
+    manual = bool(context.args) and context.args[0].strip().lower() in ("manual", "token")
+
     existing = _list_gdrive_accounts()
-    if not existing:
-        name = "gdrive"
+    if manual:
+        name = _next_gdrive_default_name() if existing else "gdrive"
         _gdrive_wizard[chat_id] = {
             "step": "await_gdrive_token", "name": name,
             "expires": _dt.datetime.now().timestamp() + GDRIVE_TOKEN_WIZARD_TTL,
         }
         await update.message.reply_text(
             _gdrive_connect_instructions(lang, name), parse_mode="HTML")
+        return
+
+    if not existing:
+        name = "gdrive"
+        _gdrive_wizard[chat_id] = {
+            "step": "await_gdrive_client", "name": name,
+            "expires": _dt.datetime.now().timestamp() + GDRIVE_TOKEN_WIZARD_TTL,
+        }
+        if read_gdrive_client():
+            await _gdrive_begin_device(update, context, lang, name)
+        else:
+            await update.message.reply_text(
+                _gdrive_client_setup_instructions(lang), parse_mode="HTML")
         return
 
     # A second+ account: ask for a short label first so /gdrive's picker stays
@@ -5757,6 +6050,119 @@ async def cmd_connectgdrive(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
 def _rclone_run(*args: str, timeout: int = 60) -> subprocess.CompletedProcess:
     return subprocess.run([RCLONE_BIN, *args], capture_output=True, text=True, timeout=timeout)
+
+
+def read_gdrive_client() -> dict:
+    """{"client_id": ..., "client_secret": ...}, or {} when not set up yet."""
+    if not GDRIVE_CLIENT_FILE.exists():
+        return {}
+    try:
+        d = json.loads(GDRIVE_CLIENT_FILE.read_text())
+        return d if d.get("client_id") else {}
+    except Exception:
+        logger.warning("gdrive_oauth_client.json unreadable", exc_info=True)
+        return {}
+
+
+def write_gdrive_client(client_id: str, client_secret: str) -> None:
+    GDRIVE_CLIENT_FILE.write_text(json.dumps(
+        {"client_id": client_id.strip(), "client_secret": client_secret.strip()}, indent=2))
+    try:
+        GDRIVE_CLIENT_FILE.chmod(0o600)
+    except OSError:
+        logger.warning("could not chmod the Drive client file", exc_info=True)
+    logger.warning("Drive OAuth client configured (%s)", client_id[:24])
+
+
+def _post_form(url: str, fields: dict) -> tuple[int, dict]:
+    """POST an application/x-www-form-urlencoded body, parse a JSON reply.
+
+    urllib rather than a new dependency, and the error body is READ rather
+    than discarded: Google returns the part that matters ("authorization_
+    pending", "slow_down", "expired_token") with a 4xx status, so treating a
+    non-200 as simply "failed" would leave the polling loop unable to tell
+    "keep waiting" from "give up".
+    """
+    data = urllib.parse.urlencode(fields).encode()
+    req = urllib.request.Request(url, data=data, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return resp.status, json.loads(resp.read().decode() or "{}")
+    except urllib.error.HTTPError as exc:
+        try:
+            return exc.code, json.loads(exc.read().decode() or "{}")
+        except Exception:
+            return exc.code, {}
+    except Exception as exc:
+        return 0, {"error": "network", "error_description": str(exc)[:200]}
+
+
+def gdrive_device_start() -> tuple[bool, dict]:
+    """Ask Google for a device code. Returns (ok, payload-or-error)."""
+    client = read_gdrive_client()
+    if not client:
+        return False, {"error_description": "no OAuth client configured"}
+    status, body = _post_form(GDRIVE_DEVICE_CODE_URL, {
+        "client_id": client["client_id"],
+        "scope": GDRIVE_DEVICE_SCOPE,
+    })
+    if status != 200 or "device_code" not in body:
+        detail = body.get("error_description") or body.get("error") or f"HTTP {status}"
+        # The one failure worth naming precisely, because it is the mistake
+        # this setup invites: an OAuth client of the wrong TYPE. Google answers
+        # "invalid_client / Invalid client type", which reads like a bad id
+        # rather than the real problem -- the client must be created as
+        # "TV and Limited Input devices", not Desktop or Web.
+        if body.get("error") == "invalid_client":
+            detail = ("that client is the wrong TYPE -- it must be created as "
+                      "'TV and Limited Input devices', not Desktop or Web app")
+        return False, {"error_description": detail}
+    return True, body
+
+
+def gdrive_device_poll_once(device_code: str) -> tuple[str, dict]:
+    """One poll. Returns (state, payload) where state is one of "ok" (payload
+    is the token), "pending", "slow_down", "denied", "expired", "error"."""
+    client = read_gdrive_client()
+    if not client:
+        return "error", {"error_description": "no OAuth client configured"}
+    status, body = _post_form(GDRIVE_TOKEN_URL, {
+        "client_id": client["client_id"],
+        "client_secret": client.get("client_secret", ""),
+        "device_code": device_code,
+        "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+    })
+    if status == 200 and body.get("access_token"):
+        return "ok", body
+    err = body.get("error", "")
+    if err == "authorization_pending":
+        return "pending", body
+    if err == "slow_down":
+        return "slow_down", body
+    if err == "access_denied":
+        return "denied", body
+    if err == "expired_token":
+        return "expired", body
+    return "error", body
+
+
+def gdrive_token_to_rclone(tok: dict) -> str:
+    """Google's device-flow reply -> the token blob rclone stores.
+
+    Google returns a RELATIVE lifetime ("expires_in": 3599); rclone stores an
+    ABSOLUTE RFC3339 "expiry". Handing rclone the raw reply would leave it
+    with no expiry at all, so it would keep presenting a dead access token
+    instead of refreshing -- working at first, then failing an hour later for
+    no visible reason.
+    """
+    expires_in = int(tok.get("expires_in") or 3600)
+    expiry = _dt.datetime.now(_dt.timezone.utc) + _dt.timedelta(seconds=expires_in)
+    return json.dumps({
+        "access_token": tok.get("access_token", ""),
+        "token_type": tok.get("token_type", "Bearer"),
+        "refresh_token": tok.get("refresh_token", ""),
+        "expiry": expiry.isoformat().replace("+00:00", "Z"),
+    })
 
 
 def connect_gdrive_account(name: str, token_raw: str) -> tuple[bool, str]:
@@ -7940,6 +8346,7 @@ def main() -> None:
     app.add_handler(CommandHandler("addmcp", cmd_addmcp))
     app.add_handler(CommandHandler("rmmcp", cmd_rmmcp))
     app.add_handler(CommandHandler("mcpservers", cmd_mcpservers))
+    app.add_handler(CommandHandler("gdrivestatus", cmd_gdrivestatus))
     app.add_handler(CallbackQueryHandler(cmd_server_button, pattern="^srv:"))
     app.add_handler(CallbackQueryHandler(cmd_needwrite_button, pattern="^nw:"))
     app.add_handler(CommandHandler("agentstatus", cmd_agentstatus))

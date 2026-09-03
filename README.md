@@ -7,7 +7,7 @@ A report doesn't have to stop at the chat: it can land straight in a shared
 [Google Drive](#google-drive-optional) folder too, connected the same explicit way as
 everything else here -- through Telegram, not a config file.
 
-> **Status: v0.2b.53 -- early/beta.** Built and battle-tested against a real production
+> **Status: v0.2b.54 -- early/beta.** Built and battle-tested against a real production
 > Proxmox VE cluster over several days of iteration, including a live-fire test of the
 > unlock/PIN/snapshot flow against real infrastructure. Works well; still has known
 > rough edges (see [Known limitations](#known-limitations)).
@@ -334,6 +334,7 @@ Ollama, say), since something has to translate between protocols.
 | `/addmcp <name> <cmd> [args]` | owner/admin + PIN | Register an MCP server -- run it bare for a ready-to-use, no-install example |
 | `/rmmcp <name>` | owner/admin | Withdraw one (no PIN -- it only reduces capability) |
 | `/mcpservers` | **0 tokens** | What MCP servers are registered |
+| `/gdrivestatus` | **0 tokens** | Is each connected Drive account still working? |
 | `/gdrive` | owner/admin, **0 tokens** | Pick (or show) which connected Drive account this room uploads to |
 | `/lang` (or `/language`) | owner/admin, **0 tokens** | Set/show this chat's language for the bot's own fixed replies (`en`/`id`) |
 | `/mode` | **0 tokens** | Read-only right now, or able to change things? |
@@ -466,29 +467,62 @@ somewhere a client or teammate can browse, not just be attached to a chat messag
 More than one account can be connected (a personal one, a company one, one per
 client...) with each chat picking its own default independently.
 
-**Connecting an account is `/connectgdrive`, in Telegram** — same principle as
-Gemini/Claude's sign-in: explicit, done by an authorised human, logged with who and
-when. It cannot be a single tap-a-link flow the way those are, though, and that is
-Google's constraint, not a design choice: `rclone`'s OAuth for Drive waits for a
-network redirect back to a listener on `127.0.0.1` on whichever machine runs it
-(confirmed live -- running it on the server itself just prints a link pointing at
-the *server's own* localhost, useless from a phone or another laptop), so the
-consent step still has to happen on a machine with a real browser. What moved into
-Telegram is everything that used to be a manual, error-prone step done by hand:
+**Connecting an account is `/connectgdrive`, in Telegram** — and since v0.2b.54 it
+finally works the way signing in to Gemini and Claude already did: open a URL, type
+a code, done. No terminal, on any machine, at any point.
 
 ```
 /connectgdrive
 ```
 
-The bot replies with one command to run on any machine you control that has
-`rclone` and a browser (your laptop -- does not have to be the server):
+The bot replies with a link and a short code. Open the link on anything with a
+browser — your phone is fine — enter the code, approve. The bot picks the result
+up by itself; there is nothing to paste back.
 
-```bash
-rclone authorize drive --drive-scope drive.file
-```
+<details>
+<summary>Why this took a Google Cloud client, and why that is a one-time step</summary>
 
-Approve in the browser that opens; rclone prints a block starting with
-`{"access_token"...}`. Paste that whole block back into the chat. The bot:
+That flow is Google's OAuth **device authorization grant**, and two facts decide
+whether it can be used here at all. Both were checked against Google's own
+documentation and against the live endpoint, not assumed:
+
+- The device flow supports only a **limited scope list**. Of the Drive scopes,
+  just `drive.appdata` and `drive.file` are on it — full `drive` is not.
+  `drive.file` is what this project already requested, so **nothing about what
+  the bot can reach changes**: it sees files it created, and nothing else.
+- `drive.file` is classed **non-sensitive**, so publishing the OAuth client needs
+  no Google review.
+
+What it does need is an OAuth client of type **"TV and Limited Input devices"**.
+rclone's own built-in client is a Desktop-type one, and Google refuses it outright
+(`invalid_client` / "Invalid client type" — confirmed by trying it). So
+`/connectgdrive` asks once, on first use, for a client from your own Google Cloud
+project, and walks through creating it. It is stored `chmod 600` on the server,
+never committed anywhere, and one client serves the whole deployment — every
+person still authorises their **own** Google account through it.
+
+One step in that setup genuinely matters: press **Publish app** on the consent
+screen. An app left in "Testing" gets a refresh token that **Google expires after
+7 days**, and no amount of keep-alive can prevent that — it is a revocation, and
+refreshing requires a live refresh token. Publishing needs no review for a
+non-sensitive scope.
+
+</details>
+
+**`/connectgdrive manual` keeps the old paste-a-token path**, for the one case the
+device flow cannot serve: `drive.file` only reaches files the bot itself created,
+so writing into a folder you made by hand needs a full-`drive` token, which Google
+will not issue over the device flow. That path still runs
+`rclone authorize drive` on a machine you control and takes the printed
+`{"access_token"...}` block pasted back into the chat.
+
+**`/gdrivestatus`** shows whether each connected account still works — 0 model
+tokens, one `rclone` call. Worth having because every way a Drive connection dies
+is silent: access revoked, the OAuth client deleted, the password changed, or that
+7-day expiry above. Without it, the first sign of trouble is a report that never
+arrives.
+
+Either way, once a token is in hand the bot:
 
 - picks a collision-free name (`gdrive` for the first account, asks for a short
   label like `company` or `clienta` for a second+ one -- becomes `gdrive_company`)

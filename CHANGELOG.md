@@ -1,5 +1,70 @@
 # Changelog
 
+## v0.2b.54 -- Drive sign-in is a URL and a code now, not a terminal
+
+The one part of setup that still needed a machine other than this one. Every
+other sign-in here is "open a link, paste a code back"; Drive alone made you
+run `rclone authorize` in a terminal on your own PC and paste a token blob.
+
+It now uses Google's OAuth **device authorization grant**: `/connectgdrive`
+replies with a link and a short code, you approve on any device (a phone is
+fine), and the bot picks the result up itself. Nothing to paste back.
+
+Two facts decided whether this was possible at all, both checked against
+Google's documentation and the live endpoint rather than assumed:
+
+- The device flow supports only a limited scope list. Of the Drive scopes only
+  `drive.appdata` and `drive.file` are on it -- full `drive` is not.
+  **`drive.file` is what connect_gdrive_account() already requested**, so
+  nothing about what the bot can reach changes: only how the token is obtained.
+- `drive.file` is non-sensitive, so the OAuth client needs no Google review to
+  be published.
+
+What it does need is a client of type "TV and Limited Input devices". rclone's
+built-in client is Desktop-type and Google refuses it (`invalid_client` /
+"Invalid client type" -- confirmed by trying it). So `/connectgdrive` asks once
+for a client from the operator's own Google Cloud project and walks through
+creating it; stored chmod 600, never committed, one client for the whole
+deployment while each person still authorises their own Google account.
+
+The setup card insists on **Publish app**, because an app left in "Testing"
+gets a refresh token Google expires after **7 days** -- and no keep-alive can
+defeat that, since it is a revocation and refreshing needs a live refresh
+token. That was the deciding argument against shipping a shared client id in
+this repo, along with it being a single point of failure for every deployment
+at once.
+
+Details that would each have shipped a quietly broken feature:
+
+- Google returns a RELATIVE lifetime (`expires_in`); rclone stores an ABSOLUTE
+  `expiry`. Handing rclone the raw reply leaves it with no expiry, so it keeps
+  presenting a dead access token instead of refreshing -- working at first,
+  failing an hour later for no visible reason.
+- A reply with no `refresh_token` (Google omits it when the account already
+  authorised this client) is refused rather than stored, with the fix named:
+  revoke at myaccount.google.com/permissions and retry. Storing it would have
+  produced a connection with an hour to live.
+- `slow_down` from Google backs the poll off instead of being treated as an
+  error, and the wait never outlives Google's own `expires_in`.
+- The approved token is handed to the SAME `connect_gdrive_account()` a pasted
+  token took, so verification, the duplicate-root-folder guard and rollback are
+  identical however the token was obtained.
+
+**`/connectgdrive manual`** keeps the paste-a-token path, for the case the
+device flow cannot serve: writing into a folder the bot did not create needs a
+full-`drive` token. Caught while updating the tests -- the first cut left that
+path unreachable, which would have silently dropped a capability.
+
+**`/gdrivestatus`** (new, 0 model tokens) reports whether each connected
+account still works. Every way a Drive connection dies is silent, so without it
+the first sign is a report that never arrives.
+
+Also: `gdrive_oauth_client.json` added to .gitignore and to install.sh's
+hardening sweep.
+
+Full suite: **463/463 across 25 suites** on the real Linux target.
+
+
 ## v0.2b.53 -- /update now refreshes the systemd unit it actually runs
 
 v0.2b.52 shipped a hardened systemd unit, and would have left almost every

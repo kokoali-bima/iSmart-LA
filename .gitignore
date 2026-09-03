@@ -31,6 +31,7 @@ setup_state.json
 model_overrides.json
 chat_language.json
 gdrive_room_accounts.json
+gdrive_oauth_client.json
 update_state.json
 update_announce.json
 spend.jsonl

@@ -62,8 +62,11 @@ def upd(chat_id=OWNER, text="hi"):
     return SimpleNamespace(message=msg, effective_message=msg, callback_query=None,
                            effective_user=SimpleNamespace(id=OWNER),
                            effective_chat=SimpleNamespace(id=chat_id, type="private", title=None))
-def ctx():
-    return SimpleNamespace(bot=SimpleNamespace(get_chat_member=AsyncMock()), args=[])
+def ctx(args=None):
+    return SimpleNamespace(bot=SimpleNamespace(get_chat_member=AsyncMock(),
+                                               send_message=AsyncMock(),
+                                               send_chat_action=AsyncMock()),
+                           args=args or [])
 
 # --- 1. naming helpers ------------------------------------------------------
 with patch.object(mod, "_list_gdrive_accounts", return_value=[]):
@@ -193,12 +196,29 @@ async def main():
         u = upd()
         await mod.cmd_connectgdrive(u, ctx())
     state = mod._gdrive_wizard.get(OWNER)
-    check("first-ever account skips the label step and goes straight to token",
-          state is not None and state["step"] == "await_gdrive_token"
+    # Changed deliberately: the default path is now Google's device flow (open
+    # a URL, type a code), so a first account no longer lands on "paste the
+    # token rclone printed". With no OAuth client stored yet it stops to ask
+    # for one first.
+    check("first-ever account skips the label step and starts the device flow",
+          state is not None and state["step"] == "await_gdrive_client"
           and state["name"] == "gdrive")
     txt = u.message.reply_text.call_args[0][0]
-    check("...and the instructions mention rclone authorize",
-          "rclone authorize" in txt)
+    check("...and asks for an OAuth client instead of a pasted rclone token",
+          "TV and Limited Input devices" in txt and "rclone authorize" not in txt)
+    mod._gdrive_wizard.clear()
+
+    # The paste-a-token path is still reachable on purpose -- drive.file only
+    # reaches files the bot created, so writing into a hand-made folder still
+    # needs a full-"drive" token, which the device flow cannot issue.
+    with patch.object(mod, "_list_gdrive_accounts", return_value=[]):
+        um = upd()
+        await mod.cmd_connectgdrive(um, ctx(args=["manual"]))
+    sm = mod._gdrive_wizard.get(OWNER)
+    check("/connectgdrive manual still reaches the paste-a-token path",
+          sm is not None and sm["step"] == "await_gdrive_token")
+    check("...with the rclone authorize instructions",
+          "rclone authorize" in um.message.reply_text.call_args[0][0])
     mod._gdrive_wizard.clear()
 
     with patch.object(mod, "_list_gdrive_accounts", return_value=["gdrive"]):
@@ -224,9 +244,9 @@ async def main():
     with patch.object(mod, "_list_gdrive_accounts", return_value=["gdrive"]):
         consumed = await mod._handle_wizard_input(u5, ctx())
     state5 = mod._gdrive_wizard.get(OWNER)
-    check("a valid label consumes the message and advances to the token step",
+    check("a valid label consumes the message and advances to the sign-in step",
           consumed is True and state5 is not None
-          and state5["step"] == "await_gdrive_token")
+          and state5["step"] in ("await_gdrive_client", "device_pending"))
     check("...with the sanitised name recorded", state5["name"] == "gdrive_ClientA")
     mod._gdrive_wizard.clear()
 

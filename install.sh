@@ -234,7 +234,7 @@ say "Step 8/8 -- basic hardening"
 # at 644 -- every chat's conversation state and token history readable by any
 # account on the box.
 HARDENED=0
-for f in .env pin.json sessions.json sessions.json.bak spend.jsonl          allowed_groups.json servers.json schedules.json snapshots.json          setup_state.json model_overrides.json chat_language.json          gdrive_room_accounts.json mcp_servers.json MEMORY.md OWNER_SCOPE.md; do
+for f in .env pin.json sessions.json sessions.json.bak spend.jsonl          allowed_groups.json servers.json schedules.json snapshots.json          setup_state.json model_overrides.json chat_language.json          gdrive_room_accounts.json gdrive_oauth_client.json \n         mcp_servers.json MEMORY.md OWNER_SCOPE.md; do
   if [ -f "$INSTALL_DIR/$f" ]; then
     chmod 600 "$INSTALL_DIR/$f" 2>/dev/null && HARDENED=$((HARDENED + 1))
   fi
