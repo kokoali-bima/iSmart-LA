@@ -3,6 +3,9 @@
 A lightweight Telegram bridge to **Claude Code** and **Antigravity CLI (agy)**, for
 infrastructure monitoring and investigation -- built to be dramatically cheaper to run
 than a full agent framework, while staying just as capable for real operational work.
+A report doesn't have to stop at the chat: it can land straight in a shared
+[Google Drive](#google-drive-optional) folder too, connected the same explicit way as
+everything else here -- through Telegram, not a config file.
 
 > **Status: v0.2b.50 -- early/beta.** Built and battle-tested against a real production
 > Proxmox VE cluster over several days of iteration, including a live-fire test of the
@@ -55,6 +58,10 @@ Claude Code usage on the same account.
   turn cold. (Trade-off found necessary in testing: letting one tier resume a
   conversation another tier started produced a single turn costing several times more
   than a fresh conversation would have.)
+- A reply isn't limited to the chat it started in: the agent can write a file and hand
+  it back through Telegram, or -- see [Google Drive](#google-drive-optional) -- drop it
+  straight into a shared folder instead, when a report needs to land somewhere a client
+  or teammate can browse.
 
 ### `/usemodel` -- an opt-in override, not a new default
 
