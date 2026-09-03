@@ -1,5 +1,41 @@
 # Changelog
 
+## v0.2b.59 -- a screenshot sent to the bot is answered, not swallowed
+
+Reported from a real session: a screenshot of a Google Cloud console page,
+captioned "which one do I pick?", got **no reply at all** -- and nothing in the
+log either. The message never reached a handler.
+
+The message filter was `filters.TEXT & ~filters.COMMAND`. A photo with a
+caption is not `filters.TEXT`, so it matched nothing and was dropped without a
+word. That is the worst way for anything here to fail: the sender cannot tell
+whether the bot is thinking, broken, or ignoring them. There was no handling of
+photos, documents or captions anywhere in the codebase.
+
+The fix is not an apology message. **Both CLIs read a local image when the
+prompt names its path** -- checked live on a generated PNG neither had seen:
+claude answered "a black rectangle in the upper-left", agy "red, on the right
+side". So an attached image is downloaded, and the model actually reads it --
+on the cheap default tier too, not only after escalating to Claude.
+
+- The **largest** of Telegram's photo sizes is fetched; the first is a
+  thumbnail too small to read text from, which is exactly what a screenshot is.
+- The caption becomes the question. With no caption, it asks for a description
+  rather than sending an empty prompt.
+- An image sent as a *file* rather than a photo works the same way.
+- An attachment that genuinely cannot be read gets a reply saying so, and
+  saying what would work. Never silence.
+- Downloads land in `incoming/` (chmod 700, gitignored, covered by install.sh's
+  hardening sweep) and anything over 24 hours old is pruned on the next one, so
+  the directory cannot grow forever on a disk nobody is watching.
+
+`Read` is added to the default `ALLOWED_TOOLS`, or the model cannot open the
+file it was just handed. This does not widen the trust surface: `Bash` was
+already allowed, and `Bash` can read any file the service user can.
+
+Full suite: **541/541 across 28 suites** on the real Linux target.
+
+
 ## v0.2b.58 -- three bugs that made connecting a Drive account impossible
 
 Reported from a real session as simply "ga bisa2 nambah gdrive". All three

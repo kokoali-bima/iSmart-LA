@@ -33,6 +33,7 @@ chat_language.json
 gdrive_room_accounts.json
 gdrive_oauth_client.json
 .lite-agent.service.bak
+/incoming/
 update_state.json
 update_announce.json
 spend.jsonl

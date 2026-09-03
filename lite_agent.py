@@ -302,7 +302,7 @@ CLAUDE_MODEL_PRIMARY = os.environ.get("CLAUDE_MODEL_PRIMARY", "claude-haiku-4-5-
 CLAUDE_MODEL_FALLBACK = os.environ.get("CLAUDE_MODEL_FALLBACK", "claude-sonnet-5")
 
 CLAUDE_BIN = os.environ.get("CLAUDE_BIN", "claude")
-ALLOWED_TOOLS = os.environ.get("ALLOWED_TOOLS", "Bash,WebSearch,WebFetch")
+ALLOWED_TOOLS = os.environ.get("ALLOWED_TOOLS", "Bash,Read,WebSearch,WebFetch")
 CLAUDE_TIMEOUT = int(os.environ.get("CLAUDE_TIMEOUT_SECONDS", "600"))
 
 # agy (Antigravity CLI) -- native, first-party Gemini access on a fixed-price
@@ -8254,6 +8254,68 @@ async def cmd_agentstatus(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     await _reply_chunked(update, text, already_html=True)
 
 
+INCOMING_MEDIA_DIR = BASE_DIR / "incoming"
+# Telegram's own cap for getFile is 20 MB; a photo is far smaller, but a
+# document masquerading as one need not be.
+MAX_INCOMING_MEDIA_BYTES = 20 * 1024 * 1024
+
+
+async def _save_incoming_image(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Optional[Path]:
+    """Download an attached image to a local file the model can read, or None.
+
+    Both CLIs read a local image when the prompt names its path -- verified
+    live before this was wired in, on a generated PNG neither had seen:
+    claude described "a black rectangle in the upper-left", agy "red, on the
+    right side". So a screenshot can be answered properly rather than merely
+    acknowledged, and on the cheap default tier too, not only on escalation.
+    """
+    msg = update.effective_message
+    if msg is None:
+        return None
+    file_id = size = None
+    if msg.photo:
+        # Telegram sends several sizes, ascending; the last is the largest.
+        best = msg.photo[-1]
+        file_id, size = best.file_id, best.file_size
+    elif msg.document and (msg.document.mime_type or "").startswith("image/"):
+        file_id, size = msg.document.file_id, msg.document.file_size
+    if not file_id:
+        return None
+    if size and size > MAX_INCOMING_MEDIA_BYTES:
+        logger.warning("incoming image too large (%s bytes), skipped", size)
+        return None
+
+    try:
+        INCOMING_MEDIA_DIR.mkdir(exist_ok=True)
+        tg_file = await context.bot.get_file(file_id)
+        suffix = Path(tg_file.file_path or "").suffix or ".jpg"
+        dest = INCOMING_MEDIA_DIR / f"{_dt.datetime.now():%Y%m%d-%H%M%S}-{file_id[-8:]}{suffix}"
+        await tg_file.download_to_drive(custom_path=str(dest))
+        try:
+            dest.chmod(0o600)
+        except OSError:
+            pass
+        logger.info("saved incoming image: %s (%s bytes)", dest, dest.stat().st_size)
+        return dest
+    except Exception:
+        logger.warning("could not download an incoming image", exc_info=True)
+        return None
+
+
+def _prune_incoming_media(keep_hours: int = 24) -> None:
+    """Old downloads are deleted on the next one. Without this the directory
+    only ever grows, on a box whose disk nobody is watching."""
+    if not INCOMING_MEDIA_DIR.is_dir():
+        return
+    cutoff = _dt.datetime.now().timestamp() - keep_hours * 3600
+    for f in INCOMING_MEDIA_DIR.iterdir():
+        try:
+            if f.is_file() and f.stat().st_mtime < cutoff:
+                f.unlink()
+        except OSError:
+            pass
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _authorized(update):
         return
@@ -8274,7 +8336,31 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
     if await _handle_server_input(update, context):
         return
-    text = update.message.text or ""
+
+    # An attached image, saved somewhere the model can open. A screenshot with
+    # a caption -- "look at this, which one do I pick?" -- used to match no
+    # handler at all and vanish without a word, which is the worst way for
+    # anything here to fail: the person has no idea whether it arrived.
+    image_path = await _save_incoming_image(update, context)
+    if image_path is not None:
+        _prune_incoming_media()
+
+    text = update.message.text or update.message.caption or ""
+    if image_path is not None:
+        question = text.strip() or _t(_chat_lang(update),
+            "Describe this image and tell me anything notable about it.",
+            "Jelaskan gambar ini dan sebutkan apa saja yang penting di dalamnya.")
+        text = (f"{question}\n\n"
+                f"[The user attached an image. Read it from this path before "
+                f"answering: {image_path}]")
+    elif update.message.photo or update.message.document:
+        # Something WAS attached, and it isn't an image this can pass on.
+        # Say so rather than staying silent.
+        return await update.message.reply_text(_t(_chat_lang(update),
+            "I can read images (a screenshot, a photo), but not this kind of "
+            "attachment. Send it as an image, or describe it in text.",
+            "Saya bisa membaca gambar (screenshot, foto), tapi bukan lampiran "
+            "jenis ini. Kirim sebagai gambar, atau jelaskan dalam teks."))
     if mention_span is not None:
         # Drop the "@botname" itself so the model sees a clean question
         # ("weather today?") rather than the mention as part of the prompt.
@@ -8717,7 +8803,9 @@ def main() -> None:
     app.add_handler(CommandHandler("learned", cmd_learned))
     app.add_handler(CommandHandler("forget", cmd_forget))
     app.add_error_handler(on_error)
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_handler(MessageHandler(
+        (filters.TEXT | filters.PHOTO | filters.Document.ALL) & ~filters.COMMAND,
+        handle_message))
 
     apply_hardening_on_start()
     logger.info("Lite Agent starting (allowed users: %s)", ALLOWED_USER_IDS or "ANY (no allowlist!)")

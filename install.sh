@@ -240,6 +240,7 @@ for f in .env pin.json sessions.json sessions.json.bak spend.jsonl          allo
   fi
 done
 [ -d "$INSTALL_DIR/memory" ] && chmod 700 "$INSTALL_DIR/memory" 2>/dev/null
+[ -d "$INSTALL_DIR/incoming" ] && chmod 700 "$INSTALL_DIR/incoming" 2>/dev/null
 # Credentials the CLIs and rclone keep in $HOME. Never created by this script,
 # but a wrong mode here is worth as much to an attacker as the bot's own files.
 [ -d "$HOME/.ssh" ] && chmod 700 "$HOME/.ssh" 2>/dev/null
