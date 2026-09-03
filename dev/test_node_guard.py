@@ -29,6 +29,8 @@ ends up with a live gate without anyone reading documentation, and that
 "protected" is never reported unless a write was actually attempted with the
 read-only key and actually refused.
 """
+import atexit
+import shutil as _shutil
 import importlib.util, os, shutil, subprocess, sys, tempfile
 from pathlib import Path
 from types import SimpleNamespace
@@ -37,6 +39,11 @@ from unittest.mock import patch
 SRC = sys.argv[1]
 sys.path.insert(0, str(Path(SRC).resolve().parent / "tools"))
 HOME = tempfile.mkdtemp(prefix="isla_guard_")
+# Tests must not litter the machine they run on: 485 stale
+# isla_* directories were found on a real server after a few days
+# of runs. Registered rather than done at the end, so a failing
+# assertion still cleans up.
+atexit.register(_shutil.rmtree, str(HOME), ignore_errors=True)
 os.environ["HOME"] = HOME
 os.environ.setdefault("TELEGRAM_BOT_TOKEN", "t")
 os.environ.setdefault("ALLOWED_USER_IDS", "111")

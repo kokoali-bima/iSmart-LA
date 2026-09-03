@@ -5,6 +5,8 @@ setup_state.json flag the reauth-notice fix (v0.2b.27) already had to clear
 once (agy_signed_in()'s fallback) -- /logout is a second, deliberate way to
 reach that same clean state.
 """
+import atexit
+import shutil as _shutil
 import asyncio, importlib.util, os, sys, tempfile
 from pathlib import Path
 from types import SimpleNamespace
@@ -12,6 +14,11 @@ from unittest.mock import AsyncMock, patch
 
 SRC = sys.argv[1]
 scratch = Path(tempfile.mkdtemp(prefix="isla_logout_"))
+# Tests must not litter the machine they run on: 485 stale
+# isla_* directories were found on a real server after a few days
+# of runs. Registered rather than done at the end, so a failing
+# assertion still cleans up.
+atexit.register(_shutil.rmtree, str(scratch), ignore_errors=True)
 os.environ["HOME"] = str(scratch)
 os.environ.setdefault("TELEGRAM_BOT_TOKEN", "t")
 os.environ.setdefault("ALLOWED_USER_IDS", "111")

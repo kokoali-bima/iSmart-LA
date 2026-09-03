@@ -20,6 +20,8 @@
    one company's group was injected into another company's very next turn.
    Not a feature request; a defect.
 """
+import atexit
+import shutil as _shutil
 import importlib.util, json, os, sys, tempfile
 from pathlib import Path
 from unittest.mock import patch
@@ -27,6 +29,11 @@ from unittest.mock import patch
 SRC = sys.argv[1]
 sys.path.insert(0, str(Path(SRC).resolve().parent / "tools"))
 scratch = Path(tempfile.mkdtemp(prefix="isla_ledger_"))
+# Tests must not litter the machine they run on: 485 stale
+# isla_* directories were found on a real server after a few days
+# of runs. Registered rather than done at the end, so a failing
+# assertion still cleans up.
+atexit.register(_shutil.rmtree, str(scratch), ignore_errors=True)
 os.environ["HOME"] = str(scratch)
 os.environ.setdefault("TELEGRAM_BOT_TOKEN", "t")
 os.environ.setdefault("ALLOWED_USER_IDS", "111")

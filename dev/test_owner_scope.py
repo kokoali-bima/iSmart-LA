@@ -18,6 +18,8 @@ never baked into a conversation's history, so a non-owner continuing the
 owner's own resumed DM can't inherit it, and the owner speaking in a group
 can't leak it there either.
 """
+import atexit
+import shutil as _shutil
 import asyncio, importlib.util, os, sys, tempfile
 from pathlib import Path
 from types import SimpleNamespace
@@ -26,6 +28,11 @@ from unittest.mock import AsyncMock, patch
 SRC = sys.argv[1]
 sys.path.insert(0, str(Path(SRC).resolve().parent / "tools"))
 scratch = Path(tempfile.mkdtemp(prefix="isla_ownerscope_"))
+# Tests must not litter the machine they run on: 485 stale
+# isla_* directories were found on a real server after a few days
+# of runs. Registered rather than done at the end, so a failing
+# assertion still cleans up.
+atexit.register(_shutil.rmtree, str(scratch), ignore_errors=True)
 os.environ["HOME"] = str(scratch)
 os.environ.setdefault("TELEGRAM_BOT_TOKEN", "t")
 os.environ.setdefault("ALLOWED_USER_IDS", "111")

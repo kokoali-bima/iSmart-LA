@@ -5,6 +5,8 @@ _agy_attempt_needs_reauth() is tested against the ACTUAL production log line
 observed on 10.10.63.11 (bscloud) when its Antigravity session died -- not a
 synthetic stand-in -- plus cases that must NOT trigger it (a normal network
 failover, a claude-side failure, success)."""
+import atexit
+import shutil as _shutil
 import asyncio, importlib.util, os, sys, tempfile
 from pathlib import Path
 from types import SimpleNamespace
@@ -12,6 +14,11 @@ from unittest.mock import AsyncMock
 
 SRC = sys.argv[1]
 scratch = Path(tempfile.mkdtemp(prefix="isla_reauth_"))
+# Tests must not litter the machine they run on: 485 stale
+# isla_* directories were found on a real server after a few days
+# of runs. Registered rather than done at the end, so a failing
+# assertion still cleans up.
+atexit.register(_shutil.rmtree, str(scratch), ignore_errors=True)
 os.environ["HOME"] = str(scratch)
 os.environ.setdefault("TELEGRAM_BOT_TOKEN", "t")
 os.environ.setdefault("ALLOWED_USER_IDS", "111")

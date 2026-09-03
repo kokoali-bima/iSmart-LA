@@ -11,6 +11,8 @@ NOT work in group B), the owner override, and permission gating (a plain
 group member can't set/remove a group's PIN, someone from an unregistered
 group can't set one at all).
 """
+import atexit
+import shutil as _shutil
 import asyncio, importlib.util, json, os, shutil, sys, tempfile
 from pathlib import Path
 from types import SimpleNamespace
@@ -42,6 +44,10 @@ def fresh_module(extra_env=None):
     # shared SRC path would have every "fresh" module secretly sharing one
     # real pin.json underneath, each call's writes bleeding into the next.
     scratch = Path(tempfile.mkdtemp(prefix="isla_gpin_"))
+    # Tests must not litter the machine they run on -- 485 stale isla_*
+    # directories turned up on a real server. atexit rather than a call at
+    # the end, so a failing assertion still cleans up.
+    atexit.register(_shutil.rmtree, str(scratch), ignore_errors=True)
     mod_path = scratch / "lite_agent.py"
     shutil.copy(SRC, mod_path)
     os.environ["HOME"] = str(scratch)

@@ -23,12 +23,19 @@ Two consequences, and the second is the serious one:
     purpose, per-group PINs and all -- that is a context leak, not merely a
     billing surprise.
 """
+import atexit
+import shutil as _shutil
 import importlib.util, os, sys, tempfile
 from pathlib import Path
 
 SRC = sys.argv[1]
 sys.path.insert(0, str(Path(SRC).resolve().parent / "tools"))
-os.environ["HOME"] = tempfile.mkdtemp(prefix="isla_iso_")
+_scratch = tempfile.mkdtemp(prefix="isla_iso_")
+# Tests must not litter the machine they run on -- 485 stale isla_*
+# directories turned up on a real server. atexit rather than a call at
+# the end, so a failing assertion still cleans up.
+atexit.register(_shutil.rmtree, _scratch, ignore_errors=True)
+os.environ["HOME"] = _scratch
 os.environ.setdefault("TELEGRAM_BOT_TOKEN", "t")
 os.environ.setdefault("ALLOWED_USER_IDS", "111")
 os.environ["ALLOWED_GROUP_IDS"] = ""

@@ -15,6 +15,8 @@ anything) stands in for "whatever gets added next without a deliberate group
 decision" -- proving the strict fallback (owner AND private DM) still holds
 for anything not explicitly listed, including for the owner themselves.
 """
+import atexit
+import shutil as _shutil
 import asyncio, importlib.util, os, sys, tempfile
 from pathlib import Path
 from types import SimpleNamespace
@@ -22,6 +24,11 @@ from unittest.mock import AsyncMock
 
 SRC = sys.argv[1]
 scratch = Path(tempfile.mkdtemp(prefix="isla_pingroup_"))
+# Tests must not litter the machine they run on: 485 stale
+# isla_* directories were found on a real server after a few days
+# of runs. Registered rather than done at the end, so a failing
+# assertion still cleans up.
+atexit.register(_shutil.rmtree, str(scratch), ignore_errors=True)
 os.environ["HOME"] = str(scratch)
 os.environ.setdefault("TELEGRAM_BOT_TOKEN", "t")
 os.environ.setdefault("ALLOWED_USER_IDS", "111")

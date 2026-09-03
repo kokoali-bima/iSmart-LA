@@ -24,6 +24,8 @@ awkward and in fact breaks the install outright on a root deployment.
 Source inspection, deliberately: these are the files an installer runs, and
 the point is that the shipped artefacts still say what was verified.
 """
+import atexit
+import shutil as _shutil
 import importlib.util
 import os
 import re
@@ -115,6 +117,11 @@ check("the firewall note tells the operator this bot needs NO inbound ports",
 # and the operator would reasonably believe otherwise.
 SRC = sys.argv[1] if len(sys.argv) > 1 else str(ROOT / "lite_agent.py")
 scratch = Path(tempfile.mkdtemp(prefix="isla_unitref_"))
+# Tests must not litter the machine they run on: 485 stale
+# isla_* directories were found on a real server after a few days
+# of runs. Registered rather than done at the end, so a failing
+# assertion still cleans up.
+atexit.register(_shutil.rmtree, str(scratch), ignore_errors=True)
 os.environ["HOME"] = str(scratch)
 os.environ.setdefault("TELEGRAM_BOT_TOKEN", "t")
 os.environ.setdefault("ALLOWED_USER_IDS", "111")
@@ -147,6 +154,39 @@ check("...and nothing was written over the installed unit",
 mod.SERVICE_TEMPLATE = scratch / "missing.template"
 check("a template that isn't in this checkout at all is a clean no-op",
       "no template" in mod.refresh_systemd_unit())
+
+# --- /update also fixes permissions on files an EARLIER version wrote ------
+# UMask=0077 only governs new files. Confirmed on a live deployment that had
+# just updated: sessions.json and spend.jsonl were still 644, world-readable,
+# on an otherwise current install -- because install.sh's sweep only runs when
+# someone re-runs the installer, and nobody re-runs an installer to pick up a
+# permissions fix they were never told they needed.
+check("/update hardens pre-existing state files too, not just new ones",
+      hasattr(mod, "harden_state_files"))
+check("...running right alongside the unit refresh, on the same update",
+      re.search(r"refresh_systemd_unit\(\)[\s\S]{0,200}?harden_state_files\(\)", src) is not None)
+
+if os.name != "nt":
+    mod.BASE_DIR = scratch
+    mod.MEMORY_DIR = scratch / "memory"
+    mod.MEMORY_DIR.mkdir(exist_ok=True)
+    (scratch / "sessions.json").write_text("{}")
+    (scratch / "pin.json").write_text("{}")
+    for f in ("sessions.json", "pin.json"):
+        (scratch / f).chmod(0o644)
+    mod.MEMORY_DIR.chmod(0o755)
+    n = mod.harden_state_files()
+    modes = {f: oct((scratch / f).stat().st_mode)[-3:] for f in ("sessions.json", "pin.json")}
+    check("a world-readable sessions.json is locked to owner-only",
+          modes["sessions.json"] == "600")
+    check("...and pin.json, which holds the PIN salt and hash",
+          modes["pin.json"] == "600")
+    check("...and the per-chat memory directory", oct(mod.MEMORY_DIR.stat().st_mode)[-3:] == "700")
+    check("...and it reports how many it changed", n == 3)
+    check("running it again is a no-op -- nothing left to fix",
+          mod.harden_state_files() == 0)
+else:
+    print("SKIP - POSIX file modes are not meaningful on Windows")
 
 failed = [n for n, ok in results if not ok]
 print(f"\n{len(results) - len(failed)}/{len(results)} passed")

@@ -3,11 +3,18 @@
 content -- the exact bug was Message_too_long from Telegram on those two
 strings, so the test that matters is against the actual content, not a
 synthetic stand-in."""
+import atexit
+import shutil as _shutil
 import importlib.util, os, sys, tempfile
 from pathlib import Path
 
 SRC = sys.argv[1]
 scratch = tempfile.mkdtemp(prefix="isla_help_")
+# Tests must not litter the machine they run on: 485 stale
+# isla_* directories were found on a real server after a few days
+# of runs. Registered rather than done at the end, so a failing
+# assertion still cleans up.
+atexit.register(_shutil.rmtree, str(scratch), ignore_errors=True)
 os.environ["HOME"] = scratch
 os.environ.setdefault("TELEGRAM_BOT_TOKEN", "t")
 os.environ.setdefault("ALLOWED_USER_IDS", "1")

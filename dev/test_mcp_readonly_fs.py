@@ -15,6 +15,8 @@ wrong, and mocking it out would test nothing real. The escape-attempt cases
 that matter most: a "read-only" server that can be walked outside its own
 directory is not read-only in any sense that matters.
 """
+import atexit
+import shutil as _shutil
 import json
 import os
 import subprocess
@@ -66,6 +68,11 @@ class Session:
 
 # --- fixture: a small directory tree with something to escape TOWARD -------
 sandbox = Path(tempfile.mkdtemp(prefix="isla_mcpfs_"))
+# Tests must not litter the machine they run on: 485 stale
+# isla_* directories were found on a real server after a few days
+# of runs. Registered rather than done at the end, so a failing
+# assertion still cleans up.
+atexit.register(_shutil.rmtree, str(sandbox), ignore_errors=True)
 root = sandbox / "root"
 outside = sandbox / "outside"
 root.mkdir()

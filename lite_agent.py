@@ -1879,6 +1879,50 @@ def apply_update() -> tuple[bool, str, str]:
     return True, before, out[:400]
 
 
+# Every file here holds something worth protecting: the PIN's salt and hash,
+# the Telegram token, whole conversations, the Drive OAuth client. UMask=0077
+# in the systemd unit covers files created from NOW on, which is precisely why
+# this exists too -- anything an earlier version wrote keeps the mode it had.
+# Confirmed on a live deployment that had just updated: sessions.json and
+# spend.jsonl were still 644, world-readable, on an otherwise current install.
+HARDEN_600 = (
+    ".env", "pin.json", "sessions.json", "sessions.json.bak", "spend.jsonl",
+    "allowed_groups.json", "servers.json", "schedules.json", "snapshots.json",
+    "setup_state.json", "model_overrides.json", "chat_language.json",
+    "gdrive_room_accounts.json", "gdrive_oauth_client.json", "mcp_servers.json",
+    "MEMORY.md", "OWNER_SCOPE.md",
+)
+
+
+def harden_state_files() -> int:
+    """chmod 600 every secret/state file that already exists, 700 the memory
+    directory. Returns how many were changed -- 0 when there was nothing to
+    do, which is the normal steady state.
+
+    Runs on /update as well as at install: install.sh only executes when
+    someone re-runs it, and nobody re-runs an installer to pick up a
+    permissions fix they were never told they needed.
+    """
+    changed = 0
+    for name in HARDEN_600:
+        path = BASE_DIR / name
+        try:
+            if path.is_file() and (path.stat().st_mode & 0o077):
+                path.chmod(0o600)
+                changed += 1
+        except OSError:
+            logger.warning("could not lock down %s", name, exc_info=True)
+    try:
+        if MEMORY_DIR.is_dir() and (MEMORY_DIR.stat().st_mode & 0o077):
+            MEMORY_DIR.chmod(0o700)
+            changed += 1
+    except OSError:
+        logger.warning("could not lock down the memory directory", exc_info=True)
+    if changed:
+        logger.warning("hardened %d state file(s) to owner-only", changed)
+    return changed
+
+
 SERVICE_UNIT_PATH = Path("/etc/systemd/system/lite-agent.service")
 SERVICE_TEMPLATE = BASE_DIR / "systemd" / "lite-agent.service.template"
 
@@ -3061,6 +3105,27 @@ def run_combo(prompt: str, sess: dict, session_name: str,
 # --------------------------------------------------------------------------
 
 def _authorized(update: Update) -> bool:
+    # A handler with no way to answer must not try. update.message is None for
+    # an edited message, a channel post, and anything else that isn't a plain
+    # new message -- while every command below reaches straight for
+    # update.message.reply_text(), 157 call sites of it. That exact crash is in
+    # this deployment's own logs (cmd_usemodel, "'NoneType' object has no
+    # attribute 'reply_text'"), from an edited /usemodel.
+    #
+    # The callback_query half of this condition is load-bearing, not caution:
+    # all ten button handlers pass through these same gates, and in a
+    # callback update update.message is ALWAYS None (the message hangs off
+    # update.callback_query). Guarding on update.message alone would have
+    # killed every button in the bot -- the PIN keypad, /update, unlock, the
+    # Drive picker -- while looking like a safety improvement.
+    #
+    # v0.2b.46 closed the original trigger by restricting allowed_updates to
+    # ["message", "callback_query"], and that stays the primary defence. This
+    # is the backstop, one comparison wide: the next update type that slips
+    # through degrades into a silently ignored command instead of a traceback.
+    if update.message is None and update.callback_query is None:
+        return False
+
     chat_id = update.effective_chat.id if update.effective_chat else None
     user_id = update.effective_user.id if update.effective_user else None
     # Whole-group authorization: any message from a chat_id in ALLOWED_GROUP_IDS
@@ -4104,6 +4169,27 @@ def _may_run_setup(update: Update) -> bool:
     a team can't fix a broken login while they're away, which is the moment it
     matters most.
     """
+    # A handler with no way to answer must not try. update.message is None for
+    # an edited message, a channel post, and anything else that isn't a plain
+    # new message -- while every command below reaches straight for
+    # update.message.reply_text(), 157 call sites of it. That exact crash is in
+    # this deployment's own logs (cmd_usemodel, "'NoneType' object has no
+    # attribute 'reply_text'"), from an edited /usemodel.
+    #
+    # The callback_query half of this condition is load-bearing, not caution:
+    # all ten button handlers pass through these same gates, and in a
+    # callback update update.message is ALWAYS None (the message hangs off
+    # update.callback_query). Guarding on update.message alone would have
+    # killed every button in the bot -- the PIN keypad, /update, unlock, the
+    # Drive picker -- while looking like a safety improvement.
+    #
+    # v0.2b.46 closed the original trigger by restricting allowed_updates to
+    # ["message", "callback_query"], and that stays the primary defence. This
+    # is the backstop, one comparison wide: the next update type that slips
+    # through degrades into a silently ignored command instead of a traceback.
+    if update.message is None and update.callback_query is None:
+        return False
+
     if _is_owner(update):
         return True
     chat = update.effective_chat
@@ -4125,6 +4211,27 @@ async def _may_authorize_group_action(update: Update, context: ContextTypes.DEFA
     action, so this only decides who may reach that PIN prompt. Used for
     scheduling and for /unlock; the two differ in how long a window /unlock
     grants when it's this path that opened it (see _effective_unlock_cap)."""
+    # A handler with no way to answer must not try. update.message is None for
+    # an edited message, a channel post, and anything else that isn't a plain
+    # new message -- while every command below reaches straight for
+    # update.message.reply_text(), 157 call sites of it. That exact crash is in
+    # this deployment's own logs (cmd_usemodel, "'NoneType' object has no
+    # attribute 'reply_text'"), from an edited /usemodel.
+    #
+    # The callback_query half of this condition is load-bearing, not caution:
+    # all ten button handlers pass through these same gates, and in a
+    # callback update update.message is ALWAYS None (the message hangs off
+    # update.callback_query). Guarding on update.message alone would have
+    # killed every button in the bot -- the PIN keypad, /update, unlock, the
+    # Drive picker -- while looking like a safety improvement.
+    #
+    # v0.2b.46 closed the original trigger by restricting allowed_updates to
+    # ["message", "callback_query"], and that stays the primary defence. This
+    # is the backstop, one comparison wide: the next update type that slips
+    # through degrades into a silently ignored command instead of a traceback.
+    if update.message is None and update.callback_query is None:
+        return False
+
     if _is_owner(update):
         return True
     chat = update.effective_chat
@@ -6552,6 +6659,7 @@ async def _pin_verified(update: Update, context: ContextTypes.DEFAULT_TYPE,
         # should be the one this release ships, or a hardening change would
         # sit in the repo unapplied while the operator believed otherwise.
         logger.warning("systemd unit refresh: %s", refresh_systemd_unit())
+        harden_state_files()
         # --no-block: this process lives inside the unit systemd is about to
         # stop, so a blocking restart would kill the very command issuing it.
         subprocess.Popen(["sudo", "-n", "systemctl", "--no-block", "restart", SERVICE_NAME])

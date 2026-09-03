@@ -24,6 +24,8 @@ adopt the conversation id out of the error payload, which is the only place it
 exists at that point. Without the second, a long first turn that times out
 orphans the conversation and every bit of work it already did.
 """
+import atexit
+import shutil as _shutil
 import importlib.util, os, sys, tempfile
 from pathlib import Path
 from unittest.mock import patch
@@ -31,6 +33,11 @@ from unittest.mock import patch
 SRC = sys.argv[1]
 sys.path.insert(0, str(Path(SRC).resolve().parent / "tools"))
 scratch = Path(tempfile.mkdtemp(prefix="isla_resume_"))
+# Tests must not litter the machine they run on: 485 stale
+# isla_* directories were found on a real server after a few days
+# of runs. Registered rather than done at the end, so a failing
+# assertion still cleans up.
+atexit.register(_shutil.rmtree, str(scratch), ignore_errors=True)
 os.environ["HOME"] = str(scratch)
 os.environ.setdefault("TELEGRAM_BOT_TOKEN", "t")
 os.environ.setdefault("ALLOWED_USER_IDS", "111")

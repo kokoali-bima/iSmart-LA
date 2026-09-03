@@ -3,6 +3,8 @@
 content -- both a fresh (still-placeholder) brief and one /setbrief has
 already filled in, and a re-run to prove it's re-editable, not a one-shot.
 """
+import atexit
+import shutil as _shutil
 import asyncio, importlib.util, os, shutil, sys, tempfile
 from pathlib import Path
 from types import SimpleNamespace
@@ -16,6 +18,11 @@ REPO = Path(sys.argv[2]) if len(sys.argv) > 2 else SRC.parent
 sys.path.insert(0, str(REPO / "tools"))
 
 scratch = Path(tempfile.mkdtemp(prefix="isla_scope_"))
+# Tests must not litter the machine they run on: 485 stale
+# isla_* directories were found on a real server after a few days
+# of runs. Registered rather than done at the end, so a failing
+# assertion still cleans up.
+atexit.register(_shutil.rmtree, str(scratch), ignore_errors=True)
 os.environ["HOME"] = str(scratch)
 os.environ.setdefault("TELEGRAM_BOT_TOKEN", "t")
 os.environ.setdefault("ALLOWED_USER_IDS", "111")

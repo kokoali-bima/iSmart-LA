@@ -1,5 +1,47 @@
 # Changelog
 
+## v0.2b.55 -- findings from a full sweep of the running deployment
+
+Nothing here came from a test failing. All four came from reading the real
+server: its log, its file modes, its /tmp.
+
+**The crash that was actually happening.** Four `AttributeError: 'NoneType'
+object has no attribute 'reply_text'` in cmd_usemodel, in this deployment's own
+log, from an edited /usemodel. v0.2b.46 closed the trigger by restricting
+allowed_updates, and that stays the primary defence -- but 157 call sites still
+reach straight for update.message.reply_text(), so the three shared auth gates
+(_authorized, _may_run_setup, _may_authorize_group_action) now refuse an update
+that offers no way to answer at all.
+
+The first cut of that guard read `if update.message is None: return False`,
+which is the obvious way to write it and **would have killed every button in
+the bot** -- the PIN keypad, /update, unlock, the Drive picker. All ten
+callback handlers pass through those same gates, and in a callback update
+update.message is ALWAYS None; the message hangs off update.callback_query.
+Caught by checking which handlers use the gates before shipping it. The guard
+now requires both to be absent, and a test asserts the naive form is not
+present anywhere.
+
+**Permissions fixed on update, not only on install.** A deployment that had
+just updated still had sessions.json and spend.jsonl at 644 -- world-readable
+conversation state and token history -- because UMask=0077 only governs files
+created from then on, and install.sh's sweep only runs when someone re-runs the
+installer. Nobody re-runs an installer for a permissions fix they were never
+told they needed. harden_state_files() now runs on /update, beside the unit
+refresh, and reports how many it changed.
+
+**Tests stopped littering.** 485 stale isla_* directories on the server, from
+suites calling tempfile.mkdtemp() and never cleaning up. All 26 now register
+cleanup with atexit, so a failing assertion still tidies up. Verified: a full
+run leaves zero behind.
+
+**Also checked and clean:** no stray MCP registrations in agy, no leftover
+scratch units, the service active with 0 restarts, and zero errors since it
+restarted onto the current version.
+
+Full suite: **484/484 across 26 suites** on the real Linux target.
+
+
 ## v0.2b.54 -- Drive sign-in is a URL and a code now, not a terminal
 
 The one part of setup that still needed a machine other than this one. Every

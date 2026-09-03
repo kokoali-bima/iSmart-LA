@@ -22,6 +22,8 @@ the mention specifically because that is exactly the kind of case that once
 produced a wrong "offsets don't line up" result in this project's own live
 diagnostic script (see CHANGELOG), from naively slicing by codepoint index.
 """
+import atexit
+import shutil as _shutil
 import asyncio, importlib.util, os, sys, tempfile
 from pathlib import Path
 from types import SimpleNamespace
@@ -30,6 +32,11 @@ from unittest.mock import AsyncMock, patch
 SRC = sys.argv[1]
 sys.path.insert(0, str(Path(SRC).resolve().parent / "tools"))
 scratch = Path(tempfile.mkdtemp(prefix="isla_mention_"))
+# Tests must not litter the machine they run on: 485 stale
+# isla_* directories were found on a real server after a few days
+# of runs. Registered rather than done at the end, so a failing
+# assertion still cleans up.
+atexit.register(_shutil.rmtree, str(scratch), ignore_errors=True)
 os.environ["HOME"] = str(scratch)
 os.environ.setdefault("TELEGRAM_BOT_TOKEN", "t")
 os.environ.setdefault("ALLOWED_USER_IDS", "111")

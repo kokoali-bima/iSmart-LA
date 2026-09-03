@@ -28,6 +28,8 @@ connected twice, verifies the connection with a real listing before calling
 it done, and rolls back cleanly on any failure so nothing is left
 half-configured. All of it logged with who did it and when.
 """
+import atexit
+import shutil as _shutil
 import asyncio, importlib.util, json, os, sys, tempfile
 from pathlib import Path
 from types import SimpleNamespace
@@ -35,7 +37,12 @@ from unittest.mock import AsyncMock, patch
 
 SRC = sys.argv[1]
 sys.path.insert(0, str(Path(SRC).resolve().parent / "tools"))
-os.environ["HOME"] = tempfile.mkdtemp(prefix="isla_gdriveconnect_")
+_scratch = tempfile.mkdtemp(prefix="isla_gdriveconnect_")
+# Tests must not litter the machine they run on -- 485 stale isla_*
+# directories turned up on a real server. atexit rather than a call at
+# the end, so a failing assertion still cleans up.
+atexit.register(_shutil.rmtree, _scratch, ignore_errors=True)
+os.environ["HOME"] = _scratch
 os.environ.setdefault("TELEGRAM_BOT_TOKEN", "t")
 os.environ.setdefault("ALLOWED_USER_IDS", "111")
 os.environ["ALLOWED_GROUP_IDS"] = ""

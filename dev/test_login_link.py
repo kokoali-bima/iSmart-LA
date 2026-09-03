@@ -25,6 +25,8 @@ IS testable here: no launchable link construct is present at all, the raw URL
 inside the <code> block is exactly the original once HTML-unescaped, and it
 appears nowhere else unlinked/differently-formed in the message.
 """
+import atexit
+import shutil as _shutil
 import asyncio, importlib.util, os, re, sys, tempfile
 from pathlib import Path
 from types import SimpleNamespace
@@ -32,6 +34,11 @@ from unittest.mock import AsyncMock, patch
 
 SRC = sys.argv[1]
 scratch = Path(tempfile.mkdtemp(prefix="isla_link_"))
+# Tests must not litter the machine they run on: 485 stale
+# isla_* directories were found on a real server after a few days
+# of runs. Registered rather than done at the end, so a failing
+# assertion still cleans up.
+atexit.register(_shutil.rmtree, str(scratch), ignore_errors=True)
 os.environ["HOME"] = str(scratch)
 os.environ.setdefault("TELEGRAM_BOT_TOKEN", "t")
 os.environ.setdefault("ALLOWED_USER_IDS", "111")
