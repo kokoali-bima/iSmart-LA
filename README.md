@@ -27,6 +27,75 @@ the smallest possible layer on top -- a Telegram relay, per-chat session bookkee
 and a manual (never automatic) memory file. Nothing in this codebase decides on its own
 to re-run, review, or "improve" a past turn.
 
+## Features
+
+What it actually does, at a glance -- details and full command reference are further
+down, this is the map.
+
+**Cost that's measured, not guessed**
+- Four fixed-price tiers, cheapest first, automatic failover -- no per-token API bill on
+  either side (see [Architecture](#architecture)).
+- `/spend [days]` reads a real per-turn token ledger straight from disk, **0 model
+  tokens** -- including tokens burned by a tier that failed before another answered,
+  a number that used to only be reachable by reading log prose one line at a time.
+- An optional hard ceiling on what a single turn may burn across the whole chain
+  (`TURN_TOKEN_CEILING`), off by default until you've actually measured your own
+  traffic with `/spend` -- a number picked before measuring would either never fire
+  or kill real work.
+
+**Change access that's really gated, not just asked nicely**
+- Read-only by default. A destructive command needs a time-boxed `/unlock` window,
+  opened with a PIN entered on an inline keypad -- the digits never appear as chat
+  text, so nothing sensitive sits in message history.
+- On the machines it manages, the agent's own SSH key is swapped for a locked-down
+  one outside that window, enforced by `command=` in `authorized_keys` on the far
+  end -- an **allowlist** of read-only verbs, not a denylist of dangerous ones,
+  so something spelled a way nobody anticipated is refused, not silently permitted.
+- A VM change gets a snapshot first, taken by the bot itself before access opens --
+  never left as an instruction the model might skip.
+
+**Built for more than one team on one deployment**
+- Every registered group can carry its **own** PIN, independent of the owner's
+  master one -- multiple companies can share one deployment without sharing a
+  secret.
+- `/remember`'s memory is **per chat** -- a fact saved in one group's chat is never
+  injected into another chat's next turn.
+- The owner alone can grant themselves extra scope that applies **only** in their
+  own private DM, never in any group even when they're the one typing there
+  (`/setownerscope`).
+
+**Learns about your infrastructure -- inside a boundary it cannot edit**
+- The agent can record durable facts about the environment it's managing (a working
+  tool invocation, a corrected topology, a naming convention) as it works, so the
+  next conversation starts already knowing them -- but only ever by *appending*
+  through one narrow, code-enforced channel. The rules above that line -- what must
+  never be touched -- are never something the model can rewrite, however it's asked.
+- `/graduate` turns a case just solved into a reusable script that costs **0 tokens**
+  to run again -- always triggered by a human once, never something the agent
+  decides on its own is worth saving.
+
+**Reports don't have to stay in the chat**
+- The agent can write a file and hand it back through Telegram, or -- see
+  [Google Drive](#google-drive-optional) -- drop it straight into a shared folder,
+  connected the same explicit, Telegram-driven way as everything else here.
+
+**Stays out of the way when nothing's wrong**
+- `/status`, `/providers`, `/servers`, `/schedules`, `/boundaries`, `/snapshots`,
+  `/tools` -- all **0 model tokens**, answered straight from a script or a file.
+- Self-updates on your say-so: `/update` shows what changed and asks before
+  installing, and if the new code doesn't even compile, the update rolls itself
+  back automatically rather than leaving the bot dead.
+- Bilingual replies (`/lang en` / `/lang id`), per chat, independently.
+
+**What this buys you over a full agent framework**
+Tried that route first, on the same infrastructure this bot now manages, before
+building this (the ~900,000-token incident above is from that attempt) -- and beyond
+that one incident, the same 7-node benchmark task cost **3.5x more** there than it
+costs here, on ordinary turns with nothing going wrong. iSmart-LA's answer isn't a
+smarter loop -- it's **no loop**: every token spent is because a human asked for
+something, right now, enforced by what's absent from this codebase, not by a setting
+that could drift back on.
+
 ## Architecture
 
 ```
