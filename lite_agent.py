@@ -66,6 +66,7 @@ from typing import Optional
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.error import BadRequest, NetworkError, TimedOut
+from telegram.request import HTTPXRequest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "tools"))
 from cli_login import LoginHandle, tmux_available  # noqa: E402
@@ -7466,15 +7467,27 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
         target = _msg(update)
         if target is not None:
             lang = _chat_lang(update)
-            try:
-                await target.reply_text(_t(lang,
-                    "⚠️ Something went wrong handling that. It is logged -- "
-                    "try again, and if it keeps happening the logs will say why.",
-                    "⚠️ Ada yang salah waktu memproses itu. Sudah tercatat di log -- "
-                    "coba lagi, dan kalau terus terjadi, log-nya akan menunjukkan sebabnya.",
-                ))
-            except Exception:
-                logger.warning("could not even deliver the error notice", exc_info=True)
+            # Retry once, same principle as the main turn's own delivery loop:
+            # a transient network blip talking to Telegram (this notice exists
+            # BECAUSE of one) must not also swallow the notice itself. Found
+            # live: a plain command reply (e.g. /new) failing with
+            # httpcore.ReadTimeout is the single most common reason this
+            # handler runs at all, so it is exactly the failure mode this
+            # retry needs to survive.
+            for attempt in (1, 2):
+                try:
+                    await target.reply_text(_t(lang,
+                        "⚠️ Something went wrong handling that. It is logged -- "
+                        "try again, and if it keeps happening the logs will say why.",
+                        "⚠️ Ada yang salah waktu memproses itu. Sudah tercatat di log -- "
+                        "coba lagi, dan kalau terus terjadi, log-nya akan menunjukkan sebabnya.",
+                    ))
+                    break
+                except Exception:
+                    if attempt == 1:
+                        await asyncio.sleep(2)
+                    else:
+                        logger.warning("could not even deliver the error notice", exc_info=True)
 
 
 def main() -> None:
@@ -7528,8 +7541,24 @@ def main() -> None:
     # Without concurrent_updates the guards above are moot: python-telegram-bot
     # hands updates to handlers strictly one at a time by default, so a long
     # turn would still stall every other chat and every zero-token command.
+    #
+    # request: PTB's own HTTPXRequest defaults to a 5-second read/connect/write
+    # timeout and a 1-second pool timeout -- checked directly against the
+    # installed library, not assumed. That is tight for any link with real
+    # jitter, and confirmed live: a run of `httpcore.ReadTimeout` (14 of them
+    # in about an hour, every single one on a plain command reply like /new or
+    # /usemodel, none on the turns that actually reached a model) surfaced as
+    # "unhandled error while processing an update" -- the reply the user was
+    # waiting for was already composed and simply never made it out. Raised
+    # here rather than wrapping some subset of the 130+ reply_text call sites
+    # individually, since the timeout applies to every outgoing Bot API call
+    # this process makes, in one place.
+    request = HTTPXRequest(
+        connect_timeout=20.0, read_timeout=20.0, write_timeout=20.0, pool_timeout=10.0,
+    )
     app = (Application.builder()
            .token(TELEGRAM_BOT_TOKEN)
+           .request(request)
            .post_init(_announce_update)
            .concurrent_updates(True)
            .build())

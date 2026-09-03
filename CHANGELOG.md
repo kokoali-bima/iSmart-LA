@@ -1,5 +1,56 @@
 # Changelog
 
+## v0.2b.50 -- Telegram network timeouts were too tight for this link
+
+Asked directly why so many commands were erroring last night. The screenshot
+showed a generic "ada yang salah" notice on `/usemodel`, right after a real
+Claude Opus turn had just answered fine seconds earlier -- not a permission
+problem, not a logic bug, something intermittent.
+
+The journal for that window told the real story: **14 separate** "unhandled
+error while processing an update" entries in about an hour, every single one
+the same chain:
+
+    httpcore.ReadTimeout
+    ...
+    telegram.error.TimedOut: Timed out
+      File "lite_agent.py", line 3249, in cmd_new
+        await update.message.reply_text(...)
+
+and the same shape on `/usemodel`, `/spend`, and others -- always a plain
+command reply, never a turn that actually reached a model (those already
+retry once on delivery, see v0.2b.24-era code). The command had already done
+its work; the reply back to Telegram was what timed out.
+
+Root cause, checked directly against the installed library rather than
+assumed:
+
+    >>> HTTPXRequest.__init__ defaults
+    connect_timeout=5.0  read_timeout=5.0  write_timeout=5.0  pool_timeout=1.0
+
+Five seconds is tight for any link with real jitter, and this deployment's
+network has shown exactly that kind of jitter before. Nothing in this project
+had ever configured these -- every outgoing Bot API call ran on
+python-telegram-bot's own defaults.
+
+Fixed at the one place that governs every such call, not by wrapping some
+subset of the 130+ raw `update.message.reply_text` sites individually: an
+`HTTPXRequest` with `connect_timeout=20, read_timeout=20, write_timeout=20,
+pool_timeout=10` is now handed to `Application.builder().request(...)`.
+
+Also hardened `on_error` itself -- the last-resort notice telling the user
+something broke now retries once too, since a network blip is exactly why
+that handler runs in the first place, and it must not also swallow the notice
+about itself.
+
+New: `dev/test_network_timeouts.py`, 14 tests, pure AST/source inspection
+(no server or `telegram` import needed). Verified it fails against the
+pre-fix source on 8 of its 10 structural checks, and passes clean on the
+fixed one.
+
+Full suite: **339/339 across 20 suites.**
+
+
 ## v0.2b.49 -- the cost claim becomes a measurement, and memory stops leaking between chats
 
 Four gaps an external review named, all closed in one release because they
