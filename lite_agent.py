@@ -55,6 +55,9 @@ import functools
 import datetime as _dt
 import hashlib
 import hmac
+import tempfile
+import shutil
+import getpass
 import json
 import logging
 import os
@@ -1856,6 +1859,109 @@ def apply_update() -> tuple[bool, str, str]:
         logger.error("update rolled back -- new code does not compile: %s", check.stderr[:400])
         return False, before, "the new version does not compile; rolled back"
     return True, before, out[:400]
+
+
+SERVICE_UNIT_PATH = Path("/etc/systemd/system/lite-agent.service")
+SERVICE_TEMPLATE = BASE_DIR / "systemd" / "lite-agent.service.template"
+
+
+def refresh_systemd_unit() -> str:
+    """Re-render the installed systemd unit from the template in the repo.
+
+    /update fast-forwards the checkout, but the unit systemd actually runs was
+    copied to /etc at install time and is never touched again -- so a release
+    that hardens the unit (v0.2b.52 did: 9.6 UNSAFE -> 5.8 MEDIUM) would land
+    the new template in the repo while the service kept running unhardened,
+    and the operator would reasonably believe otherwise. That gap is the whole
+    reason this exists.
+
+    Returns a short status string for the log/reply. Best-effort throughout: a
+    failure here must never block an update that has already succeeded, so
+    every path returns rather than raises.
+
+    Safety: the rendered unit is checked BEFORE it replaces anything, and the
+    previous unit is kept and restored if the install goes wrong -- a broken
+    unit means a bot that cannot come back up at all, which is far worse than
+    an unhardened one.
+    """
+    if not SERVICE_TEMPLATE.exists():
+        return "no template in this checkout"
+    try:
+        rendered = (SERVICE_TEMPLATE.read_text()
+                    .replace("__INSTALL_USER__", getpass.getuser())
+                    .replace("__INSTALL_DIR__", str(BASE_DIR))
+                    .replace("__INSTALL_HOME__", str(Path.home())))
+    except OSError:
+        logger.warning("could not read the unit template", exc_info=True)
+        return "template unreadable"
+
+    try:
+        current = SERVICE_UNIT_PATH.read_text()
+    except OSError:
+        current = ""
+    if current.strip() == rendered.strip():
+        return "unchanged"
+
+    # systemd-analyze verify refuses a path that isn't a valid unit FILENAME
+    # ("Failed to prepare filename ...: Invalid argument"), so the candidate
+    # cannot just be a dotfile next to the code -- it needs the real unit name
+    # in a directory of its own. Found by testing: with a dotfile name the
+    # verification failed every time, which would have made this whole
+    # refresh a silent no-op.
+    staging = Path(tempfile.mkdtemp(prefix="isla_unit_"))
+    tmp = staging / SERVICE_UNIT_PATH.name
+    try:
+        tmp.write_text(rendered)
+        # Two checks, because neither alone is enough -- both measured, not
+        # assumed:
+        #
+        # Our own structural check first. `systemd-analyze verify` does NOT
+        # catch a malformed unit: fed a file containing an invented directive
+        # it exits 0 quite happily. So it cannot be the thing standing between
+        # a bad render and a bot that never comes back.
+        if "[Service]" not in rendered or "\nExecStart=" not in rendered:
+            logger.error("refusing to install a unit missing [Service]/ExecStart")
+            return "new unit looks malformed, kept the old one"
+
+        # Then verify, for the one thing it IS good at here: it exits 1 when
+        # ExecStart names a binary that does not exist. That is exactly the
+        # failure mode a path-substituting renderer like this one can create,
+        # so it earns its place -- just not under the name "parse check".
+        verify = subprocess.run(["systemd-analyze", "verify", str(tmp)],
+                                capture_output=True, text=True, timeout=30)
+        if verify.returncode != 0:
+            logger.error("refusing to install a unit whose ExecStart does not "
+                         "resolve: %s", (verify.stderr or "")[:300])
+            return "new unit failed verification, kept the old one"
+
+        backup = rendered_backup = None
+        if current:
+            backup = BASE_DIR / ".lite-agent.service.bak"
+            backup.write_text(current)
+            rendered_backup = str(backup)
+
+        install = subprocess.run(
+            ["sudo", "-n", "cp", str(tmp), str(SERVICE_UNIT_PATH)],
+            capture_output=True, text=True, timeout=30)
+        if install.returncode != 0:
+            logger.warning("could not install the refreshed unit: %s",
+                           (install.stderr or "")[:200])
+            return "could not write the unit (needs sudo)"
+
+        reload_ = subprocess.run(["sudo", "-n", "systemctl", "daemon-reload"],
+                                 capture_output=True, text=True, timeout=30)
+        if reload_.returncode != 0 and rendered_backup:
+            subprocess.run(["sudo", "-n", "cp", rendered_backup, str(SERVICE_UNIT_PATH)],
+                           capture_output=True, timeout=30)
+            logger.error("daemon-reload failed, restored the previous unit")
+            return "daemon-reload failed, previous unit restored"
+        logger.warning("systemd unit refreshed from template")
+        return "refreshed"
+    except (OSError, subprocess.SubprocessError):
+        logger.warning("unit refresh failed", exc_info=True)
+        return "unit refresh failed"
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
 
 
 def _read_update_state() -> dict:
@@ -6036,6 +6142,10 @@ async def _pin_verified(update: Update, context: ContextTypes.DEFAULT_TYPE,
             f"\u2705 Terupdate ke <b>{_tg_escape(new_version)}</b>. Restart\u2026",
         ), parse_mode="HTML")
         logger.warning("UPDATE applied %s -> %s, restarting", before[:12], new_version)
+        # Before the restart, not after: the unit systemd is about to load
+        # should be the one this release ships, or a hardening change would
+        # sit in the repo unapplied while the operator believed otherwise.
+        logger.warning("systemd unit refresh: %s", refresh_systemd_unit())
         # --no-block: this process lives inside the unit systemd is about to
         # stop, so a blocking restart would kill the very command issuing it.
         subprocess.Popen(["sudo", "-n", "systemctl", "--no-block", "restart", SERVICE_NAME])

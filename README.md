@@ -7,7 +7,7 @@ A report doesn't have to stop at the chat: it can land straight in a shared
 [Google Drive](#google-drive-optional) folder too, connected the same explicit way as
 everything else here -- through Telegram, not a config file.
 
-> **Status: v0.2b.52 -- early/beta.** Built and battle-tested against a real production
+> **Status: v0.2b.53 -- early/beta.** Built and battle-tested against a real production
 > Proxmox VE cluster over several days of iteration, including a live-fire test of the
 > unlock/PIN/snapshot flow against real infrastructure. Works well; still has known
 > rough edges (see [Known limitations](#known-limitations)).
@@ -639,9 +639,14 @@ CLIs and does not (a real Claude turn *and* a real agy turn both completed
 under it, so it is enabled), while `ProtectHome` was assumed merely awkward and
 in fact breaks the install.
 
-Existing deployments get this by re-running `./install.sh` (it is idempotent),
-or `sudo systemctl daemon-reload && sudo systemctl restart lite-agent` after
-an `/update` that brings the new unit file.
+**Existing deployments get it from `/update`.** The unit systemd actually runs
+is the copy in `/etc/systemd/system`, not the template in the repo, so
+`/update` re-renders and reinstalls it before restarting -- otherwise a
+release that hardens the unit would land in the checkout while the service
+kept running unprotected, and you would have no way to tell. If the render
+comes out malformed, or `daemon-reload` fails, the previous unit is restored
+rather than leaving a bot that cannot come back up. Re-running `./install.sh`
+does the same thing and is safe to repeat.
 
 ### Updating (`/update`)
 

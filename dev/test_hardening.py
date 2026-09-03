@@ -24,9 +24,15 @@ awkward and in fact breaks the install outright on a root deployment.
 Source inspection, deliberately: these are the files an installer runs, and
 the point is that the shipped artefacts still say what was verified.
 """
+import importlib.util
+import os
 import re
+import subprocess
 import sys
+import tempfile
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parent.parent
 UNIT = ROOT / "systemd" / "lite-agent.service.template"
@@ -101,6 +107,46 @@ check("...and the per-chat memory directory", "chmod 700" in install)
 check("...and ~/.ssh", ".ssh" in install)
 check("the firewall note tells the operator this bot needs NO inbound ports",
       "ufw" in install and ("inbound" in install.lower() or "incoming" in install.lower()))
+
+# --- the unit actually RUNNING gets refreshed, not just the one in the repo -
+# /update fast-forwards the checkout, but the unit systemd runs was copied to
+# /etc at install time. Without this, a release that hardens the unit lands
+# the new template in the repo while the service keeps running unhardened --
+# and the operator would reasonably believe otherwise.
+SRC = sys.argv[1] if len(sys.argv) > 1 else str(ROOT / "lite_agent.py")
+scratch = Path(tempfile.mkdtemp(prefix="isla_unitref_"))
+os.environ["HOME"] = str(scratch)
+os.environ.setdefault("TELEGRAM_BOT_TOKEN", "t")
+os.environ.setdefault("ALLOWED_USER_IDS", "111")
+os.environ["ALLOWED_GROUP_IDS"] = ""
+sys.path.insert(0, str(Path(SRC).resolve().parent / "tools"))
+spec = importlib.util.spec_from_file_location("la_h", SRC)
+mod = importlib.util.module_from_spec(spec)
+sys.modules["la_h"] = mod
+spec.loader.exec_module(mod)
+
+check("/update refreshes the installed systemd unit, not only the repo copy",
+      hasattr(mod, "refresh_systemd_unit"))
+
+src = Path(SRC).read_text(encoding="utf-8")
+check("...and it runs BEFORE the restart, so systemd loads the new unit",
+      re.search(r"refresh_systemd_unit\(\)[\s\S]{0,600}?sudo.{0,40}systemctl", src) is not None)
+
+# A template with no [Service]/ExecStart must be refused. This is OUR check:
+# `systemd-analyze verify` was measured to exit 0 on a unit containing an
+# invented directive, so it cannot be what stands between a bad render and a
+# bot that never comes back.
+mod.SERVICE_TEMPLATE = scratch / "bad.template"
+mod.SERVICE_UNIT_PATH = scratch / "fake.service"
+mod.SERVICE_TEMPLATE.write_text("[Unit]\nDescription=no service section\n")
+check("a malformed template is refused rather than installed",
+      "malformed" in mod.refresh_systemd_unit())
+check("...and nothing was written over the installed unit",
+      not mod.SERVICE_UNIT_PATH.exists())
+
+mod.SERVICE_TEMPLATE = scratch / "missing.template"
+check("a template that isn't in this checkout at all is a clean no-op",
+      "no template" in mod.refresh_systemd_unit())
 
 failed = [n for n, ok in results if not ok]
 print(f"\n{len(results) - len(failed)}/{len(results)} passed")

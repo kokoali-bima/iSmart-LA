@@ -1,5 +1,40 @@
 # Changelog
 
+## v0.2b.53 -- /update now refreshes the systemd unit it actually runs
+
+v0.2b.52 shipped a hardened systemd unit, and would have left almost every
+existing deployment unhardened while telling its operator otherwise. /update
+fast-forwards the checkout; the unit systemd actually loads was copied to
+/etc/systemd/system at install time and was never touched again. So the new
+template landed in the repo, the service kept running the old unprotected
+unit, and nothing said so.
+
+`refresh_systemd_unit()` now runs as part of /update, before the restart, so
+systemd loads the unit this release ships. It renders the template with the
+same substitutions install.sh uses (taken from the running process: its own
+user, BASE_DIR, home), does nothing at all when the result matches what is
+already installed, and keeps a backup it restores if daemon-reload fails.
+Best-effort throughout -- a failure here is logged, never allowed to block an
+update that already succeeded.
+
+Two things found by testing it rather than trusting it:
+
+- `systemd-analyze verify` refuses a candidate file that isn't named like a
+  real unit ("Failed to prepare filename ...: Invalid argument"). The first
+  version staged the render as a dotfile beside the code, so verification
+  failed every single time and the whole refresh would have been a silent
+  no-op. It now stages in a temp directory under the real unit name.
+- `systemd-analyze verify` does NOT catch a malformed unit. Fed a file
+  containing an invented directive it exits 0 quite happily; it exits 1 for a
+  missing ExecStart binary. So it cannot be what stands between a bad render
+  and a bot that never comes back. There is now a structural check of our own
+  ([Service] and ExecStart present) ahead of it, and verify is kept for the
+  one thing it genuinely does here -- catching a path substitution that
+  produced an ExecStart pointing at nothing.
+
+Full suite: **428/428 across 24 suites** on the real Linux target.
+
+
 ## v0.2b.52 -- MCP support, and hardening that ships with the install
 
 Two of the three remaining review items, both finished the same way: verify
