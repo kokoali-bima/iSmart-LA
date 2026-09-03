@@ -32,6 +32,7 @@ model_overrides.json
 chat_language.json
 gdrive_room_accounts.json
 gdrive_oauth_client.json
+.lite-agent.service.bak
 update_state.json
 update_announce.json
 spend.jsonl

@@ -7,7 +7,7 @@ A report doesn't have to stop at the chat: it can land straight in a shared
 [Google Drive](#google-drive-optional) folder too, connected the same explicit way as
 everything else here -- through Telegram, not a config file.
 
-> **Status: v0.2b.56 -- early/beta.** Built and battle-tested against a real production
+> **Status: v0.2b.57 -- early/beta.** Built and battle-tested against a real production
 > Proxmox VE cluster over several days of iteration, including a live-fire test of the
 > unlock/PIN/snapshot flow against real infrastructure. Works well; still has known
 > rough edges (see [Known limitations](#known-limitations)).
@@ -335,6 +335,7 @@ Ollama, say), since something has to translate between protocols.
 | `/rmmcp <name>` | owner/admin | Withdraw one (no PIN -- it only reduces capability) |
 | `/mcpservers` | **0 tokens** | What MCP servers are registered |
 | `/gdrivestatus` | **0 tokens** | Is each connected Drive account still working? |
+| `/gdrive` (disconnect) | owner/admin | Same card also disconnects an account: revokes access at Google, deletes the local token, deletes nothing in Drive |
 | `/gdrive` | owner/admin, **0 tokens** | Pick (or show) which connected Drive account this room uploads to |
 | `/lang` (or `/language`) | owner/admin, **0 tokens** | Set/show this chat's language for the bot's own fixed replies (`en`/`id`) |
 | `/mode` | **0 tokens** | Read-only right now, or able to change things? |

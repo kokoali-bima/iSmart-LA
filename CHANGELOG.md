@@ -1,5 +1,49 @@
 # Changelog
 
+## v0.2b.57 -- disconnect a Drive account from Telegram, and an alphabetical /help
+
+**`/gdrive` can now disconnect an account.** Prompted by an operator finding an
+account connected that they did not remember adding, with no way to remove it
+except editing rclone.conf on the host by hand.
+
+The care here is about one distinction: "remove the account" reads just as
+naturally as "delete my files", and only one of those readings is
+recoverable. So this revokes the agent's ACCESS and touches nothing in Drive
+itself -- the confirmation card says so in as many words, and a test asserts
+that wording is actually present rather than trusting it stays.
+
+What it does: revokes the grant at Google (a real logout, not just forgetting
+the token locally -- otherwise a leaked config file still holds live access),
+deletes the rclone remote through rclone's own config API, and unsets any room
+that pointed at it, since a room aimed at a deleted remote would otherwise
+quietly fall back to whichever account happens to be first. If Google cannot be
+reached the local removal still happens, and the reply says the grant was NOT
+revoked rather than claiming a logout that did not occur.
+
+Verified against real rclone v1.75.0 in an isolated config, not only mocks:
+the token was read back correctly, the revoke was posted with it, and the
+remote was genuinely gone from the file afterwards.
+
+**`/help` is alphabetical, and complete.** 48 commands in the order they
+happened to be written is a list you have to read end to end. Sorted as one
+flat A-Z run rather than regrouped into categories -- a category is another
+thing to guess at, and the point is finding a half-remembered name without
+knowing where it belongs. Eight commands were missing entirely and are now
+listed: /addmcp, /chatid, /gdrivestatus, /mcpservers, /registergroup, /rmmcp,
+/secure, /unregistergroup. Still splits cleanly into 3 messages under
+Telegram's 4096-character limit, with content intact.
+
+**A stale claim in /help, corrected.** It still told group members that
+`/remember` is "GLOBAL across every chat" -- wrong since v0.2b.49 made memory
+per-chat, and wrong in the direction that matters: it described other rooms as
+able to read facts saved here.
+
+Also: `.lite-agent.service.bak` (written by the unit refresh) added to
+.gitignore.
+
+Full suite: **516/516 across 27 suites** on the real Linux target.
+
+
 ## v0.2b.56 -- hardening applies itself at startup, not only during /update
 
 The operator updated to v0.2b.55 and neither the unit refresh (v0.2b.53) nor

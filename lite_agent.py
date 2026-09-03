@@ -5502,46 +5502,54 @@ Every message is tried through 4 tiers, cheapest first:
 Every reply ends with a "— by ..." tag. If it's ever NOT "{TIERS[0]['label']}", that's a signal something upstream is having trouble (rate limit, auth, etc) -- useful for keeping an eye on system health at a glance.
 
 *Available commands*
-/status — instant status check, ZERO tokens (straight from a script, not a model)
-/tools — list of skills already turned into scripts, ZERO tokens
+/addboundary <rule> — add a rule the agent may NEVER break (run it alone to see what that means)
+/addmcp <name> <command> [args...] — register an MCP server, giving the agent new tools (PIN); run it bare for a ready-to-use example
+/addserver — register a new machine, step by step
+/adopt — bring pre-existing cron entries under management
+/agentstatus — live check: is each AI tier actually up right now?
+/boundaries — what the agent must never do (0 tokens)
+/cancel — abort a multi-step form (/start, /addserver)
+/chatid — show this chat's ID, for group access setup (no auth needed)
+/connectgdrive — connect a new Drive account, through Telegram (owner anywhere, or a registered group's own admin)
+/forget <number> — delete one wrong learned fact (numbers come from /learned)
+/gdrive — pick (or show) which connected Drive account this room uploads to (0 tokens)
+/gdrivestatus — is each connected Drive account still working? (0 tokens)
 /graduate <name> — turn the case you JUST solved into a reusable script (free to reuse afterward)
+/help — this guide (choose EN or ID)
+/lang [en|id] — set/show this chat's language for the bot's own fixed replies (0 tokens)
+/learned — see what the agent figured out about this environment BY ITSELF
+/lock — close that window early
+/logout — clear a sign-in (Gemini or Claude) so the next /start is a genuinely fresh one
+/mcpservers — what MCP servers are registered (0 tokens)
+/memory — view memory: this chat's own facts, plus the shared base
+/mode — read-only right now, or able to make changes? (0 tokens)
 /new — restart the ACTIVE session from scratch (conversation history reset, MEMORY.md untouched)
+/providers — which AI tiers are configured and which are healthy (0 tokens)
+/registergroup — open this group to every member (group admin only)
+/remember <fact> — save a fact PERMANENTLY for THIS CHAT, read in EVERY session & EVERY tier, even after many /new
+/removeserver <name> — unregister one
+/rmboundary <n> — remove one (PIN)
+/rmgrouppin — remove this group's own PIN, falls back to the owner's (owner or this group's admin)
+/rmmcp <name> — withdraw an MCP server (no PIN: it only reduces what the agent can do)
+/schedules — everything that runs on a timer, and what it does (0 tokens)
+/secure <server> — install the read-only guard on a registered machine and retire any older key
+/servers — machines the agent may reach (0 tokens)
 /session <name> — create/switch to a named session, for keeping different cases separate
 /sessions — list all saved sessions
-/remember <fact> — save a fact PERMANENTLY for THIS CHAT, read in EVERY session & EVERY tier, even after many /new
-/spend [days] — what this deployment actually spent, straight from the ledger (0 tokens)
-/memory — view memory: this chat's own facts, plus the shared base
-/schedules — everything that runs on a timer, and what it does (0 tokens)
-/unschedule <name> — remove a scheduled task
-/adopt — bring pre-existing cron entries under management
-/setpin — set/change the OWNER's PIN, works everywhere (entered on a keypad, never typed in chat)
-/setgrouppin — set/change THIS group's own PIN (owner or this group's admin, run inside the group)
-/rmgrouppin — remove this group's own PIN, falls back to the owner's (owner or this group's admin)
-/update — check GitHub for a newer version and install it (PIN)
 /setbrief <what it looks after> — set the one-line environment brief
-/setscope <kind of assistant> — change the role itself, e.g. beyond infrastructure-only
+/setgrouppin — set/change THIS group's own PIN (owner or this group's admin, run inside the group)
 /setownerscope <extra text> — extra scope for YOU only, in YOUR DM only (owner-only)
-/logout — clear a sign-in (Gemini or Claude) so the next /start is a genuinely fresh one
-/boundaries — what the agent must never do (0 tokens)
-/addboundary <rule> — add a rule the agent may NEVER break (run it alone to see what that means)
-/rmboundary <n> — remove one (PIN)
+/setpin — set/change the OWNER's PIN, works everywhere (entered on a keypad, never typed in chat)
+/setscope <kind of assistant> — change the role itself, e.g. beyond infrastructure-only
 /snapshots — snapshots taken before changes (0 tokens)
-/servers — machines the agent may reach (0 tokens)
-/addserver — register a new machine, step by step
-/removeserver <name> — unregister one
-/agentstatus — live check: is each AI tier actually up right now?
-/providers — which AI tiers are configured and which are healthy (0 tokens)
-/usemodel [name] — force a specific tier for this chat (Opus, Gemini Pro-high, ...); `/usemodel auto` for the default chain
-/gdrive — pick (or show) which connected Drive account this room uploads to (0 tokens)
-/connectgdrive — connect a new Drive account, through Telegram (owner anywhere, or a registered group's own admin)
-/lang [en|id] — set/show this chat's language for the bot's own fixed replies (0 tokens)
-/mode — read-only right now, or able to make changes? (0 tokens)
+/spend [days] — what this deployment actually spent, straight from the ledger (0 tokens)
+/status — instant status check, ZERO tokens (straight from a script, not a model)
+/tools — list of skills already turned into scripts, ZERO tokens
 /unlock [minutes] — open a time-boxed window for real changes (owner anywhere, or a registered group's own admin -- capped at 10 min from a group)
-/lock — close that window early
-/learned — see what the agent figured out about this environment BY ITSELF
-/forget <number> — delete one wrong learned fact (numbers come from /learned)
-/cancel — abort a multi-step form (/start, /addserver)
-/help — this guide (choose EN or ID)
+/unregistergroup — revoke this group's access (group admin only)
+/unschedule <name> — remove a scheduled task
+/update — check GitHub for a newer version and install it (PIN)
+/usemodel [name] — force a specific tier for this chat (Opus, Gemini Pro-high, ...); `/usemodel auto` for the default chain
 
 *3 habits that keep it cheap*
 1. *`/new` every time the topic changes.* A continuing conversation history is EXPENSIVE -- the longer it gets, the more expensive every next turn (can be 10-20x if left to pile up). Infra case closed → want to ask something unrelated? `/new` first.
@@ -5551,7 +5559,7 @@ Every reply ends with a "— by ..." tag. If it's ever NOT "{TIERS[0]['label']}"
 *Using it in a Telegram Group*
 If this group has been registered by an admin (check with `/chatid`), EVERY member can give the bot commands automatically -- no per-person whitelist needed.
 1. By default the bot only sees *commands* (`/status` etc) or a reply to one of its own messages -- that's Telegram's Privacy Mode, ON for every new bot, and it hides everyday chat (a plain `@botname` typed mid-sentence included, despite looking like a mention) from the bot entirely. **For most groups this is what you want**: no token spent unless someone actually asked it something. To make a real `@botname` mention wake it up too: (a) @BotFather → `/mybots` → this bot → *Bot Settings* → *Group Privacy* → *Turn off*, then (b) **remove the bot from this group and invite it back** -- Telegram locks in the privacy setting when the bot JOINS, so without the re-invite the old setting sticks and mentions keep being ignored. No need to `/registergroup` again; the chat ID (and its PIN) survive. This does NOT turn the bot into a full participant: ordinary chatter still costs nothing, only mentions and replies do.
-2. Sessions (`/new`, `/session`) in this group are *separate* from each member's private DM -- safely isolated. But `/remember` is *GLOBAL* across every chat including this group -- if someone remembers a fact here, everyone here (and in every other chat with this bot) can see it via `/memory`.
+2. Sessions (`/new`, `/session`) in this group are *separate* from each member's private DM -- safely isolated. `/remember` is *per-chat*: a fact saved here is read back here, and is never injected into another chat's conversation. `/memory` shows this chat's own facts plus the shared base the operator maintains.
 3. This group doesn't have access yet? An admin just needs to type `/registergroup` here -- takes effect immediately, no restart needed. (`/unregistergroup` to revoke it again.)
 4. Confirming with a PIN (`/addserver`, `/update`, etc) here uses this group's OWN PIN if it has one (`/setgrouppin`), so different companies sharing one bot don't need to share a secret -- the owner's personal PIN always works too, everywhere, as a master credential.
 
@@ -5566,46 +5574,54 @@ Setiap pesan dicoba lewat 4 tingkatan, dari yang paling murah dulu:
 Setiap balasan diakhiri tanda "— by ...". Kalau tandanya BUKAN "{TIERS[0]['label']}", itu sinyal ada gangguan di salah satu layanan (rate limit, auth, dll) -- gampang dipantau sekilas tanpa perlu buka log.
 
 *Daftar perintah*
-/status — cek status instan, NOL token (langsung dari script, bukan model)
-/tools — daftar skill yang sudah jadi script, NOL token
+/addboundary <aturan> — tambah aturan yang TIDAK BOLEH dilanggar agent (ketik sendirian untuk lihat penjelasannya)
+/addmcp <nama> <perintah> [argumen...] — daftarkan server MCP, memberi agent tool baru (PIN); jalankan kosong untuk contoh siap pakai
+/addserver — daftarkan mesin baru, langkah demi langkah
+/adopt — bawa cron lama ke dalam kelolaan bot
+/agentstatus — cek langsung: tiap tingkat AI benar-benar hidup sekarang?
+/boundaries — apa yang tidak boleh dilakukan agent (NOL token)
+/cancel — batalkan form bertahap yang sedang jalan (/start, /addserver)
+/chatid — tampilkan ID chat ini, untuk setup akses grup (tanpa perlu izin)
+/connectgdrive — hubungkan akun Drive baru, lewat Telegram (owner di mana saja, atau admin grup terdaftar)
+/forget <nomor> — hapus satu catatan hasil belajar yang keliru (nomornya dari /learned)
+/gdrive — pilih (atau lihat) akun Drive mana yang dipakai room ini untuk upload (NOL token)
+/gdrivestatus — apakah tiap akun Drive yang terhubung masih jalan? (0 token)
 /graduate <nama> — ubah kasus yang BARU SAJA selesai jadi script reusable (gratis dipakai lagi)
+/help — panduan ini (pilih EN atau ID)
+/lang [en|id] — atur/lihat bahasa balasan tetap bot untuk chat ini (NOL token)
+/learned — lihat apa saja yang agent pelajari SENDIRI soal lingkungan ini
+/lock — tutup lebih awal
+/logout — hapus satu sign-in (Gemini atau Claude) supaya /start berikutnya benar-benar baru
+/mcpservers — server MCP apa saja yang terdaftar (0 token)
+/memory — lihat memori: fakta milik chat ini, plus yang dipakai bersama
+/mode — agent lagi read-only atau boleh mengubah? (NOL token)
 /new — mulai ulang sesi AKTIF dari nol (riwayat percakapan direset, MEMORY.md tetap ada)
+/providers — tingkat AI mana saja yang dipakai dan mana yang sehat (NOL token)
+/registergroup — buka grup ini untuk semua anggota (khusus admin grup)
+/remember <fakta> — simpan fakta PERMANEN KHUSUS CHAT INI, kebaca di SEMUA sesi & tingkatan, walau sudah /new berkali-kali
+/removeserver <nama> — hapus satu
+/rmboundary <n> — hapus satu (pakai PIN)
+/rmgrouppin — hapus PIN grup ini, kembali pakai PIN owner (owner atau admin grup ini)
+/rmmcp <nama> — cabut satu server MCP (tanpa PIN: hanya mengurangi kemampuan agent)
+/schedules — semua yang jalan terjadwal, dan isinya apa (NOL token)
+/secure <server> — pasang penjaga read-only di mesin terdaftar dan pensiunkan kunci lama
+/servers — daftar mesin yang boleh diakses agent (NOL token)
 /session <nama> — buat/pindah ke sesi bernama, buat pisahin kasus berbeda
 /sessions — lihat semua sesi tersimpan
-/remember <fakta> — simpan fakta PERMANEN KHUSUS CHAT INI, kebaca di SEMUA sesi & tingkatan, walau sudah /new berkali-kali
-/spend [hari] — pemakaian token nyata, langsung dari ledger (NOL token)
-/memory — lihat memori: fakta milik chat ini, plus yang dipakai bersama
-/schedules — semua yang jalan terjadwal, dan isinya apa (NOL token)
-/unschedule <nama> — hapus satu task terjadwal
-/adopt — bawa cron lama ke dalam kelolaan bot
-/setpin — atur/ganti PIN OWNER, berlaku di mana pun (lewat keypad, tidak pernah diketik di chat)
-/setgrouppin — atur/ganti PIN milik grup INI (owner atau admin grup ini, jalankan di dalam grupnya)
-/rmgrouppin — hapus PIN grup ini, kembali pakai PIN owner (owner atau admin grup ini)
-/update — cek versi terbaru di GitHub dan pasang (pakai PIN)
 /setbrief <yang diurus> — atur brief lingkungan satu baris
-/setscope <jenis agent> — ubah perannya sendiri, mis. lebih luas dari infrastruktur saja
+/setgrouppin — atur/ganti PIN milik grup INI (owner atau admin grup ini, jalankan di dalam grupnya)
 /setownerscope <teks tambahan> — scope tambahan cuma untuk KAMU, cuma di DM KAMU (owner-only)
-/logout — hapus satu sign-in (Gemini atau Claude) supaya /start berikutnya benar-benar baru
-/boundaries — apa yang tidak boleh dilakukan agent (NOL token)
-/addboundary <aturan> — tambah aturan yang TIDAK BOLEH dilanggar agent (ketik sendirian untuk lihat penjelasannya)
-/rmboundary <n> — hapus satu (pakai PIN)
+/setpin — atur/ganti PIN OWNER, berlaku di mana pun (lewat keypad, tidak pernah diketik di chat)
+/setscope <jenis agent> — ubah perannya sendiri, mis. lebih luas dari infrastruktur saja
 /snapshots — snapshot yang diambil sebelum perubahan (NOL token)
-/servers — daftar mesin yang boleh diakses agent (NOL token)
-/addserver — daftarkan mesin baru, langkah demi langkah
-/removeserver <nama> — hapus satu
-/agentstatus — cek langsung: tiap tingkat AI benar-benar hidup sekarang?
-/providers — tingkat AI mana saja yang dipakai dan mana yang sehat (NOL token)
-/usemodel [nama] — paksa satu tingkatan tertentu untuk chat ini (Opus, Gemini Pro-high, ...); `/usemodel auto` untuk balik ke rantai default
-/gdrive — pilih (atau lihat) akun Drive mana yang dipakai room ini untuk upload (NOL token)
-/connectgdrive — hubungkan akun Drive baru, lewat Telegram (owner di mana saja, atau admin grup terdaftar)
-/lang [en|id] — atur/lihat bahasa balasan tetap bot untuk chat ini (NOL token)
-/mode — agent lagi read-only atau boleh mengubah? (NOL token)
+/spend [hari] — pemakaian token nyata, langsung dari ledger (NOL token)
+/status — cek status instan, NOL token (langsung dari script, bukan model)
+/tools — daftar skill yang sudah jadi script, NOL token
 /unlock [menit] — buka mode tulis untuk waktu terbatas (pemilik di mana saja, atau admin grup terdaftar -- dibatasi maks 10 menit dari grup)
-/lock — tutup lebih awal
-/learned — lihat apa saja yang agent pelajari SENDIRI soal lingkungan ini
-/forget <nomor> — hapus satu catatan hasil belajar yang keliru (nomornya dari /learned)
-/cancel — batalkan form bertahap yang sedang jalan (/start, /addserver)
-/help — panduan ini (pilih EN atau ID)
+/unregistergroup — cabut akses grup ini (khusus admin grup)
+/unschedule <nama> — hapus satu task terjadwal
+/update — cek versi terbaru di GitHub dan pasang (pakai PIN)
+/usemodel [nama] — paksa satu tingkatan tertentu untuk chat ini (Opus, Gemini Pro-high, ...); `/usemodel auto` untuk balik ke rantai default
 
 *3 kebiasaan supaya tetap irit*
 1. *`/new` setiap topik berganti.* Riwayat percakapan yang terus nyambung itu MAHAL -- makin panjang, makin mahal setiap giliran berikutnya (bisa 10-20x kalau dibiarkan menumpuk). Case infra sudah selesai → mau tanya hal lain yang tidak nyambung? `/new` dulu.
@@ -5976,6 +5992,77 @@ async def cmd_gdrivestatus(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
 
+def _gdrive_stored_refresh_token(name: str) -> str:
+    """The refresh token rclone holds for this remote, or "" if unreadable.
+
+    Read straight from rclone rather than parsed out of rclone.conf by hand:
+    the token sits inside a JSON blob on one line of a config file whose
+    format rclone owns, and a wrong guess here would mean silently skipping
+    the revoke and reporting a logout that never happened.
+    """
+    try:
+        out = _rclone_run("config", "dump", timeout=20)
+        if out.returncode != 0:
+            return ""
+        blob = json.loads(out.stdout or "{}").get(name, {}).get("token", "")
+        return json.loads(blob).get("refresh_token", "") if blob else ""
+    except Exception:
+        logger.warning("could not read the stored token for %s", name, exc_info=True)
+        return ""
+
+
+def _revoke_google_token(refresh_token: str) -> bool:
+    """Tell Google to invalidate the grant. Best-effort by design: the local
+    config is being deleted either way, and a network blip must not leave a
+    half-removed account behind."""
+    if not refresh_token:
+        return False
+    status, _ = _post_form("https://oauth2.googleapis.com/revoke",
+                           {"token": refresh_token})
+    return status == 200
+
+
+def disconnect_gdrive_account(name: str) -> tuple[bool, str]:
+    """Disconnect a Drive account: revoke the grant at Google, drop the rclone
+    remote, and forget every room that pointed at it.
+
+    Nothing in Google Drive itself is touched. This removes the agent's
+    ACCESS, not the files -- anything already uploaded stays exactly where it
+    is and stays visible to the account's owner. That distinction is worth
+    being deliberate about, because "remove the account" could easily be read
+    the other way round, and the destructive reading is unrecoverable.
+    """
+    if name not in _list_gdrive_accounts():
+        return False, f"'{name}' isn't connected"
+
+    revoked = _revoke_google_token(_gdrive_stored_refresh_token(name))
+
+    try:
+        out = _rclone_run("config", "delete", name, timeout=20)
+    except Exception as exc:
+        return False, f"couldn't run rclone: {exc}"
+    if out.returncode != 0:
+        return False, (out.stderr or out.stdout or "rclone config delete failed").strip()[:300]
+
+    # Rooms pointing at a remote that no longer exists would silently fall
+    # back to "whatever account happens to be first", which is exactly the
+    # kind of quiet wrong-destination this project guards against elsewhere.
+    rooms = _read_gdrive_room_accounts()
+    orphaned = [c for c, r in rooms.items() if r == name]
+    if orphaned:
+        for c in orphaned:
+            del rooms[c]
+        _write_gdrive_room_accounts(rooms)
+
+    logger.warning("Drive account disconnected: %s (revoked=%s, rooms cleared=%d)",
+                   name, revoked, len(orphaned))
+    detail = "access revoked at Google and removed locally" if revoked else \
+             "removed locally (could not reach Google to revoke the grant)"
+    if orphaned:
+        detail += f"; {len(orphaned)} room(s) unset"
+    return True, detail
+
+
 async def cmd_gdrive(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Pick (or show) which connected Drive account this room uploads to.
     Connecting an account itself is still a one-time step done directly on
@@ -6021,7 +6108,10 @@ async def cmd_gdrive(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     # ship. A syntax error at import is not a degraded feature; nothing runs.
     tick = "\u2705 "
     rows = [[InlineKeyboardButton(
-        f"{tick if a == effective else ''}{a}", callback_data=f"gdrv:{a}",
+        f"{tick if a == effective else ''}{a}", callback_data=f"gdrv:use:{a}",
+    )] for a in accounts]
+    rows += [[InlineKeyboardButton(
+        _t(lang, f"Disconnect {a}", f"Putuskan {a}"), callback_data=f"gdrv:rm:{a}",
     )] for a in accounts]
     lines.append("")
     lines.append(_t(lang,
@@ -6042,13 +6132,65 @@ async def cmd_gdrive_button(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         await query.answer(_t(lang, "Not permitted.", "Tidak diizinkan."), show_alert=True)
         return
     await query.answer()
-    _, remote = query.data.split(":", 1)
+    parts = query.data.split(":", 2)
+    # "gdrv:<name>" was the only shape before disconnect existed. Still
+    # accepted, so a picker card left sitting in a chat from before an update
+    # keeps working instead of failing on a tap.
+    action, remote = ("use", parts[1]) if len(parts) == 2 else (parts[1], parts[2])
+
+    if action == "cancel":
+        return await query.edit_message_text(_t(lang, "Cancelled.", "Dibatalkan."))
+
     if remote not in _list_gdrive_accounts():
         await query.edit_message_text(_t(lang,
             "That account isn't connected any more. Run /gdrive again.",
             "Akun itu sudah tidak terhubung lagi. Jalankan /gdrive lagi.",
         ))
         return
+
+    if action == "rm":
+        # Confirm first, and say plainly what this does NOT do. "Remove the
+        # account" reads just as naturally as "delete my files", and only one
+        # of those readings is recoverable.
+        return await query.edit_message_text(_t(lang,
+            f"Disconnect <b>{_tg_escape(remote)}</b>?\n\n"
+            "This revokes the agent's access at Google and deletes the stored "
+            "token from this server.\n\n"
+            "<b>Nothing in Google Drive is deleted.</b> Files already uploaded "
+            "stay exactly where they are and stay yours — this only takes away "
+            "the agent's ability to reach them.",
+            f"Putuskan <b>{_tg_escape(remote)}</b>?\n\n"
+            "Ini mencabut akses agent di Google dan menghapus token yang "
+            "tersimpan di server ini.\n\n"
+            "<b>Tidak ada yang dihapus di Google Drive.</b> File yang sudah "
+            "diunggah tetap di tempatnya dan tetap milik Anda — ini hanya "
+            "mencabut kemampuan agent menjangkaunya.",
+        ), parse_mode="HTML", reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton(_t(lang, "Yes, disconnect", "Ya, putuskan"),
+                                 callback_data=f"gdrv:rmyes:{remote}"),
+            InlineKeyboardButton(_t(lang, "Cancel", "Batal"),
+                                 callback_data="gdrv:cancel:-"),
+        ]]))
+
+    if action == "rmyes":
+        loop = asyncio.get_running_loop()
+        ok, detail = await loop.run_in_executor(None, disconnect_gdrive_account, remote)
+        safe = _tg_escape(str(detail))
+        left = _list_gdrive_accounts()
+        if left:
+            tail = _t(lang, f"\n\n{len(left)} account(s) still connected.",
+                            f"\n\n{len(left)} akun masih terhubung.")
+        else:
+            tail = _t(lang,
+                      "\n\nNo Drive account is connected now. /connectgdrive to add one.",
+                      "\n\nTidak ada akun Drive terhubung sekarang. /connectgdrive untuk menambah.")
+        head = (_t(lang, f"<b>{_tg_escape(remote)}</b> disconnected — {safe}.",
+                         f"<b>{_tg_escape(remote)}</b> diputus — {safe}.")
+                if ok else
+                _t(lang, f"Could not disconnect: {safe}",
+                         f"Gagal memutus: {safe}"))
+        return await query.edit_message_text(head + tail, parse_mode="HTML")
+
     chat_id = str(update.effective_chat.id)
     room_accounts = _read_gdrive_room_accounts()
     room_accounts[chat_id] = remote
