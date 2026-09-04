@@ -1,5 +1,80 @@
 # Changelog
 
+## Unreleased -- Drive keeps refreshing after rclone's shared client retires
+
+Google has begun charging for API requests made through rclone's built-in
+shared OAuth client, and shared usage is far over the free quota, so rclone is
+retiring it during 2026 after a 90-day notice. Asked here as "should we replace
+rclone with the Drive API directly, since this method dies in 2026?"
+
+**It should not, and that would not have helped.** What is retiring is rclone's
+shared *client_id*, not rclone and not the way Drive is reached. Any OAuth app
+needs a client of its own -- Google requires one whichever library moves the
+bytes -- so the deadline forces exactly the same action either way, and a
+rewrite would only add work on top of it: Drive has no paths (every operation
+resolves file IDs by parent, and duplicate sibling names are legal), plus
+resumable uploads, the permissions API for share links, refresh handling and
+backoff. This project has exactly one dependency today, and since v0.2b.64 it
+fetches its own rclone binary, so the binary was never the friction anyway.
+
+**What the question did surface is a real dated bug, which was not visible from
+outside.** `connect_gdrive_account()` created every remote with only `scope` and
+`token`:
+
+    rclone config create <name> drive scope=drive.file token=<blob>
+
+An access token lasts about an hour. Everything after that is the REFRESH, and
+rclone refreshes using the client_id stored on the remote -- with none stored,
+its own shared one. So even an account connected through the device flow with
+the operator's OWN Google Cloud client (v0.2b.54) was still refreshing through
+rclone's shared client, and would have died with it. The failure shape is the
+worst kind: fine for an hour, then Drive stops, on a deployment nobody touched,
+with nothing in the error pointing at the cause.
+
+The client is now written onto the remote -- but only where its provenance is
+actually known, and that restraint is the whole of the design. **A refresh
+token is bound to the client that issued it**, so attaching the wrong client_id
+does not postpone the breakage, it causes it immediately at the first refresh.
+So `connect_gdrive_account()` takes the client from its caller rather than
+reading it itself, and exactly one of the three call sites passes one:
+
+| path | token issued by | passes a client |
+|---|---|---|
+| device flow | the operator's own stored client | yes -- certain |
+| `rclone authorize` | rclone's shared client | no -- nothing to attach |
+| pasted token | whatever the operator used | no -- unknown |
+
+The last two keep today's behaviour exactly, because there is no honest fix for
+them in code: they have to be RECONNECTED before the retirement. So they are
+made visible instead. `/gdrivestatus` now lists every Drive remote with no
+client_id of its own and says what happens and when -- a green tick there
+otherwise means "works today", right up until it does not.
+
+Also corrected: the README called this a "known limitation" with a one-line
+workaround. It is a dated breakage with two different outcomes depending on how
+each account was connected, and it now says so, including why reconnecting is
+unavoidable rather than an implementation shortcut.
+
+New: `dev/test_gdrive_client_id.py`, 24 tests. Captures the actual argv handed
+to `rclone config create` rather than trusting the source reads right, asserts
+that an unusable or empty client dict writes nothing rather than a blank
+`client_id=`, and walks the AST to assert only one call site passes a client and
+that `connect_gdrive_account()` does not read one itself -- the change that
+would quietly reintroduce the trap. **1/2 against the pre-change source**, with
+a tally rather than a traceback.
+
+**Not verified against a live rclone.** The mechanism (an empty client_id
+falling back to rclone's built-in one) is from rclone's own documentation and
+its config warning, not from a run here, and this dev box has no connected Drive
+account. The argv is asserted; that it produces a remote which refreshes through
+the operator's client should be confirmed on the Linux deployment before the
+notice period starts.
+
+Full suite: **751/753 across 36 suites** on this Windows dev box; the two
+failures and four skips are the long-standing Windows-only artifacts, confirmed
+pre-existing.
+
+
 ## Unreleased -- /setchatscope: a different job per room
 
 The second half of the same problem the SERVICE_NAME change below solves the

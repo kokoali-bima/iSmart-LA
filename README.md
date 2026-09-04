@@ -639,11 +639,36 @@ company account used across multiple client rooms) — the folder split is a
 convenience default, not a hard permission boundary enforced by Google itself, so
 treat the escape hatch as something only a trusted admin should reach for.
 
-**Known limitation:** rclone's shared default `client_id` (used above, since it
-needs no Google Cloud project of your own) is being retired sometime in 2026 and
-can occasionally hit a shared rate limit under global load (rclone retries with
-backoff automatically). If it stops working, the fix is creating your own
-`client_id` — see rclone's docs linked above.
+#### Dated: rclone's shared OAuth client is being retired in 2026
+
+The zero-setup path above uses rclone's own shared `client_id`. Google has begun
+charging for API requests made through it, and shared usage sits far over the
+free quota, so **rclone is retiring it during 2026** — after a 90-day notice.
+From then on every user needs their own `client_id` / `client_secret`. It can
+also hit a shared rate limit under global load today (rclone retries with
+backoff on its own).
+
+**This is not solved by dropping rclone for the Drive API directly.** Any OAuth
+app needs a client of its own; Google requires one either way. The retirement
+forces exactly the same action whichever library moves the bytes, so rewriting
+would add work without removing the deadline.
+
+What matters here is *which* client refreshes an account. An access token lasts
+about an hour; everything after that is the refresh, and rclone refreshes using
+the `client_id` stored on the remote — with none stored, its shared one.
+
+- **Connected through `/connectgdrive` with your own OAuth client** (the device
+  flow): the client is now recorded on the remote, so these keep working
+  straight through the retirement.
+- **Connected the zero-setup way, or by pasting a token**: these refresh through
+  rclone's shared client and will stop about an hour after it goes.
+  **`/gdrivestatus` names them**, so they are visible while there is still time
+  rather than discovered as "Drive suddenly broke".
+
+Fixing one means setting up your own OAuth client and running `/connectgdrive`
+again for that account. Reconnecting is unavoidable, not laziness in the
+implementation: a refresh token belongs to the client that issued it, so an
+existing one cannot be re-pointed at a new client.
 
 ### MCP servers (optional)
 

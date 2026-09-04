@@ -5466,8 +5466,13 @@ async def _gdrive_device_wait(context: ContextTypes.DEFAULT_TYPE, chat_id: int,
         # Hand the token to the SAME path a pasted token took, so verification,
         # the duplicate-root-folder guard and rollback behave identically
         # however the token was obtained.
+        # This is the ONE path whose token provenance is certain: it was just
+        # issued by the operator's own stored client, so that client is what
+        # must refresh it from here on. Without it the remote would refresh
+        # through rclone's shared client and die with it during 2026.
         ok, detail = await loop.run_in_executor(
-            None, connect_gdrive_account, name, gdrive_token_to_rclone(payload))
+            None, connect_gdrive_account, name, gdrive_token_to_rclone(payload),
+            read_gdrive_client())
         safe = _tg_escape(str(detail))
         if ok:
             logger.warning("Drive account connected via device flow: %s", name)
@@ -6951,6 +6956,29 @@ async def cmd_gdrivestatus(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         mark = "🟢" if ok else "🔴"
         lines.append(f"{mark} <b>{_tg_escape(name)}</b>"
                      + ("" if ok else f" — {_tg_escape(detail)}"))
+    # A 🟢 here only means the account works TODAY. An account with no
+    # client_id of its own refreshes through rclone's built-in shared client,
+    # which Google has begun charging for and rclone is retiring during 2026 --
+    # so it is green right up until it is not, with nothing in the failure
+    # pointing at the cause. Naming it while there is still time to act is the
+    # entire reason this line exists.
+    shared = await loop.run_in_executor(None, _gdrive_accounts_on_shared_client)
+    if shared:
+        listed = ", ".join(_tg_escape(n) for n in shared)
+        lines.append("")
+        lines.append(_t(lang,
+            f"⚠️ <b>{listed}</b> refresh through rclone's shared OAuth client, "
+            "which is being retired during 2026 (Google now charges for it). "
+            "They work until then, and stop about an hour after it goes. "
+            "To fix: set up your own OAuth client, then /connectgdrive again "
+            "for each — reconnecting is required, because a refresh token "
+            "belongs to the client that issued it.",
+            f"⚠️ <b>{listed}</b> me-refresh lewat OAuth client bersama milik rclone, "
+            "yang dipensiunkan sepanjang 2026 (Google mulai menagihnya). "
+            "Masih jalan sampai saat itu, lalu berhenti sekitar sejam setelahnya. "
+            "Perbaikannya: siapkan OAuth client sendiri, lalu /connectgdrive ulang "
+            "untuk tiap akun — harus dihubungkan ulang, karena refresh token "
+            "terikat pada client yang menerbitkannya."))
     client = read_gdrive_client()
     if not client:
         lines.append("")
@@ -6977,6 +7005,35 @@ def _gdrive_stored_refresh_token(name: str) -> str:
     except Exception:
         logger.warning("could not read the stored token for %s", name, exc_info=True)
         return ""
+
+
+def _gdrive_accounts_on_shared_client() -> list[str]:
+    """Remotes that will stop refreshing when rclone retires its shared client.
+
+    A Drive remote with no client_id of its own refreshes through rclone's
+    built-in one. Google has begun charging for requests made through it, and
+    usage is far over the free quota, so rclone is retiring it during 2026 --
+    after which every account here keeps working for about an hour, until its
+    access token expires and the refresh has nowhere to go.
+
+    Worth surfacing rather than waiting for: nothing about the failure will
+    point at this. It looks like Drive breaking, on a deployment nobody
+    changed, roughly an hour after the last successful upload.
+    """
+    try:
+        out = _rclone_run("config", "dump", timeout=20)
+        if out.returncode != 0:
+            return []
+        cfg = json.loads(out.stdout or "{}")
+    except Exception:
+        logger.warning("could not read the rclone config to check client ids", exc_info=True)
+        return []
+    return sorted(
+        name for name, remote in cfg.items()
+        if isinstance(remote, dict)
+        and remote.get("type") == "drive"
+        and not (remote.get("client_id") or "").strip()
+    )
 
 
 def _revoke_google_token(refresh_token: str) -> bool:
@@ -7992,7 +8049,8 @@ def gdrive_token_to_rclone(tok: dict) -> str:
     })
 
 
-def connect_gdrive_account(name: str, token_raw: str) -> tuple[bool, str]:
+def connect_gdrive_account(name: str, token_raw: str,
+                           oauth_client: Optional[dict] = None) -> tuple[bool, str]:
     """Register a new rclone Drive remote from a pasted OAuth token, verify it
     actually works, and roll back cleanly on any failure.
 
@@ -8010,10 +8068,26 @@ def connect_gdrive_account(name: str, token_raw: str) -> tuple[bool, str]:
     if name in _list_gdrive_accounts():
         return False, f"'{name}' already exists -- pick a different label"
 
+    # An access token lives about an hour; everything after that depends on
+    # the REFRESH, and rclone refreshes using the client_id stored on the
+    # remote. With none stored it falls back to its own built-in shared client
+    # -- which Google has started charging for, so rclone is retiring it during
+    # 2026. Storing the client the token was actually issued by is what keeps
+    # this account working past that date.
+    #
+    # Passed in rather than read here on purpose. A refresh token is bound to
+    # the client that issued it, so attaching the WRONG client_id does not
+    # postpone the breakage, it causes it immediately -- and only the caller
+    # knows where its token came from. The device flow knows (its own client);
+    # the rclone-authorize path and a hand-pasted blob do not, and correctly
+    # pass nothing.
+    opts = ["scope=drive.file", f"token={token_raw}"]
+    if oauth_client and oauth_client.get("client_id"):
+        opts += [f"client_id={oauth_client['client_id']}",
+                 f"client_secret={oauth_client.get('client_secret', '')}"]
     try:
         create = _rclone_run("config", "create", name, "drive",
-                             "scope=drive.file", f"token={token_raw}",
-                             "--non-interactive")
+                             *opts, "--non-interactive")
     except Exception as exc:
         return False, "drive_rclone_failed"
     if create.returncode != 0:
