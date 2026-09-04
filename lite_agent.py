@@ -4720,6 +4720,26 @@ async def _gdrive_begin_rclone(update: Update, context: ContextTypes.DEFAULT_TYP
     the same shape as signing in to Gemini or Claude here."""
     chat_id = update.effective_chat.id
     loop = asyncio.get_running_loop()
+
+    # Said BEFORE the work starts, not after. Fetching rclone takes fifteen or
+    # twenty seconds, and with nothing on screen the bot simply looks frozen --
+    # the same silence that has made every other failure here hard to read.
+    # Checked rather than announced unconditionally: a host that already has
+    # rclone must not be told to wait for a download that will not happen.
+    if _rclone_path() is None:
+        await update.message.reply_text(_t(lang,
+            "⏳ First time on this host — fetching rclone (a single file, "
+            "~20 MB) so Drive can work. This takes a few seconds; the sign-in "
+            "link comes right after.",
+            "⏳ Pertama kali di host ini — mengunduh rclone (satu file, ~20 MB) "
+            "supaya Drive bisa jalan. Butuh beberapa detik; link sign-in-nya "
+            "menyusul setelah ini.",
+        ))
+        try:
+            await context.bot.send_chat_action(chat_id, "typing")
+        except Exception:
+            pass
+
     ok, result, handle = await loop.run_in_executor(None, gdrive_rclone_start)
     if not ok:
         _gdrive_wizard.pop(chat_id, None)

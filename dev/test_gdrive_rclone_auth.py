@@ -295,6 +295,41 @@ async def main():
           mod.GDRIVE_CLIENT_FILE.exists())
     mod.GDRIVE_CLIENT_FILE.unlink(missing_ok=True)
 
+    # --- the wait must be announced before it happens ---------------------
+    # Fetching rclone takes fifteen or twenty seconds. With nothing on screen
+    # the bot simply looks frozen -- the same silence that made every other
+    # failure here hard to read.
+    mod._gdrive_wizard[111] = {"step": "x", "name": "gdrive",
+                               "expires": mod._dt.datetime.now().timestamp() + 900}
+    with patch.object(mod, "_rclone_path", return_value=None),          patch.object(mod, "gdrive_rclone_start",
+                      return_value=(True, "https://accounts.google.com/o/oauth2/auth?x=1",
+                                    {"pid": 1, "state": "S", "log": "/x"})):
+        u = upd()
+        await mod._gdrive_begin_rclone(u, ctx(), "en", "gdrive")
+    said = [c[0][0] for c in u.message.reply_text.call_args_list]
+    check("a host that must fetch rclone first SAYS SO before starting, "
+          "instead of going quiet for twenty seconds",
+          any("fetching rclone" in m.lower() or "mengunduh rclone" in m.lower()
+              for m in said))
+    check("...and the message comes BEFORE the sign-in link, not after",
+          said and ("rclone" in said[0].lower())
+          and any("accounts.google.com" in m for m in said[1:]))
+
+    # A host that already has it must not be told to wait for nothing.
+    mod._gdrive_wizard[111] = {"step": "x", "name": "gdrive",
+                               "expires": mod._dt.datetime.now().timestamp() + 900}
+    with patch.object(mod, "_rclone_path", return_value="/usr/bin/rclone"),          patch.object(mod, "gdrive_rclone_start",
+                      return_value=(True, "https://accounts.google.com/o/oauth2/auth?x=1",
+                                    {"pid": 1, "state": "S", "log": "/x"})):
+        u = upd()
+        await mod._gdrive_begin_rclone(u, ctx(), "en", "gdrive")
+    said2 = [c[0][0] for c in u.message.reply_text.call_args_list]
+    check("a host that already has rclone is NOT told to wait for a download "
+          "that will not happen",
+          not any("fetching rclone" in m.lower() or "mengunduh" in m.lower()
+                  for m in said2))
+    check("...and still gets the link", any("accounts.google.com" in m for m in said2))
+
     failed = [n for n, ok in results if not ok]
     print(f"\n{len(results) - len(failed)}/{len(results)} passed")
     if failed:

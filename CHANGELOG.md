@@ -1,5 +1,24 @@
 # Changelog
 
+## v0.2b.65 -- say that rclone is being fetched, before going quiet for it
+
+v0.2b.64 made the bot fetch rclone for itself when a host has none. That
+download takes fifteen or twenty seconds, and it said nothing while it ran --
+so `/connectgdrive` on a fresh host looked exactly like a bot that had frozen.
+The same silence that made every other failure in this feature hard to read.
+
+It now says so first: a short note that rclone is being fetched and the
+sign-in link follows, plus a typing indicator, sent *before* the work starts
+rather than explained afterwards.
+
+Checked rather than announced unconditionally -- a host that already has
+rclone is not told to wait for a download that will never happen. Both
+directions are asserted, including that the notice arrives BEFORE the link
+and not after it.
+
+Full suite: **618/618 across 30 suites** on the real Linux target.
+
+
 ## v0.2b.64 -- the two ways connecting Drive still dead-ended
 
 Both reported from live deployments, one on each host, and neither had a way
