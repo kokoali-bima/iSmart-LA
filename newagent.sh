@@ -54,12 +54,14 @@ NAME=""
 REPO=""
 BRANCH="master"
 RUN_INSTALL=1
+RESUME=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --repo)      REPO="${2:-}"; shift 2 ;;
     --branch)    BRANCH="${2:-}"; shift 2 ;;
     --no-install) RUN_INSTALL=0; shift ;;
-    -h|--help)   sed -n '2,33p' "$0"; exit 0 ;;
+    --resume)    RESUME=1; shift ;;
+    -h|--help)   sed -n '2,36p' "$0"; exit 0 ;;
     -*)          die "unknown option: $1" ;;
     *)           [ -n "$NAME" ] && die "give exactly one name"; NAME="$1"; shift ;;
   esac
@@ -97,38 +99,55 @@ echo "  directory: ${INSTALL_DIR}"
 echo "  service:   ${SERVICE_NAME}"
 echo ""
 
-# --- Refuse to touch anything that already exists ----------------------------
+# --- Existing state: refuse, or resume ---------------------------------------
 # Never clobber: an existing deployment holds a PIN hash, sessions, SSH keys and
 # connected Drive accounts. Re-running this over one would destroy all of it,
 # and "provision" is not a word anyone expects to mean that.
-id -u "$USER_NAME" >/dev/null 2>&1 && die "user ${USER_NAME} already exists -- refusing to touch an existing deployment"
-[ -e "$INSTALL_DIR" ] && die "${INSTALL_DIR} already exists -- refusing to overwrite it"
-[ -e "$UNIT_PATH" ]   && die "${UNIT_PATH} already exists -- refusing to overwrite it"
-
-if [ -z "$REPO" ]; then
-  REPO="$(git -C "$HERE" remote get-url origin 2>/dev/null || true)"
-  [ -n "$REPO" ] || die "could not read this checkout's origin -- pass --repo <url>"
-  say "Cloning the same repository this checkout came from:"
-  echo "    ${DIM}${REPO}${RESET}"
+#
+# --resume exists because install.sh can fail halfway (its Claude Code and agy
+# steps download from the internet), and the first version of this script then
+# said "left in place so you can retry" while the guard above refused exactly
+# that retry. Found on the first real Linux run. Resuming re-runs install.sh
+# against the user and checkout that are already there; it still never touches
+# an existing UNIT, since reaching that step means the install got far enough
+# to have written one.
+if [ "$RESUME" -eq 1 ]; then
+  id -u "$USER_NAME" >/dev/null 2>&1 || die "--resume, but user ${USER_NAME} does not exist -- run without it to provision from scratch"
+  [ -d "$INSTALL_DIR" ] || die "--resume, but ${INSTALL_DIR} does not exist -- run without it to provision from scratch"
+  [ "$RUN_INSTALL" -eq 1 ] || die "--resume with --no-install would do nothing"
+  say "Resuming: ${USER_NAME} and ${INSTALL_DIR} are already in place"
+else
+  id -u "$USER_NAME" >/dev/null 2>&1 && die "user ${USER_NAME} already exists -- use --resume to re-run the install against it, or pick another name"
+  [ -e "$INSTALL_DIR" ] && die "${INSTALL_DIR} already exists -- use --resume to re-run the install against it, or pick another name"
+  [ -e "$UNIT_PATH" ]   && die "${UNIT_PATH} already exists -- refusing to overwrite it"
 fi
 
-command -v git >/dev/null 2>&1 || die "git is not installed"
+if [ "$RESUME" -eq 0 ]; then
+  if [ -z "$REPO" ]; then
+    REPO="$(git -C "$HERE" remote get-url origin 2>/dev/null || true)"
+    [ -n "$REPO" ] || die "could not read this checkout's origin -- pass --repo <url>"
+    say "Cloning the same repository this checkout came from:"
+    echo "    ${DIM}${REPO}${RESET}"
+  fi
 
-# --- 1. the user -------------------------------------------------------------
-say "Creating ${USER_NAME}"
-# A real login shell, not /usr/sbin/nologin: the Gemini and Claude sign-ins run
-# through tmux in a terminal as this user, and /update's git work happens here
-# too. --system would skip creating the home directory the whole design is
-# built around.
-useradd --create-home --home-dir "$HOME_DIR" --shell /bin/bash "$USER_NAME"
-chmod 750 "$HOME_DIR"
-ok "user created, home at ${HOME_DIR} (750)"
+  command -v git >/dev/null 2>&1 || die "git is not installed"
 
-# --- 2. the checkout ---------------------------------------------------------
-say "Cloning ${BRANCH}"
-sudo -u "$USER_NAME" git clone --branch "$BRANCH" "$REPO" "$INSTALL_DIR" \
-  || die "clone failed"
-ok "cloned into ${INSTALL_DIR}"
+  # --- 1. the user -----------------------------------------------------------
+  say "Creating ${USER_NAME}"
+  # A real login shell, not /usr/sbin/nologin: the Gemini and Claude sign-ins run
+  # through tmux in a terminal as this user, and /update's git work happens here
+  # too. --system would skip creating the home directory the whole design is
+  # built around.
+  useradd --create-home --home-dir "$HOME_DIR" --shell /bin/bash "$USER_NAME"
+  chmod 750 "$HOME_DIR"
+  ok "user created, home at ${HOME_DIR} (750)"
+
+  # --- 2. the checkout -------------------------------------------------------
+  say "Cloning ${BRANCH}"
+  sudo -u "$USER_NAME" git clone --branch "$BRANCH" "$REPO" "$INSTALL_DIR" \
+    || die "clone failed"
+  ok "cloned into ${INSTALL_DIR}"
+fi
 
 # --- 3. sudo rights ----------------------------------------------------------
 # Two rules, and the difference between them is the whole security argument of
@@ -188,7 +207,8 @@ EOF
   echo ""
   sudo -u "$USER_NAME" env "SERVICE_NAME=${SERVICE_NAME}" \
     bash -c "cd '${INSTALL_DIR}' && ./install.sh" \
-    || die "install.sh failed -- ${USER_NAME} and ${INSTALL_DIR} were left in place so you can retry"
+    || die "install.sh failed. ${USER_NAME} and ${INSTALL_DIR} were left in place -- re-run the install against them with:
+    sudo $0 ${NAME} --resume"
 fi
 
 # --- done --------------------------------------------------------------------

@@ -144,8 +144,30 @@ for what, needle in (
     ("an existing systemd unit", '[ -e "$UNIT_PATH" ]'),
 ):
     check(f"it refuses when {what} is already there", needle in text)
-check("...and says so rather than continuing quietly",
-      text.count("refusing to") >= 3)
+check("...and each refusal stops the script rather than continuing quietly",
+      len(re.findall(r"already exists -- (?:use --resume|refusing)", text)) >= 3)
+
+# --- 5b. ...but a half-finished install can still be retried ---------------
+# install.sh downloads the Claude Code and agy CLIs, so it can fail halfway
+# through on a slow or interrupted network. The first version of this script
+# said "left in place so you can retry" and then refused exactly that retry on
+# the next run -- found on its first real Linux execution, where the Claude
+# installer was interrupted.
+check("--resume exists, so a half-finished install is not a dead end",
+      "--resume" in text and "RESUME=1" in text)
+check("...the failure message names it, rather than suggesting a retry that "
+      "the guard above would refuse",
+      re.search(r"install\.sh failed.*--resume", text, re.S) is not None)
+check("--resume REQUIRES the user and directory to exist, so it cannot be used "
+      "to half-provision something that was never started",
+      re.search(r'RESUME.*-eq 1.*does not exist', text, re.S) is not None)
+check("--resume still never overwrites an existing unit",
+      re.search(r'RESUME.*-eq 0', text, re.S) is not None
+      and '[ -e "$UNIT_PATH" ]' in text)
+check("--resume skips the user creation and the clone rather than repeating them",
+      re.search(r'if \[ "\$RESUME" -eq 0 \]; then.*useradd.*git clone.*\nfi', text, re.S) is not None)
+check("--resume with --no-install is refused, since it would do nothing at all",
+      "would do nothing" in text)
 
 # --- 6. the deployment it creates is actually separate ---------------------
 check("the new deployment gets its own SERVICE_NAME, so it does not fight the "
