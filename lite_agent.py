@@ -2450,15 +2450,6 @@ def save_sessions(sessions: dict) -> None:
             tmp.unlink(missing_ok=True)
 
 
-def update_chat_session(chat_id: str, mutate) -> None:
-    """Re-read, apply `mutate(sessions)`, and write -- all under one lock, so
-    a concurrent turn in another chat cannot be overwritten in between."""
-    with _sessions_lock:
-        sessions = load_sessions()
-        mutate(sessions)
-        save_sessions(sessions)
-
-
 def get_chat_state(sessions: dict, chat_id: str) -> dict:
     """Return this chat's {active, sessions} block, migrating older formats
     transparently: (1) flat {chat_id: session_id}, (2) {active, sessions: {name:
@@ -6735,7 +6726,25 @@ async def cmd_connectgdrive(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     # files the bot itself created, so anyone who needs the agent to write into
     # a folder they made by hand still needs a full-"drive" token, and that
     # scope is not one Google's device flow will issue.
-    manual = bool(context.args) and context.args[0].strip().lower() in ("manual", "token")
+    arg = (context.args[0].strip().lower() if context.args else "")
+    manual = arg in ("manual", "token")
+
+    # Setting up your OWN Google Cloud OAuth client became unreachable when
+    # rclone's shared one was made the default -- the setup card was still
+    # there, called by nothing. Found by the symbol index, not by review.
+    #
+    # It matters more than it looks: rclone's shared client_id is being
+    # retired during 2026 (rclone's own warning, on every command), so the
+    # own-client path is the one that survives. Leaving it unreachable would
+    # have meant discovering that only when uploads started failing.
+    if arg in ("setupclient", "client", "ownclient"):
+        _gdrive_wizard[chat_id] = {
+            "step": "await_gdrive_client",
+            "name": _next_gdrive_default_name() if _list_gdrive_accounts() else "gdrive",
+            "expires": _dt.datetime.now().timestamp() + GDRIVE_TOKEN_WIZARD_TTL,
+        }
+        return await update.message.reply_text(
+            _gdrive_client_setup_instructions(lang), parse_mode="HTML")
 
     existing = _list_gdrive_accounts()
     if manual:
@@ -6923,10 +6932,6 @@ def _rclone_path() -> Optional[str]:
     if RCLONE_LOCAL_BIN.is_file() and os.access(RCLONE_LOCAL_BIN, os.X_OK):
         return str(RCLONE_LOCAL_BIN)
     return None
-
-
-def _rclone_installed() -> bool:
-    return _rclone_path() is not None
 
 
 def ensure_rclone() -> tuple[bool, str]:

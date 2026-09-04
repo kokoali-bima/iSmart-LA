@@ -136,9 +136,10 @@ def upd(uid=111, chat=111):
                            effective_user=SimpleNamespace(id=uid),
                            effective_chat=SimpleNamespace(id=chat, type="private", title=None))
 
-def ctx():
+def ctx(args=None):
     return SimpleNamespace(bot=SimpleNamespace(send_chat_action=AsyncMock(),
-                                               send_message=AsyncMock()), args=[])
+                                               send_message=AsyncMock()),
+                           args=args or [])
 
 def sent(u):
     return u.message.reply_text.call_args[0][0] if u.message.reply_text.call_args else ""
@@ -370,6 +371,25 @@ async def main():
           "Audience" in setup and "OAuth consent screen" not in setup)
     check("...and warns that skipping Publish causes access_denied, so the "
           "error is recognisable when it happens", "access_denied" in setup)
+
+    # --- the own-client path must stay REACHABLE --------------------------
+    # It went unreachable when rclone's shared client became the default: the
+    # setup card was still in the file, called by nothing. Found by the symbol
+    # index, not by review. It matters more than it looks -- rclone's shared
+    # client_id is being retired during 2026, so this is the path that
+    # survives, and losing it would have surfaced only when uploads failed.
+    mod._gdrive_wizard.clear()
+    mod.GDRIVE_CLIENT_FILE.unlink(missing_ok=True)
+    with patch.object(mod, "_may_authorize_group_action", new=AsyncMock(return_value=True)),          patch.object(mod, "_list_gdrive_accounts", return_value=[]),          patch.object(mod, "_gdrive_begin_rclone",
+                      side_effect=AssertionError("asked for the own-client path")):
+        u = upd()
+        await mod.cmd_connectgdrive(u, ctx(args=["setupclient"]))
+    card = sent(u)
+    check("/connectgdrive setupclient still reaches the own-client setup card",
+          "TV and Limited Input devices" in card)
+    check("...and puts the wizard in the state that accepts the client id",
+          mod._gdrive_wizard.get(111, {}).get("step") == "await_gdrive_client")
+    mod._gdrive_wizard.clear()
 
     failed = [n for n, ok in results if not ok]
     print(f"\n{len(results) - len(failed)}/{len(results)} passed")

@@ -1,5 +1,42 @@
 # Changelog
 
+## v0.2b.69 -- the index learned to answer "what breaks if I change this"
+
+The symbol index told you whether a name existed. It could not tell you what
+used it, which is the question you actually have when picking something apart
+-- and answering it meant reading 9,694 lines, which is what the index exists
+to avoid.
+
+It now maps the call graph: every name carries who references it, grouped by
+area (Drive, MCP, sign-in, write gate, sessions, ...) so a change can start
+from its own neighbourhood. Plus a section for names **referenced by nothing**,
+because a helper nobody calls is either dead or was orphaned by an edit that
+only half-landed -- which happened here twice this week.
+
+**It found three things on its first proper run, none of which review had:**
+
+- `_rclone_installed()` -- left behind when `_rclone_path()` replaced it.
+- `update_chat_session()` -- written for a lock that was then removed as
+  unnecessary; the function stayed.
+- **`_gdrive_client_setup_instructions()` -- the own-client setup card had
+  become unreachable.** Making rclone's shared client the default in v0.2b.61
+  left nothing routing to it. That matters more than dead code: rclone's
+  shared client_id is being retired during 2026 (its own warning, printed on
+  every command), so the own-Google-Cloud-client path is the one that
+  survives, and it was quietly gone. Restored as `/connectgdrive setupclient`,
+  with a test that fails if it is ever orphaned again.
+
+**And one calibration bug in the tool itself, caught on its first run.** The
+graph only walked function bodies, so anything used at import time --
+`_parse_tiers`, `_tier_summary`, `_load_allowed_groups_file` -- was reported
+as dead. A list that calls healthy code dead is a list people stop reading, so
+module-level references now count as a caller too.
+
+Full suite: **690/690 across 31 suites** on the real Linux target -- which also
+clears the verification v0.2b.68 shipped without, both hosts having been
+unreachable at the time.
+
+
 ## v0.2b.68 -- deleting and moving files in Drive, behind the PIN
 
 Asked for directly: *"bagaimana caranya agar kita bisa hapus file di gdrive?

@@ -94,7 +94,83 @@ def collect(path: Path) -> dict:
     return syms
 
 
-def render_symbols(syms: dict, src: Path, version: str) -> str:
+def call_graph(path: Path, syms: dict) -> dict:
+    """Who calls what, among this file's own top-level names.
+
+    The index answered "does this name exist" but not "what happens if I
+    change it", which is the question you actually have when picking a
+    function apart. Without it, tracing means reading -- and reading 9,694
+    lines is exactly what this whole exercise is trying to avoid.
+    """
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    known = set(syms)
+    callers = {n: set() for n in known}
+    calls = {n: set() for n in known}
+    # Module-level code counts as a caller too, under the name "<module>".
+    # Without this the orphan list cried wolf on its very first run:
+    # _parse_tiers, _tier_summary and _load_allowed_groups_file are all used
+    # at import time, and a list that reports healthy code as dead is a list
+    # people stop reading.
+    module_body = [n for n in tree.body
+                   if not isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]
+    for stmt in module_body:
+        for node in ast.walk(stmt):
+            name = None
+            if isinstance(node, ast.Call):
+                if isinstance(node.func, ast.Name):
+                    name = node.func.id
+                elif isinstance(node.func, ast.Attribute):
+                    name = node.func.attr
+            elif isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
+                name = node.id
+            if name and name in known:
+                callers[name].add("<module>")
+
+    for fn in tree.body:
+        if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        for node in ast.walk(fn):
+            name = None
+            if isinstance(node, ast.Call):
+                if isinstance(node.func, ast.Name):
+                    name = node.func.id
+                elif isinstance(node.func, ast.Attribute):
+                    name = node.func.attr
+            elif isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
+                # A function passed by reference (a callback, a patch target)
+                # is a use too -- and those are the ones a rename breaks
+                # silently, because nothing calls them by name at that point.
+                name = node.id
+            if name and name in known and name != fn.name:
+                callers[name].add(fn.name)
+                calls[fn.name].add(name)
+    return {"callers": callers, "calls": calls}
+
+
+def area_of(name: str) -> str:
+    """Group by the prefix the codebase already uses, so the map reflects how
+    the file is really organised rather than an ordering imposed on it."""
+    n = name.lstrip("_").lower()
+    for area, keys in (
+        ("Google Drive", ("gdrive", "rclone", "drive_")),
+        ("MCP", ("mcp",)),
+        ("Sign-in / CLI", ("agy", "claude", "cli_login", "login", "logout", "reauth")),
+        ("Write gate / PIN", ("pin", "unlock", "lock", "write_mode", "guard",
+                              "secure_server", "snapshot")),
+        ("Sessions / memory", ("session", "memory", "learned", "remember", "graduate")),
+        ("Telegram plumbing", ("reply", "tg_", "telegram", "chunk", "msg", "media")),
+        ("Servers / schedules", ("server", "schedule", "cron", "boundar")),
+        ("Update / hardening", ("update", "harden", "systemd", "refresh_")),
+        ("Spend / ledger", ("ledger", "spend", "token", "cost")),
+    ):
+        if any(k in n for k in keys):
+            return area
+    if n.startswith("cmd_"):
+        return "Commands"
+    return "Core / other"
+
+
+def render_symbols(syms: dict, src: Path, version: str, graph: dict = None) -> str:
     dupes = {k: v for k, v in syms.items() if len(v) > 1}
     out = [f"# Symbol index — {src.name}",
            "",
@@ -120,15 +196,56 @@ def render_symbols(syms: dict, src: Path, version: str) -> str:
         out.append("None. Every top-level name is defined exactly once.")
     out.append("")
 
-    out.append("## All names, A–Z")
+    callers = (graph or {}).get("callers", {})
+
+    # Never referenced anywhere in this file. Entry points reached from
+    # outside belong here (handlers, main) -- but a helper nobody calls is
+    # either dead, or was orphaned by an edit that only half-landed. That
+    # happened here this week: `gdrive_ops` was used by a line that went in
+    # while the line defining it never did.
+    orphans = sorted(n for n, c in callers.items()
+                     if not c and not n.startswith("cmd_")
+                     and n != "main" and syms[n][0]["kind"] != "const")
+    out.append("## Referenced by nothing in this file")
     out.append("")
-    out.append("| name | kind | line | what it is |")
-    out.append("|---|---|---|---|")
-    for name in sorted(syms, key=str.lower):
-        for e in syms[name]:
-            doc = e["doc"].replace("|", "\\|") or "—"
-            out.append(f"| `{name}{e['sig']}` | {e['kind']} | {e['line']} | {doc} |")
+    if orphans:
+        out.append("Handlers and `main` are reached from outside and belong "
+                   "here. Anything else is either dead, or was orphaned by an "
+                   "edit that only half-landed.")
+        out.append("")
+        out.append(", ".join(f"`{n}`" for n in orphans))
+    else:
+        out.append("None.")
     out.append("")
+
+    out.append("## By area")
+    out.append("")
+    out.append("Grouped by what each name belongs to, so a change can start "
+               "from its own neighbourhood instead of from line 1. The "
+               "**used by** column answers the question you actually have "
+               "when picking something apart: what breaks if I change this.")
+    out.append("")
+    areas = {}
+    for name in syms:
+        areas.setdefault(area_of(name), []).append(name)
+    for area in sorted(areas):
+        names = sorted(areas[area], key=str.lower)
+        out.append(f"### {area} ({len(names)})")
+        out.append("")
+        out.append("| name | line | used by | what it is |")
+        out.append("|---|---|---|---|")
+        for name in names:
+            for e in syms[name]:
+                doc = e["doc"].replace("|", "\\|") or "—"
+                used = callers.get(name, set())
+                if not used:
+                    who = "—"
+                elif len(used) <= 3:
+                    who = ", ".join(f"`{u}`" for u in sorted(used))
+                else:
+                    who = f"{len(used)} callers"
+                out.append(f"| `{name}{e['sig']}` | {e['line']} | {who} | {doc} |")
+        out.append("")
     return "\n".join(out)
 
 
@@ -174,8 +291,9 @@ def main() -> None:
         sys.exit(1 if dupes else 0)
     OUT_DIR.mkdir(parents=True, exist_ok=True)
 
+    graph = call_graph(src, syms)
     (OUT_DIR / "SYMBOLS.md").write_text(
-        render_symbols(syms, src, version), encoding="utf-8")
+        render_symbols(syms, src, version, graph), encoding="utf-8")
 
     state_file = OUT_DIR / ".index-state.json"
     prev = {}
