@@ -1,5 +1,40 @@
 # Changelog
 
+## v0.2b.73 -- the agent is told what this build can do, not what the install could
+
+Asked in a group for a cut of a music video, the bot replied that it "can only
+send local media files stored on disk" and offered YouTube links instead. That
+reads like the model being unhelpful. It was not: it was reporting its
+instructions accurately.
+
+`GEMINI.md` and `SOUL.md` are written once, by the install. `install.sh` copies
+the templates only when the file does not already exist
+(`[ -f ... ] || cp`), and `/update` never touches them -- correctly, because
+they hold the operator's own servers, tone and rules, and overwriting them
+would throw that away.
+
+The consequence had gone unnoticed since the module shipped. On the live host,
+installed 2 September, grepping the deployed brief:
+
+    GDRIVE_DELETE   0
+    GDRIVE_MOVE     0
+    yt-dlp          0
+    ffmpeg          0
+
+Every capability shipped after that install date was invisible to the model
+running on it. No amount of rephrasing a request could have reached them --
+there was no prompt that would have worked.
+
+Capability documentation now lives **in code**, next to what implements it, and
+arrives with `/update` like everything else. It is injected only when a
+conversation starts -- `include_env` for agy, a fresh session for Claude -- so
+it costs ~445 tokens once per conversation rather than every turn, and it no
+longer depends on `GEMINI.md` existing at all. The operator's brief stays
+theirs, for the things only they can write.
+
+It also names the two failures behind the complaints: keep `-c:a aac` or the
+clip arrives silent, and never tell someone the bot cannot send media.
+
 ## v0.2b.72 -- the tracing tools now actually run, and actually stop things
 
 v0.2b.71 shipped correctly and the operator's `/update` still announced

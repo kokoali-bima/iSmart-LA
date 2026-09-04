@@ -2683,6 +2683,13 @@ def _run_claude_once(prompt: str, session_id: Optional[str], session_name: str, 
     # win was never verified and isn't worth depending on either way.
     memory_text = load_memory_text(chat_id)
     extra_parts = [p for p in (memory_text, owner_scope_text() if owner_dm else "") if p]
+    if not session_id:
+        # Only on a FRESH session, like agy's include_env: once it is in the
+        # history the model still has it, and re-sending it every turn would
+        # be pure waste. SOUL.md cannot carry this -- it is written by the
+        # install and never updated, so it describes whatever the feature set
+        # was on the day the box was set up.
+        extra_parts.insert(0, CAPABILITIES_BRIEF)
     combined_extra = "\n\n".join(extra_parts)
     if combined_extra:
         cmd += ["--append-system-prompt", combined_extra]
@@ -2729,6 +2736,68 @@ def run_claude(prompt: str, session_id: Optional[str], session_name: str, model:
 # agy (Antigravity CLI) invocation -- native Gemini access, fixed-price
 # --------------------------------------------------------------------------
 
+# --------------------------------------------------------------------------
+# What this agent can DO -- shipped in code, not in the operator's brief.
+#
+# GEMINI.md and SOUL.md are written once, by the install, and belong to the
+# operator: their servers, their tone, their rules. install.sh copies the
+# templates only when the file is absent (`[ -f ... ] || cp`), and /update
+# never touches them -- correctly, because overwriting them would throw away
+# whatever the operator wrote there.
+#
+# The consequence went unnoticed for weeks: every capability shipped AFTER an
+# install was invisible to the model running on it. Measured on a real host
+# installed 2 Sep -- GDRIVE_DELETE, GDRIVE_MOVE, yt-dlp and ffmpeg all appeared
+# ZERO times in its brief. Asked for a meme clip, the model answered that it
+# "can only send local media files stored on disk" and offered YouTube links
+# instead. That was not a hallucination. Given what it had been told, it was
+# correct -- and no amount of rephrasing the request could have fixed it.
+#
+# So capability documentation lives here, beside the code that implements it,
+# and arrives with /update like everything else. Injected only when a
+# conversation STARTS, exactly like the operator brief, so it costs its tokens
+# once rather than every turn.
+CAPABILITIES_BRIEF = """[What you can do here -- current as of this build:]
+
+You can produce and send real media, not just text. Say what you did; never
+tell someone you are unable to send media.
+
+  MEDIA: /path/to/file   -- on its own line, sends that file. Video arrives
+                            playable in the chat, audio as audio, images as
+                            images. The line is stripped from your reply.
+
+`ffmpeg`, `ffprobe` and `yt-dlp` are installed. Use them through Bash.
+
+  yt-dlp -f "bv*[height<=720]+ba/b[height<=720]" --merge-output-format mp4 \\
+         -o "/tmp/clip.%(ext)s" "ytsearch1:<what they asked for>"
+
+Cut BEFORE you encode, always. Measured here: a 3m42s video downloaded at 32MB
+in AV1 became 67MB re-encoded to H.264 -- bigger than the source and over the
+50MB limit. Cutting first gave 8MB in 15 seconds.
+
+  ffmpeg -y -ss <start> -i in.mp4 -t 10 -c:v libx264 -preset veryfast -crf 26 \\
+         -c:a aac -b:a 128k -movflags +faststart out.mp4
+
+Keep audio: `-c:a aac`. Dropping the audio stream, or using `-an`, sends a
+silent clip -- the usual complaint about meme clips is that they arrived mute.
+To lay sound over existing video: `-c:v copy -c:a aac -shortest` (under a
+second, no re-encode).
+
+For a meme or a "potongan"/highlight, about 10 seconds. Never past 30 unless
+asked. Ten seconds is a joke; three minutes is homework. Send the whole thing
+only when someone actually asks for the whole thing.
+
+Do not try to make a file fit the size limit yourself -- hand over what you
+produced, the bot re-encodes anything oversized and says so.
+
+Drive markers, each on its own line, all gated behind the operator's PIN:
+
+  GDRIVE: <local file> -> <folder/name>   upload
+  GDRIVE_MOVE: <from> -> <to>             move
+  GDRIVE_DELETE: <path>                   delete
+"""
+
+
 def _build_agy_prompt(prompt: str, include_env: bool = False, owner_dm: bool = False,
                       chat_id: Optional[str] = None) -> str:
     """agy has no --append-system-prompt equivalent, so context is folded into
@@ -2747,6 +2816,11 @@ def _build_agy_prompt(prompt: str, include_env: bool = False, owner_dm: bool = F
     has it, so re-sending ~2.5k tokens every turn would be pure waste.
     """
     parts: list[str] = []
+    if include_env:
+        # Capabilities first, and unconditionally: the operator's brief may be
+        # older than the build (it is never rewritten by /update), so this is
+        # the only description of the current feature set the model gets.
+        parts.append(CAPABILITIES_BRIEF)
     if include_env and GEMINI_PROMPT_FILE.exists():
         env_text = GEMINI_PROMPT_FILE.read_text().strip()
         if env_text:
