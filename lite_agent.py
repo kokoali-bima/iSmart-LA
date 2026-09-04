@@ -573,6 +573,7 @@ PIN_ACTIONS_ALLOWED_IN_GROUP = frozenset({
     "new_pin_capture", "new_pin_confirm", "change_pin_start", "schedule_install",
     "unlock", "unlock_and_resume", "addserver", "update", "rmboundary", "addmcp",
     "new_group_pin_capture", "new_group_pin_confirm", "change_group_pin_start",
+    "gdrive_mutate",
 })
 _pin_lockout_until: float = 0.0
 
@@ -6345,6 +6346,151 @@ def disconnect_gdrive_account(name: str) -> tuple[bool, str]:
     return True, detail
 
 
+# Deleting or moving something in Drive is the one Drive action that cannot be
+# undone from here, so it follows the same shape as a destructive change on a
+# managed machine: the model may only ASK, by writing a marker line, and the
+# bot is what actually does it -- after a human enters the PIN.
+#
+# The model is never given the ability itself. That is deliberate and matches
+# NEEDS_WRITE: an instruction telling a model not to delete things is a
+# request, while not handing it the tool is a fact.
+GDRIVE_RM_RE = re.compile(r"^\s*GDRIVE_DELETE:\s*(.+?)\s*$", re.MULTILINE)
+GDRIVE_MV_RE = re.compile(r"^\s*GDRIVE_MOVE:\s*(.+?)\s*->\s*(.+?)\s*$", re.MULTILINE)
+
+
+def extract_gdrive_mutations(text: str) -> tuple[str, list[dict]]:
+    """Pull GDRIVE_DELETE:/GDRIVE_MOVE: lines out and strip them from the
+    reply. Returns (clean_text, [{"op": "delete"|"move", "path": ..., ...}])."""
+    ops = []
+    for path in GDRIVE_RM_RE.findall(text):
+        ops.append({"op": "delete", "path": path.strip().strip("`\"'")})
+    for src, dst in GDRIVE_MV_RE.findall(text):
+        ops.append({"op": "move", "path": src.strip().strip("`\"'"),
+                    "to": dst.strip().strip("`\"'")})
+    clean = GDRIVE_MV_RE.sub("", GDRIVE_RM_RE.sub("", text)).strip()
+    return clean, ops
+
+
+def _gdrive_safe_path(rel: str) -> Optional[str]:
+    """A path INSIDE this deployment's own root folder, or None.
+
+    Everything the bot writes lives under GDRIVE_ROOT, and a delete must not
+    be able to walk out of it. drive.file already means the account's other
+    files are invisible, but that is Google's boundary, not ours -- and the
+    two together are what make "the bot cannot touch anything it did not put
+    there" true rather than merely likely.
+    """
+    rel = (rel or "").strip().lstrip("/")
+    if not rel or ".." in rel.split("/") or rel.startswith("~"):
+        return None
+    # A path the model wrote out in full is accepted, but only if it really
+    # does start at our own root.
+    if rel.startswith(GDRIVE_ROOT + "/"):
+        rel = rel[len(GDRIVE_ROOT) + 1:]
+    if not rel:
+        return None
+    return f"{GDRIVE_ROOT}/{rel}"
+
+
+def gdrive_mutate(remote: str, op: dict) -> tuple[bool, str]:
+    """Carry out one confirmed delete or move. Never called before a PIN."""
+    src = _gdrive_safe_path(op.get("path", ""))
+    if src is None:
+        return False, "gdrive_path_refused"
+
+    if op["op"] == "delete":
+        try:
+            # deletefile, not delete: `delete` on a path that turns out to be
+            # a directory empties the whole thing, and a one-word difference
+            # must not be what stands between removing a report and removing
+            # a folder of them.
+            out = _rclone_run("deletefile", f"{remote}:{src}", timeout=60)
+        except Exception as exc:
+            logger.warning("Drive delete failed", exc_info=True)
+            return False, f"rclone: {exc}"
+        if out.returncode != 0:
+            return False, (out.stderr or out.stdout or "").strip()[:200]
+        logger.warning("Drive file deleted: %s:%s", remote, src)
+        return True, "gdrive_deleted"
+
+    dst = _gdrive_safe_path(op.get("to", ""))
+    if dst is None:
+        return False, "gdrive_path_refused"
+    try:
+        out = _rclone_run("moveto", f"{remote}:{src}", f"{remote}:{dst}", timeout=120)
+    except Exception as exc:
+        logger.warning("Drive move failed", exc_info=True)
+        return False, f"rclone: {exc}"
+    if out.returncode != 0:
+        return False, (out.stderr or out.stdout or "").strip()[:200]
+    logger.warning("Drive file moved: %s:%s -> %s", remote, src, dst)
+    return True, "gdrive_moved"
+
+
+def _describe_gdrive_ops(lang: str, ops: list[dict]) -> str:
+    lines = []
+    for o in ops:
+        if o["op"] == "delete":
+            lines.append(_t(lang, f"🗑 delete <code>{_tg_escape(o['path'])}</code>",
+                                  f"🗑 hapus <code>{_tg_escape(o['path'])}</code>"))
+        else:
+            lines.append(_t(lang,
+                f"📦 move <code>{_tg_escape(o['path'])}</code> → "
+                f"<code>{_tg_escape(o.get('to',''))}</code>",
+                f"📦 pindah <code>{_tg_escape(o['path'])}</code> → "
+                f"<code>{_tg_escape(o.get('to',''))}</code>"))
+    return "\n".join(lines)
+
+
+async def _offer_gdrive_mutations(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                                  ops: list[dict]) -> None:
+    """Show exactly what would happen, and ask for the PIN."""
+    lang = _chat_lang(update)
+    accounts = _list_gdrive_accounts()
+    if not accounts:
+        return await _msg(update).reply_text(_t(lang,
+            "📁 No Google Drive account is connected, so there is nothing to "
+            "delete from. /connectgdrive first.",
+            "📁 Belum ada akun Google Drive terhubung, jadi tidak ada yang bisa "
+            "dihapus. /connectgdrive dulu."))
+
+    # Refuse anything outside our own folder BEFORE asking for a PIN: a
+    # confirmation card for something that would be rejected afterwards wastes
+    # the person's PIN entry and teaches them the prompt means less than it does.
+    bad = [o for o in ops if _gdrive_safe_path(o.get("path", "")) is None
+           or (o["op"] == "move" and _gdrive_safe_path(o.get("to", "")) is None)]
+    ops = [o for o in ops if o not in bad]
+    if bad:
+        await _msg(update).reply_text(_t(lang,
+            f"⚠️ Refused {len(bad)} path(s) outside <code>{GDRIVE_ROOT}/</code> — "
+            "this only ever touches files the agent itself put there.",
+            f"⚠️ Menolak {len(bad)} path di luar <code>{GDRIVE_ROOT}/</code> — "
+            "ini hanya menyentuh file yang memang ditaruh agent di sana."),
+            parse_mode="HTML")
+    if not ops:
+        return
+
+    what = _describe_gdrive_ops(lang, ops)
+    if not pin_is_set(update.effective_chat.id):
+        return await _msg(update).reply_text(_t(lang,
+            "⚠️ No PIN is set, so I won't delete or move anything in Drive. "
+            "Set one with /setpin first — this is exactly what it protects.",
+            "⚠️ Belum ada PIN, jadi saya tidak akan menghapus atau memindahkan "
+            "apa pun di Drive. Atur dulu dengan /setpin — ini persis yang "
+            "dilindunginya."))
+
+    await request_pin(update, "gdrive_mutate", {"ops": ops}, _t(lang,
+        f"<b>Google Drive — this cannot be undone from here</b>\n\n{what}\n\n"
+        "<i>Files removed this way go to your Drive's own Trash, so Google "
+        "keeps them for a while — but nothing in this bot can bring them "
+        "back.</i>",
+        f"<b>Google Drive — ini tidak bisa dibatalkan dari sini</b>\n\n{what}\n\n"
+        "<i>File yang dihapus begini masuk ke Trash Drive Anda, jadi Google "
+        "masih menyimpannya sementara — tapi tidak ada satu pun bagian bot ini "
+        "yang bisa mengembalikannya.</i>"),
+    )
+
+
 async def cmd_gdrive(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Pick (or show) which connected Drive account this room uploads to.
     Connecting an account itself is still a one-time step done directly on
@@ -6714,6 +6860,11 @@ _MSG = {
         "Google is rate-limiting or the quota is exhausted",
         "Google sedang membatasi rate, atau kuotanya habis"),
     "drive_ok": ("ok", "ok"),
+    "gdrive_deleted": ("deleted", "dihapus"),
+    "gdrive_moved": ("moved", "dipindahkan"),
+    "gdrive_path_refused": (
+        "refused -- outside this agent's own folder",
+        "ditolak -- di luar folder milik agent ini"),
     "drive_revoked_and_removed": (
         "access revoked at Google and removed locally",
         "akses dicabut di Google dan dihapus dari server ini"),
@@ -7445,6 +7596,28 @@ async def _pin_verified(update: Update, context: ContextTypes.DEFAULT_TYPE,
 
     if action == "addserver":
         await _begin_addserver(update, query)
+        return
+
+    if action == "gdrive_mutate":
+        loop = asyncio.get_running_loop()
+        remote = _gdrive_effective_default(str(update.effective_chat.id),
+                                           _list_gdrive_accounts())
+        done, failed = [], []
+        for op in payload["ops"]:
+            ok, detail = await loop.run_in_executor(None, gdrive_mutate, remote, op)
+            (done if ok else failed).append((op, detail))
+        lines = []
+        if done:
+            lines.append(_t(lang, f"✅ {len(done)} done:", f"✅ {len(done)} selesai:"))
+            lines.append(_describe_gdrive_ops(lang, [o for o, _ in done]))
+        if failed:
+            lines.append("")
+            lines.append(_t(lang, f"⚠️ {len(failed)} failed:",
+                                  f"⚠️ {len(failed)} gagal:"))
+            for o, d in failed:
+                lines.append(f"• <code>{_tg_escape(o['path'])}</code> — "
+                             f"{_tg_escape(_detail(lang, d))}")
+        await query.edit_message_text("\n".join(lines), parse_mode="HTML")
         return
 
     if action == "addmcp":
@@ -9180,6 +9353,7 @@ async def _run_turn_inner(update: Update, context: ContextTypes.DEFAULT_TYPE, te
     reply_text, schedule_proposals = extract_schedules(reply_text)
     reply_text, snapshots_taken = extract_snapshots(reply_text)
     reply_text, needs_write = extract_needs_write(reply_text)
+    reply_text, gdrive_ops = extract_gdrive_mutations(reply_text)
     for snap in snapshots_taken:
         register_snapshot(snap)
     clean_text, media_paths = extract_media_paths(reply_text)
@@ -9253,6 +9427,14 @@ async def _run_turn_inner(update: Update, context: ContextTypes.DEFAULT_TYPE, te
                     logger.exception("even the failure notice couldn't be delivered (chat=%s)", chat_id)
 
     await _maybe_notify_update(update, context)
+
+    # The model asked to remove or move something in Drive. It cannot do that
+    # itself -- it can only write the marker, and this is where a human is
+    # asked for the PIN. Same shape as NEEDS_WRITE below, for the same reason:
+    # an instruction telling a model not to delete things is a request, while
+    # not handing it the tool is a fact.
+    if gdrive_ops:
+        await _offer_gdrive_mutations(update, context, gdrive_ops)
 
     # Refused by the node guard? Offer to unlock (snapshotting first if the
     # operator wants) and re-run. Nothing is guessed from the wording of the

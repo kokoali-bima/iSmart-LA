@@ -1,5 +1,53 @@
 # Changelog
 
+## v0.2b.68 -- deleting and moving files in Drive, behind the PIN
+
+Asked for directly: *"bagaimana caranya agar kita bisa hapus file di gdrive?
+memindahkan atau menghapus file di gdrive wajib memakai pin sebelum
+eksekusi."*
+
+Feasibility was checked against the real connected account before any of it
+was written, because `drive.file` only reaches files this client created and
+it was not obvious that covered removing them. A probe file was uploaded,
+moved with `rclone moveto`, deleted with `rclone deletefile`, and the folder
+was verifiably empty afterwards. It works.
+
+The shape follows `NEEDS_WRITE`, for the same reason: **the model may only
+ask.** It writes `GDRIVE_DELETE: <path>` or `GDRIVE_MOVE: <a> -> <b>`, the
+markers are stripped from what the user reads, and the bot shows a card naming
+every affected file and requires the PIN before touching anything. An
+instruction telling a model not to delete things is a request; not handing it
+the tool is a fact.
+
+Details that matter:
+
+- **`deletefile`, never `delete`.** rclone's `delete` on a path that turns out
+  to be a directory empties the whole thing, and one word must not be what
+  stands between removing a report and removing a folder of them.
+- **Nothing outside the shared root**, checked before the PIN is requested --
+  a card for something that would be rejected afterwards wastes the entry and
+  teaches people the prompt means less than it does. `drive.file` already
+  hides the account's other files; that is Google's boundary, this is ours,
+  and the two together make "cannot touch what it did not put there" true
+  rather than merely likely.
+- **No PIN set means refuse**, not proceed with a warning. `/addserver` only
+  warns because it can be undone; this cannot.
+- The card says plainly that nothing here can bring the file back, while
+  noting Drive's own Trash still holds it for a while.
+- Both briefs now describe the markers, including that the model must not tell
+  anyone it deleted something -- it has not; a human still has to approve.
+
+**One bug of my own, caught by the suite rather than by review.** The
+extraction line was never written: the script that was meant to add it hit an
+assertion first and wrote nothing, while the line that USES the result went in
+separately. Five suites reported `NameError: name 'gdrive_ops' is not defined`.
+
+Verified locally across 31 suites (633/635; the two skips and one failure are
+long-standing Windows-only artifacts). **Re-verification on the Linux target
+is still pending** -- both hosts became unreachable partway through, and this
+release has not yet had the run on real Linux the others in this series did.
+
+
 ## v0.2b.67 -- a symbol index, so a name collision is visible before it is written
 
 `dev/code_index.py`, written directly out of the v0.2b.66 incident: a new

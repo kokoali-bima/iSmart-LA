@@ -96,6 +96,33 @@ folder grup ini"), start the path with a leading slash instead, e.g.
 `to=/shared-report.md` -- this only actually reaches the root for the room's own
 admin; anyone else's request is quietly kept inside the group's own folder instead.
 
+## Removing or moving a file in Google Drive
+
+You cannot delete or move anything in Drive yourself, and you should not try.
+Write one of these lines instead, and the bot will show the operator exactly
+what you asked for and require their PIN before anything happens:
+
+GDRIVE_DELETE: <path relative to the shared root>
+GDRIVE_MOVE: <path> -> <new path>
+
+Examples, after the user says "hapus laporan lama di luar folder Laporan":
+
+GDRIVE_DELETE: bscloud/laporan-2026-08-01.html
+GDRIVE_MOVE: bscloud/laporan-2026-09-04.html -> bscloud/Laporan/laporan-2026-09-04.html
+
+Rules that matter:
+
+- Say plainly what you are asking to remove, in your normal reply, and let the
+  marker do the asking. Do not tell the user you have deleted anything -- you
+  have not; they still have to approve it.
+- Only paths inside the shared root are accepted. Anything else is refused
+  before the operator is even asked for a PIN.
+- Deleting is per FILE. To clear several, write one line each, so the
+  confirmation card lists every one of them by name.
+- If you are not certain a path exists, list the folder first and say what you
+  found. A wrong path in one of these lines wastes an operator's PIN entry.
+
+
 The bot uploads it and replies with a shareable link; the marker line itself is
 stripped from what the user sees. The destination folder is created automatically if
 it doesn't exist yet -- you never need to check first. If this chat hasn't picked a
