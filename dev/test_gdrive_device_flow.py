@@ -248,14 +248,16 @@ async def main():
     with patch.object(mod, "_rclone_run",
                       return_value=SimpleNamespace(returncode=0, stdout="", stderr="")):
         ok, detail = mod.check_gdrive_account("gdrive")
-    check("a working remote reports healthy", ok and detail == "ok")
+    check("a working remote reports healthy", ok and detail == "drive_ok")
 
     with patch.object(mod, "_rclone_run",
                       return_value=SimpleNamespace(returncode=1, stdout="",
                                                    stderr="couldn't fetch token: invalid_grant")):
         ok, detail = mod.check_gdrive_account("gdrive")
     check("a dead sign-in is reported as such, with what to do about it",
-          not ok and "connectgdrive" in detail)
+          not ok and detail == "drive_signin_dead"
+          and "connectgdrive" in mod._detail("en", detail)
+          and "connectgdrive" in mod._detail("id", detail))
 
     # --- the three ways this got someone stuck in a real session ----------
     # Reported as "ga bisa2 nambah gdrive": /gdrive told them to ask an

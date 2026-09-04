@@ -80,7 +80,14 @@ check("the rclone remote is deleted through rclone's own config API, never by "
 check("the grant is REVOKED at Google, not merely forgotten locally -- "
       "otherwise a leaked config file still holds live access",
       revoked and revoked[0].get("token") == "R123")
-check("...and the reply says so", "revoked" in detail)
+check("...and the reply says so, in both languages",
+      detail.startswith("drive_revoked_and_removed")
+      and "revoked" in mod._detail("en", detail)
+      and "dicabut" in mod._detail("id", detail))
+check("...with the room count rendered in both, not glued on as English prose "
+      "that would stop the whole thing being a translatable key",
+      "1 room unset" in mod._detail("en", detail)
+      and "1 room dilepas" in mod._detail("id", detail))
 
 rooms = mod._read_gdrive_room_accounts()
 check("a room pointing at the removed account is unset, so uploads cannot "
@@ -119,7 +126,9 @@ with patch.object(mod, "_rclone_run", side_effect=run3), \
 check("if Google can't be reached, the local removal still happens", ok)
 check("...and the reply admits the grant was NOT revoked, rather than "
       "claiming a logout that did not happen",
-      "could not reach Google" in detail)
+      detail == "drive_removed_only"
+      and "could not reach Google" in mod._detail("en", detail)
+      and "tidak terjangkau" in mod._detail("id", detail))
 
 # A token rclone won't give up must not stop the removal either.
 run4, _ = rclone_stub({})

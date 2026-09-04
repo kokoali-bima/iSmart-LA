@@ -3205,7 +3205,7 @@ def run_combo(prompt: str, sess: dict, session_name: str,
 # Telegram handlers
 # --------------------------------------------------------------------------
 
-def _authorized(update: Update) -> bool:
+def _authorized(update: Update, allow_edited: bool = False) -> bool:
     # A handler with no way to answer must not try. update.message is None for
     # an edited message, a channel post, and anything else that isn't a plain
     # new message -- while every command below reaches straight for
@@ -3225,7 +3225,14 @@ def _authorized(update: Update) -> bool:
     # is the backstop, one comparison wide: the next update type that slips
     # through degrades into a silently ignored command instead of a traceback.
     if update.message is None and update.callback_query is None:
-        return False
+        # Editing a message to ADD the @mention you forgot is a natural thing
+        # to do, and it produced no answer at all: edited updates were blocked
+        # outright because a hundred-odd call sites reach for
+        # update.message.reply_text, which is None for one. Commands still
+        # are -- an edited /usemodel crashed this bot for real -- but the
+        # plain-message path opts in, and reads effective_message instead.
+        if not (allow_edited and update.edited_message is not None):
+            return False
 
     chat_id = update.effective_chat.id if update.effective_chat else None
     user_id = update.effective_user.id if update.effective_user else None
@@ -3723,11 +3730,11 @@ def _gdrive_upload(remote: str, local_path: str, drive_rel_path: str) -> tuple[b
     dest = f"{remote}:{GDRIVE_ROOT}/{drive_rel_path}"
     try:
         subprocess.run(
-            [RCLONE_BIN, "copyto", local_path, dest],
+            [_rclone_path() or RCLONE_BIN, "copyto", local_path, dest],
             check=True, capture_output=True, text=True, timeout=120,
         )
         link = subprocess.run(
-            [RCLONE_BIN, "link", dest],
+            [_rclone_path() or RCLONE_BIN, "link", dest],
             check=True, capture_output=True, text=True, timeout=30,
         )
         return True, link.stdout.strip()
@@ -4744,8 +4751,8 @@ async def _gdrive_begin_rclone(update: Update, context: ContextTypes.DEFAULT_TYP
     if not ok:
         _gdrive_wizard.pop(chat_id, None)
         return await update.message.reply_text(_t(lang,
-            f"⚠️ Could not start the sign-in: {result}",
-            f"⚠️ Tidak bisa memulai sign-in: {result}"))
+            f"⚠️ Could not start the sign-in: {_detail('en', result)}",
+            f"⚠️ Tidak bisa memulai sign-in: {_detail('id', result)}"))
 
     state = _gdrive_wizard.get(chat_id)
     if state is not None:
@@ -4806,7 +4813,7 @@ async def _gdrive_begin_device(update: Update, context: ContextTypes.DEFAULT_TYP
             ))
             return await _gdrive_begin_rclone(update, context, lang, name)
         _gdrive_wizard.pop(chat_id, None)
-        detail = str(body.get("error_description", "unknown"))
+        detail = _detail(lang, str(body.get("error_description", "unknown")))
         return await update.message.reply_text(_t(lang,
             f"⚠️ Google refused to start the sign-in: {detail}",
             f"⚠️ Google menolak memulai sign-in: {detail}",
@@ -5050,19 +5057,20 @@ async def _handle_gdrive_wizard_input(update: Update, context: ContextTypes.DEFA
             # Left in place on purpose: a mistyped paste should let them try
             # again with the same link, not send them back to the start.
             return await update.message.reply_text(_t(lang,
-                f"⚠️ {result}", f"⚠️ {result}"))
+                f"⚠️ {_detail('en', result)}", f"⚠️ {_detail('id', result)}"))
         name = state.get("name") or "gdrive"
         ok, detail = await loop.run_in_executor(
             None, connect_gdrive_account, name, result)
         await loop.run_in_executor(None, gdrive_rclone_cleanup, handle)
         _gdrive_wizard.pop(chat_id, None)
-        safe = _tg_escape(str(detail))
+        en = _tg_escape(_detail("en", str(detail)))
+        id_ = _tg_escape(_detail("id", str(detail)))
         await update.message.reply_text(
-            _t(lang, f"✅ <b>{_tg_escape(name)}</b> connected. {safe}",
-                     f"✅ <b>{_tg_escape(name)}</b> terhubung. {safe}")
+            _t(lang, f"✅ <b>{_tg_escape(name)}</b> connected. {en}",
+                     f"✅ <b>{_tg_escape(name)}</b> terhubung. {id_}")
             if ok else
-            _t(lang, f"⚠️ Could not finish: {safe}",
-                     f"⚠️ Tidak bisa menyelesaikan: {safe}"),
+            _t(lang, f"⚠️ Could not finish: {en}",
+                     f"⚠️ Tidak bisa menyelesaikan: {id_}"),
             parse_mode="HTML")
         return True
 
@@ -5703,12 +5711,45 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if not _authorized(update):
         return
     lang = _chat_lang(update)
-    state = _wizard.pop(update.effective_chat.id, None)
+    chat_id = update.effective_chat.id
+    cancelled = []
+
+    # /cancel used to know about the sign-in wizard only. Every other flow that
+    # tells you "send /cancel to stop" -- the Drive connect, /addserver -- got
+    # "Nothing to cancel" instead, which reads as if the bot has lost track of
+    # what it just asked you to do. Reported from a real session, on a card
+    # that had said "Kirim /cancel untuk berhenti" three lines earlier.
+    state = _wizard.pop(chat_id, None)
     if state:
-        state["handle"].kill()
-        await update.message.reply_text(_t(lang, "✖️ Cancelled.", "✖️ Dibatalkan."))
+        try:
+            state["handle"].kill()
+        except Exception:
+            logger.warning("could not stop the sign-in process", exc_info=True)
+        cancelled.append(_t(lang, "sign-in", "sign-in"))
+
+    gd = _gdrive_wizard.pop(chat_id, None)
+    if gd:
+        # An rclone authorize left running still owns port 53682, and its log
+        # holds a live token until it is removed.
+        handle = gd.get("handle")
+        if handle:
+            try:
+                gdrive_rclone_cleanup(handle)
+            except Exception:
+                logger.warning("could not clean up the Drive sign-in", exc_info=True)
+        cancelled.append(_t(lang, "the Google Drive connect",
+                                  "penghubungan Google Drive"))
+
+    if _server_wizard.pop(chat_id, None) is not None:
+        cancelled.append(_t(lang, "adding a server", "penambahan server"))
+
+    if cancelled:
+        what = ", ".join(cancelled)
+        await update.message.reply_text(_t(lang,
+            f"✖️ Cancelled: {what}.", f"✖️ Dibatalkan: {what}."))
     else:
-        await update.message.reply_text(_t(lang, "Nothing to cancel.", "Tidak ada yang perlu dibatalkan."))
+        await update.message.reply_text(_t(lang,
+            "Nothing to cancel.", "Tidak ada yang perlu dibatalkan."))
 
 
 def _tier_summary() -> str:
@@ -6188,13 +6229,13 @@ def check_gdrive_account(name: str, timeout: int = 30) -> tuple[bool, str]:
     except Exception as exc:
         return False, f"could not run rclone: {exc}"
     if probe.returncode == 0:
-        return True, "ok"
+        return True, "drive_ok"
     err = (probe.stderr or probe.stdout or "").strip()
     low = err.lower()
     if "token" in low and ("expired" in low or "invalid" in low or "revoked" in low):
-        return False, "the sign-in has expired or been revoked -- /connectgdrive again"
+        return False, "drive_signin_dead"
     if "quota" in low or "rate" in low:
-        return False, "Google is rate-limiting or the quota is exhausted"
+        return False, "drive_rate_limited"
     return False, err[:200] or f"rclone exited {probe.returncode}"
 
 
@@ -6270,14 +6311,14 @@ def disconnect_gdrive_account(name: str) -> tuple[bool, str]:
     the other way round, and the destructive reading is unrecoverable.
     """
     if name not in _list_gdrive_accounts():
-        return False, f"'{name}' isn't connected"
+        return False, "drive_not_connected"
 
     revoked = _revoke_google_token(_gdrive_stored_refresh_token(name))
 
     try:
         out = _rclone_run("config", "delete", name, timeout=20)
     except Exception as exc:
-        return False, f"couldn't run rclone: {exc}"
+        return False, "drive_rclone_failed"
     if out.returncode != 0:
         return False, (out.stderr or out.stdout or "rclone config delete failed").strip()[:300]
 
@@ -6293,10 +6334,14 @@ def disconnect_gdrive_account(name: str) -> tuple[bool, str]:
 
     logger.warning("Drive account disconnected: %s (revoked=%s, rooms cleared=%d)",
                    name, revoked, len(orphaned))
-    detail = "access revoked at Google and removed locally" if revoked else \
-             "removed locally (could not reach Google to revoke the grant)"
+    detail = ("drive_revoked_and_removed" if revoked
+              else "drive_removed_only")
     if orphaned:
-        detail += f"; {len(orphaned)} room(s) unset"
+        # Carried as structured data, not appended prose: gluing a sentence
+        # onto the end would stop it being a key, and _msg() would hand the
+        # whole thing back untranslated -- which is exactly what happened the
+        # first time this was written.
+        detail += f"|rooms={len(orphaned)}"
     return True, detail
 
 
@@ -6606,6 +6651,112 @@ RCLONE_AUTH_START_TIMEOUT = 20    # seconds to wait for it to print its state
 RCLONE_AUTH_FINISH_TIMEOUT = 60
 
 
+# Detail strings these helpers return end up inside a bilingual wrapper, which
+# produced replies that were half-translated: "Tidak bisa memulai sign-in:
+# rclone isn't installed on this host. Install it with: curl ..." -- reported
+# from a real screenshot. The wrapper was translated; the sentence inside it
+# never was.
+#
+# Keys rather than sentences, because these functions are sync and are also
+# called from places with no chat language at all (startup, /update). The
+# language is only known where the message is shown, so that is where it is
+# resolved.
+#
+# Anything NOT in this table passes through untouched, deliberately: rclone's
+# stderr and Google's error strings are technical output we did not write, and
+# inventing an Indonesian rendering of them would be worse than showing what
+# the tool actually said.
+_MSG = {
+    "rclone_missing_unsupported": (
+        "no rclone here, and I only know how to fetch the linux-amd64 build. "
+        "Install it with: curl https://rclone.org/install.sh | sudo bash",
+        "rclone belum ada di sini, dan saya hanya bisa mengunduh versi "
+        "linux-amd64. Pasang dengan: curl https://rclone.org/install.sh | sudo bash"),
+    "rclone_download_failed": (
+        "couldn't download rclone. Install it with: "
+        "curl https://rclone.org/install.sh | sudo bash",
+        "gagal mengunduh rclone. Pasang manual dengan: "
+        "curl https://rclone.org/install.sh | sudo bash"),
+    "rclone_wont_run": (
+        "downloaded rclone but it would not run",
+        "rclone terunduh tapi tidak bisa dijalankan"),
+    "rclone_no_start": (
+        "could not start rclone",
+        "tidak bisa menjalankan rclone"),
+    "rclone_no_link": (
+        "rclone did not produce a sign-in link in time",
+        "rclone tidak menghasilkan link sign-in tepat waktu"),
+    "rclone_no_google_link": (
+        "rclone started but did not hand back a Google link",
+        "rclone jalan tapi tidak mengembalikan link Google"),
+    "code_not_found": (
+        "I couldn't find a code in that. Copy the whole address from the "
+        "browser bar -- the page will look broken, which is expected -- or "
+        "just the part after code=.",
+        "Saya tidak menemukan kode di situ. Salin seluruh alamat dari address "
+        "bar browser -- halamannya memang terlihat gagal, itu wajar -- atau "
+        "cukup bagian setelah code=."),
+    "code_rejected": (
+        "Google rejected that code. It is single-use and expires quickly -- "
+        "run /connectgdrive again for a fresh link.",
+        "Google menolak kode itu. Kodenya sekali-pakai dan cepat kedaluwarsa "
+        "-- jalankan /connectgdrive lagi untuk link baru."),
+    "code_no_token": (
+        "rclone did not return a token in time",
+        "rclone tidak mengembalikan token tepat waktu"),
+    "code_handoff_failed": (
+        "could not hand the code to rclone",
+        "gagal menyerahkan kode ke rclone"),
+    "drive_signin_dead": (
+        "the sign-in has expired or been revoked -- /connectgdrive again",
+        "sign-in-nya kedaluwarsa atau dicabut -- /connectgdrive lagi"),
+    "drive_rate_limited": (
+        "Google is rate-limiting or the quota is exhausted",
+        "Google sedang membatasi rate, atau kuotanya habis"),
+    "drive_ok": ("ok", "ok"),
+    "drive_revoked_and_removed": (
+        "access revoked at Google and removed locally",
+        "akses dicabut di Google dan dihapus dari server ini"),
+    "drive_removed_only": (
+        "removed locally (could not reach Google to revoke the grant)",
+        "dihapus dari server ini (Google tidak terjangkau untuk mencabut izinnya)"),
+    "drive_not_connected": (
+        "that account isn't connected",
+        "akun itu tidak terhubung"),
+    "drive_rclone_failed": (
+        "couldn't run rclone",
+        "tidak bisa menjalankan rclone"),
+}
+
+
+def _detail(lang: str, detail: str) -> str:
+    """Translate one of OUR message keys; pass anything else through.
+
+    Named _detail, not _msg: this file already had a _msg(update) that every
+    reply path calls, and defining a second _msg with a different signature
+    silently replaced it -- every message the bot sent then failed with
+    "TypeError: _msg() missing 1 required positional argument", twice per
+    turn, two seconds apart because the delivery retry masked it as slowness
+    rather than an error. Caught only because a concurrency test measured how
+    long a turn took.
+
+    A key may carry structured extras after "|", e.g. "drive_removed_only|
+    rooms=2". They are rendered here rather than glued onto the key by the
+    caller, because a key with prose appended is no longer a key and would
+    come back untranslated in full."""
+    key, _, extra = detail.partition("|")
+    pair = _MSG.get(key)
+    if not pair:
+        return detail
+    indo = (lang or DEFAULT_LANGUAGE).startswith("id")
+    out = pair[1] if indo else pair[0]
+    if extra.startswith("rooms="):
+        n = extra[6:]
+        out += (f"; {n} room dilepas dari akun itu" if indo
+                else f"; {n} room unset")
+    return out
+
+
 RCLONE_LOCAL_BIN = BASE_DIR / "bin" / "rclone"
 RCLONE_DOWNLOAD_URL = "https://downloads.rclone.org/rclone-current-linux-amd64.zip"
 
@@ -6643,10 +6794,7 @@ def ensure_rclone() -> tuple[bool, str]:
     if existing:
         return True, existing
     if sys.platform != "linux" or platform.machine() not in ("x86_64", "amd64"):
-        return False, (f"no rclone here, and I only know how to fetch the "
-                       f"linux-amd64 build (this is {sys.platform}/"
-                       f"{platform.machine()}). Install it with: "
-                       f"curl https://rclone.org/install.sh | sudo bash")
+        return False, "rclone_missing_unsupported"
     staging = Path(tempfile.mkdtemp(prefix="isla_rcdl_"))
     try:
         RCLONE_LOCAL_BIN.parent.mkdir(parents=True, exist_ok=True)
@@ -6662,8 +6810,7 @@ def ensure_rclone() -> tuple[bool, str]:
         RCLONE_LOCAL_BIN.chmod(0o755)
     except Exception as exc:
         logger.warning("could not fetch rclone", exc_info=True)
-        return False, (f"couldn't download rclone ({exc}). Install it with: "
-                       f"curl https://rclone.org/install.sh | sudo bash")
+        return False, "rclone_download_failed"
     finally:
         # finally, not just the happy path: an exception halfway through left
         # the staging directory behind, which is how stale isla_* directories
@@ -6674,7 +6821,7 @@ def ensure_rclone() -> tuple[bool, str]:
                            capture_output=True, text=True, timeout=30)
     if probe.returncode != 0:
         RCLONE_LOCAL_BIN.unlink(missing_ok=True)
-        return False, "downloaded rclone but it would not run"
+        return False, "rclone_wont_run"
     logger.warning("rclone fetched into %s (%s)", RCLONE_LOCAL_BIN,
                    (probe.stdout or "").splitlines()[0] if probe.stdout else "?")
     return True, str(RCLONE_LOCAL_BIN)
@@ -6753,7 +6900,7 @@ def gdrive_rclone_start(scope: str = "drive.file") -> tuple[bool, str, dict]:
             stdout=out.open("wb"), stderr=subprocess.STDOUT,
             stdin=subprocess.DEVNULL, start_new_session=True)
     except Exception as exc:
-        return _give_up(f"could not start rclone: {exc}")
+        return _give_up("rclone_no_start")
 
     deadline = time.time() + RCLONE_AUTH_START_TIMEOUT
     state = ""
@@ -6772,13 +6919,13 @@ def gdrive_rclone_start(scope: str = "drive.file") -> tuple[bool, str, dict]:
             return _give_up(proc_out)
     if not state:
         proc.kill()
-        return _give_up("rclone did not produce a sign-in link in time")
+        return _give_up("rclone_no_link")
 
     auth_url = _http_redirect_location(
         f"http://127.0.0.1:{RCLONE_AUTH_PORT}/auth?state={state}")
     if not auth_url or "accounts.google.com" not in auth_url:
         proc.kill()
-        return _give_up("rclone started but did not hand back a Google link")
+        return _give_up("rclone_no_google_link")
 
     return True, auth_url, {"pid": proc.pid, "state": state, "log": str(out)}
 
@@ -6805,9 +6952,7 @@ def gdrive_rclone_finish(handle: dict, pasted: str) -> tuple[bool, str]:
     """Hand the code to the waiting rclone and return its token JSON."""
     code = _extract_oauth_code(pasted)
     if not code:
-        return False, ("I couldn't find a code in that. Copy the whole address "
-                       "from the browser bar -- the page will look broken, "
-                       "which is expected -- or just the part after code=.")
+        return False, "code_not_found"
     state = handle.get("state", "")
     try:
         urllib.request.urlopen(
@@ -6815,7 +6960,7 @@ def gdrive_rclone_finish(handle: dict, pasted: str) -> tuple[bool, str]:
             f"?state={urllib.parse.quote(state)}&code={urllib.parse.quote(code)}",
             timeout=20).read()
     except Exception as exc:
-        return False, f"could not hand the code to rclone: {exc}"
+        return False, "code_handoff_failed"
 
     log = Path(handle.get("log", ""))
     deadline = time.time() + RCLONE_AUTH_FINISH_TIMEOUT
@@ -6829,10 +6974,8 @@ def gdrive_rclone_finish(handle: dict, pasted: str) -> tuple[bool, str]:
         if m:
             return True, m.group(1)
         if "Fatal error" in text or "invalid_grant" in text:
-            return False, ("Google rejected that code. It is single-use and "
-                           "expires quickly -- run /connectgdrive again for a "
-                           "fresh link.")
-    return False, "rclone did not return a token in time"
+            return False, "code_rejected"
+    return False, "code_no_token"
 
 
 def gdrive_rclone_cleanup(handle: dict) -> None:
@@ -7002,7 +7145,7 @@ def connect_gdrive_account(name: str, token_raw: str) -> tuple[bool, str]:
                              "scope=drive.file", f"token={token_raw}",
                              "--non-interactive")
     except Exception as exc:
-        return False, f"couldn't run rclone: {exc}"
+        return False, "drive_rclone_failed"
     if create.returncode != 0:
         return False, (create.stderr or create.stdout or "rclone config create failed").strip()[:400]
 
@@ -8796,7 +8939,10 @@ def _prune_incoming_media(keep_hours: int = 24) -> None:
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not _authorized(update):
+    if not _authorized(update, allow_edited=True):
+        return
+    msg = update.effective_message
+    if msg is None:
         return
     chat = update.effective_chat
     mention_span = None
@@ -8824,7 +8970,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if image_path is not None:
         _prune_incoming_media()
 
-    text = update.message.text or update.message.caption or ""
+    text = msg.text or msg.caption or ""
 
     # Strip the "@botname" BEFORE anything rewrites the text. The entity
     # offsets Telegram gave us index the ORIGINAL message; they are only still
@@ -8842,10 +8988,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         text = (f"{question}\n\n"
                 f"[The user attached an image. Read it from this path before "
                 f"answering: {image_path}]")
-    elif update.message.photo or update.message.document:
+    elif msg.photo or msg.document:
         # Something WAS attached, and it isn't an image this can pass on.
         # Say so rather than staying silent.
-        return await update.message.reply_text(_t(_chat_lang(update),
+        return await msg.reply_text(_t(_chat_lang(update),
             "I can read images (a screenshot, a photo), but not this kind of "
             "attachment. Send it as an image, or describe it in text.",
             "Saya bisa membaca gambar (screenshot, foto), tapi bukan lampiran "
@@ -9330,6 +9476,10 @@ def main() -> None:
     app.add_handler(MessageHandler(
         (filters.TEXT | filters.PHOTO | filters.Document.ALL) & ~filters.COMMAND,
         handle_message))
+    # Edited messages reach the same handler, but ONLY here: commands still
+    # ignore them, because that is where the crash was.
+    app.add_handler(MessageHandler(
+        filters.UpdateType.EDITED_MESSAGE & ~filters.COMMAND, handle_message))
 
     apply_hardening_on_start()
     logger.info("Lite Agent starting (allowed users: %s)", ALLOWED_USER_IDS or "ANY (no allowlist!)")
@@ -9354,7 +9504,8 @@ def main() -> None:
     # appears at over a hundred call sites in this file, so the fix belongs
     # here, at the source, rather than patched into each one by hand.
     app.run_polling(drop_pending_updates=False,
-                    allowed_updates=["message", "callback_query"])
+                    allowed_updates=["message", "edited_message",
+                                     "callback_query"])
 
 
 if __name__ == "__main__":

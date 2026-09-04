@@ -1,5 +1,54 @@
 # Changelog
 
+## v0.2b.66 -- four bugs, one of them mine and nearly shipped
+
+**A name collision that would have broken every reply.** Adding a bilingual
+message helper called `_msg(lang, detail)` silently replaced a `_msg(update)`
+that had been here far longer and is called by every reply path. Every message
+the bot sent then failed with *"TypeError: _msg() missing 1 required
+positional argument"* -- twice per turn, two seconds apart, because the
+delivery retry masked it as slowness rather than an error. It was caught only
+because a concurrency test measured how long a turn took: turns still ran in
+parallel (peak=3) but took 3.4s of work worth 0.4s. Renamed to `_detail()`.
+
+That is exactly the failure mode this release's other work is about, and it
+argues for the tracing index requested alongside it: a new name that collides
+with an old one is invisible at the point you write it.
+
+**Drive uploads failed on any host where the bot fetched its own rclone.**
+`FileNotFoundError: [Errno 2] No such file or directory: 'rclone'`, live on
+bscloud. `_rclone_run()` was taught to resolve the path in v0.2b.64, but
+`_gdrive_upload()` builds its own `subprocess.run` calls and was missed -- so
+the sign-in worked and then every upload and share-link failed. Both call
+sites now use the resolver, and a test asserts no invocation is left using the
+bare name.
+
+**`/cancel` did not cancel what the card said it would.** The Drive sign-in
+card ends with "Kirim /cancel untuk berhenti", and `/cancel` answered "Nothing
+to cancel" -- it only knew about the sign-in wizard. It now cancels the Drive
+connect and `/addserver` too, says which, and cleans up the rclone process
+(which otherwise keeps port 53682 and a live token in its log).
+
+**Editing a message to add a forgotten @mention got no answer.** Blocking
+`edited_message` outright (v0.2b.46) closed a real crash, and also broke
+something people do constantly. Edited updates are delivered again, with the
+crash held off one layer lower: `_authorized()` refuses a message-less update
+unless the caller passes `allow_edited=True`, exactly one caller does
+(`handle_message`, which reads `effective_message`), and commands never do --
+so cmd_usemodel, where it crashed, still ignores them.
+
+**Also: the half-translated replies.** Helper functions returned English
+sentences that were then shown inside a bilingual wrapper, producing "Tidak
+bisa memulai sign-in: rclone isn't installed on this host. Install it with:
+curl ...". They now return keys, resolved to a language where the message is
+shown -- these helpers are sync and are also called with no chat language at
+all (startup, /update), so the wording cannot be chosen where it is produced.
+Untranslatable technical output (rclone's stderr, Google's own errors) passes
+through unchanged rather than being given an invented Indonesian rendering.
+
+Full suite: **656/656 across 30 suites** on the real Linux target.
+
+
 ## v0.2b.65 -- say that rclone is being fetched, before going quiet for it
 
 v0.2b.64 made the bot fetch rclone for itself when a host has none. That

@@ -130,9 +130,48 @@ async def main():
           re.search(r"if update\.message is None:\s*\n\s*return False", src) is None)
 
     # --- 6. allowed_updates, the primary defence, is still in place ---------
-    check("allowed_updates still restricts the update types that arrive at all "
-          "(v0.2b.46's fix, which this only backs up)",
-          'allowed_updates=["message", "callback_query"]' in src)
+    # Still a restricted list, just a longer one: edited_message was added so
+    # that adding a forgotten @mention by editing works, and the guard above is
+    # what keeps that safe for commands. Channel posts and the rest stay out.
+    check("allowed_updates is still an explicit allowlist, not everything",
+          "allowed_updates=[" in src and '"channel_post"' not in src)
+    check("...and carries exactly the three types this bot handles",
+          all(f'"{t}"' in src for t in ("message", "edited_message", "callback_query")))
+
+    # --- editing a message to ADD the mention you forgot -------------------
+    # Reported: "kirim teks, lupa tag bot, lalu edit untuk menambahkan tag --
+    # tidak dapat respons apa pun". Edited updates were blocked outright
+    # because update.message is None for one and a hundred-odd call sites
+    # reach straight for update.message.reply_text. Commands still ignore
+    # them -- an edited /usemodel crashed this bot for real -- but the plain
+    # message path now opts in and reads effective_message instead.
+    edited_msg = SimpleNamespace(text="@bot lihat ini", caption=None,
+                                 caption_entities=None, entities=[],
+                                 photo=None, document=None,
+                                 reply_to_message=None, reply_text=AsyncMock())
+    edited = SimpleNamespace(message=None, edited_message=edited_msg,
+                             callback_query=None, effective_message=edited_msg,
+                             effective_user=SimpleNamespace(id=111),
+                             effective_chat=SimpleNamespace(id=111, type="private",
+                                                            title=None))
+    check("an edited message is still refused by default, so commands cannot "
+          "crash on it", mod._authorized(edited) is False)
+    check("...but the plain-message path can opt in",
+          mod._authorized(edited, allow_edited=True) is True)
+
+    got = {}
+    async def cap(update, context, text, **kw):
+        got["text"] = text
+    with patch.object(mod, "_run_turn", side_effect=cap),          patch.object(mod, "_handle_wizard_input", new=AsyncMock(return_value=False)),          patch.object(mod, "_handle_server_input", new=AsyncMock(return_value=False)):
+        await mod.handle_message(edited, ctx())
+    check("editing a message to add the tag now gets an answer",
+          got.get("text") == "@bot lihat ini")
+
+    src2 = Path(SRC).read_text(encoding="utf-8")
+    check("edited updates are actually delivered by the poller",
+          '"edited_message"' in src2)
+    check("...and routed to handle_message, but never to commands",
+          "UpdateType.EDITED_MESSAGE" in src2 and "~filters.COMMAND, handle_message" in src2)
 
     failed = [n for n, ok in results if not ok]
     print(f"\n{len(results) - len(failed)}/{len(results)} passed")

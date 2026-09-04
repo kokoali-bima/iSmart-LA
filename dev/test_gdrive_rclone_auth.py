@@ -103,8 +103,14 @@ check("a host that already has rclone keeps using it, with no download",
 with patch.object(mod, "_rclone_path", return_value=None), \
      patch.object(mod.sys, "platform", "darwin"):
     ok, msg = mod.ensure_rclone()
-check("a platform it cannot fetch for says so AND still gives the install "
-      "command", not ok and "rclone.org/install.sh" in msg)
+# A key now, not a sentence -- these helpers are also called with no chat
+# language at all, so the wording is resolved where it is shown.
+check("a platform it cannot fetch for is reported, not silently failed",
+      not ok and msg == "rclone_missing_unsupported")
+check("...and BOTH renderings still hand over the manual install command, "
+      "since that is the only way forward on such a host",
+      "rclone.org/install.sh" in mod._detail("en", msg)
+      and "rclone.org/install.sh" in mod._detail("id", msg))
 
 with patch.object(mod, "ensure_rclone", return_value=(False, "no rclone here")):
     ok, msg, handle = mod.gdrive_rclone_start()
@@ -329,6 +335,112 @@ async def main():
           not any("fetching rclone" in m.lower() or "mengunduh" in m.lower()
                   for m in said2))
     check("...and still gets the link", any("accounts.google.com" in m for m in said2))
+
+    # --- both languages, all the way down ---------------------------------
+    # These helpers are sync and are also called with no chat language at all
+    # (startup, /update), so they return KEYS and the language is resolved
+    # where the message is shown. Before that, the wrapper was translated and
+    # the sentence inside it never was, producing replies like "Tidak bisa
+    # memulai sign-in: rclone isn't installed on this host. Install it with:
+    # curl ..." -- reported from a real screenshot.
+    KEYS = ("rclone_missing_unsupported", "rclone_download_failed",
+            "rclone_wont_run", "rclone_no_start", "rclone_no_link",
+            "rclone_no_google_link", "code_not_found", "code_rejected",
+            "code_no_token", "code_handoff_failed", "drive_signin_dead",
+            "drive_rate_limited", "drive_revoked_and_removed",
+            "drive_removed_only", "drive_not_connected", "drive_rclone_failed")
+    for k in KEYS:
+        en, id_ = mod._detail("en", k), mod._detail("id", k)
+        check(f"'{k}' has both languages, and they differ",
+              en != k and id_ != k and en != id_)
+
+    check("an unknown string passes through untouched -- rclone's stderr and "
+          "Google's own errors are technical output we did not write, and "
+          "inventing an Indonesian rendering would be worse than showing what "
+          "the tool actually said",
+          mod._detail("id", "exit 1: some raw stderr") == "exit 1: some raw stderr")
+
+    # The failure the screenshot showed, end to end in Indonesian.
+    mod._gdrive_wizard[111] = {"step": "x", "name": "gdrive",
+                               "expires": mod._dt.datetime.now().timestamp() + 900}
+    with patch.object(mod, "gdrive_rclone_start",
+                      return_value=(False, "rclone_missing_unsupported", {})):
+        u = upd()
+        await mod._gdrive_begin_rclone(u, ctx(), "id", "gdrive")
+    said = sent(u)
+    check("the rclone-missing failure is fully Indonesian, not half-translated",
+          "Tidak bisa memulai" in said and "isn't installed" not in said)
+
+    with patch.object(mod, "gdrive_rclone_start",
+                      return_value=(False, "rclone_missing_unsupported", {})):
+        u = upd()
+        mod._gdrive_wizard[111] = {"step": "x", "name": "gdrive",
+                                   "expires": mod._dt.datetime.now().timestamp() + 900}
+        await mod._gdrive_begin_rclone(u, ctx(), "en", "gdrive")
+    check("...and fully English when that is the chat's language",
+          "Could not start" in sent(u) and "Tidak bisa" not in sent(u))
+
+    # A bad paste, in Indonesian.
+    mod._gdrive_wizard[111] = {"step": "await_rclone_code", "name": "gdrive",
+                               "handle": {"state": "S", "log": "/x"},
+                               "expires": mod._dt.datetime.now().timestamp() + 900}
+    u = upd("nonsense")
+    with patch.object(mod, "gdrive_rclone_finish", return_value=(False, "code_not_found")):
+        await mod._handle_gdrive_wizard_input(u, ctx())
+    check("a bad code paste explains itself in Indonesian too",
+          "tidak menemukan kode" in sent(u).lower())
+    mod._gdrive_wizard.clear()
+
+    # --- /cancel must cancel what the card told you it would --------------
+    # Reported: the Drive card says "Kirim /cancel untuk berhenti", and
+    # /cancel answered "Tidak ada yang perlu dibatalkan" -- it only knew about
+    # the sign-in wizard. Reads as if the bot forgot what it just asked you.
+    mod._gdrive_wizard.clear()
+    mod._wizard.clear()
+    mod._server_wizard.clear()
+
+    u = upd()
+    with patch.object(mod, "_authorized", return_value=True):
+        await mod.cmd_cancel(u, ctx())
+    check("with nothing pending, /cancel still says so",
+          "othing to cancel" in sent(u) or "Tidak ada yang perlu" in sent(u))
+
+    cleaned = []
+    mod._gdrive_wizard[111] = {"step": "await_rclone_code", "name": "gdrive",
+                               "handle": {"pid": 1, "log": "/x"},
+                               "expires": mod._dt.datetime.now().timestamp() + 900}
+    u = upd()
+    with patch.object(mod, "_authorized", return_value=True),          patch.object(mod, "gdrive_rclone_cleanup",
+                      side_effect=lambda h: cleaned.append(h)):
+        await mod.cmd_cancel(u, ctx())
+    check("/cancel during a Drive connect actually cancels it",
+          111 not in mod._gdrive_wizard)
+    check("...and says what it cancelled, rather than 'nothing to cancel'",
+          "Drive" in sent(u) or "Drive" in sent(u))
+    check("...and stops the rclone process, which otherwise keeps port 53682 "
+          "and a live token in its log",
+          len(cleaned) == 1)
+
+    # /addserver too -- it also tells you /cancel works.
+    mod._server_wizard[111] = {"step": "x"}
+    u = upd()
+    with patch.object(mod, "_authorized", return_value=True):
+        await mod.cmd_cancel(u, ctx())
+    check("/cancel also cancels an /addserver in progress",
+          111 not in mod._server_wizard and "erver" in sent(u))
+
+    # --- the upload path must use the resolved binary ---------------------
+    # A host where the bot fetched rclone into bin/ signed in fine and then
+    # failed every upload with "FileNotFoundError: [Errno 2] No such file or
+    # directory: 'rclone'" -- _gdrive_upload built its own subprocess call
+    # instead of going through the resolver.
+    text = Path(SRC).read_text(encoding="utf-8")
+    check("the upload itself uses the resolved rclone path",
+          '[_rclone_path() or RCLONE_BIN, "copyto"' in text)
+    check("...and so does the share-link call beside it",
+          '[_rclone_path() or RCLONE_BIN, "link"' in text)
+    check("no rclone invocation is left using the bare name",
+          "[RCLONE_BIN," not in text)
 
     failed = [n for n, ok in results if not ok]
     print(f"\n{len(results) - len(failed)}/{len(results)} passed")
