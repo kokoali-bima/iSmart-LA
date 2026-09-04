@@ -264,7 +264,9 @@ async def main():
     mod._gdrive_wizard.clear()
     mod.GDRIVE_CLIENT_FILE.unlink(missing_ok=True)
 
-    with patch.object(mod, "_may_authorize_group_action", new=AsyncMock(return_value=True)),          patch.object(mod, "_list_gdrive_accounts", return_value=[]):
+    with patch.object(mod, "_may_authorize_group_action", new=AsyncMock(return_value=True)), \
+         patch.object(mod, "_list_gdrive_accounts", return_value=[]), \
+         patch.object(mod, "_gdrive_begin_rclone", new=AsyncMock()):
         u = upd(); await mod.cmd_gdrive(u, ctx())
     empty = sent(u)
     check("/gdrive with no account points at /connectgdrive, instead of telling "
@@ -274,7 +276,9 @@ async def main():
           "not through Telegram" not in empty and "bukan lewat Telegram" not in empty)
 
     # An abandoned wizard must not lock the command out.
-    with patch.object(mod, "_may_authorize_group_action", new=AsyncMock(return_value=True)),          patch.object(mod, "_list_gdrive_accounts", return_value=[]):
+    with patch.object(mod, "_may_authorize_group_action", new=AsyncMock(return_value=True)), \
+         patch.object(mod, "_list_gdrive_accounts", return_value=[]), \
+         patch.object(mod, "_gdrive_begin_rclone", new=AsyncMock()):
         mod._gdrive_wizard[111] = {"step": "await_gdrive_client", "name": "gdrive",
                                    "expires": mod._dt.datetime.now().timestamp() + 900}
         u = upd(); await mod.cmd_connectgdrive(u, ctx())
@@ -283,7 +287,9 @@ async def main():
           "way forward", "already" not in sent(u).lower() and "sedang" not in sent(u).lower())
 
     # ...but a sign-in already waiting on Google is worth protecting.
-    with patch.object(mod, "_may_authorize_group_action", new=AsyncMock(return_value=True)),          patch.object(mod, "_list_gdrive_accounts", return_value=[]):
+    with patch.object(mod, "_may_authorize_group_action", new=AsyncMock(return_value=True)), \
+         patch.object(mod, "_list_gdrive_accounts", return_value=[]), \
+         patch.object(mod, "_gdrive_begin_rclone", new=AsyncMock()):
         mod._gdrive_wizard[111] = {"step": "device_pending", "name": "gdrive",
                                    "expires": mod._dt.datetime.now().timestamp() + 900}
         u = upd(); await mod.cmd_connectgdrive(u, ctx())

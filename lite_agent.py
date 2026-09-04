@@ -59,6 +59,8 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import platform
+import zipfile
 import threading
 import tempfile
 import shutil
@@ -4766,6 +4768,23 @@ async def _gdrive_begin_device(update: Update, context: ContextTypes.DEFAULT_TYP
     loop = asyncio.get_running_loop()
     ok, body = await loop.run_in_executor(None, gdrive_device_start)
     if not ok:
+        # A stored client that Google says is gone ("The OAuth client was
+        # deleted") used to be a one-way trap: its mere presence sends every
+        # /connectgdrive down the device path, and nothing in Telegram could
+        # remove it. The operator was locked onto a broken route while the
+        # rclone one -- which needs no Google Cloud project at all -- sat
+        # unreachable. Reported exactly that way on a live deployment.
+        if _client_is_dead(body):
+            clear_gdrive_client()
+            await update.message.reply_text(_t(lang,
+                "⚠️ That saved Google OAuth client no longer exists, so I've "
+                "removed it. Starting again the simple way — no Google Cloud "
+                "project needed.",
+                "⚠️ OAuth client Google yang tersimpan sudah tidak ada, jadi "
+                "saya hapus. Memulai ulang dengan cara sederhana — tanpa perlu "
+                "project Google Cloud.",
+            ))
+            return await _gdrive_begin_rclone(update, context, lang, name)
         _gdrive_wizard.pop(chat_id, None)
         detail = str(body.get("error_description", "unknown"))
         return await update.message.reply_text(_t(lang,
@@ -6554,7 +6573,12 @@ async def cmd_connectgdrive(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
 
 def _rclone_run(*args: str, timeout: int = 60) -> subprocess.CompletedProcess:
-    return subprocess.run([RCLONE_BIN, *args], capture_output=True, text=True, timeout=timeout)
+    """Resolved path, not the bare name: when the bot fetched rclone into its
+    own bin/ that copy is not on PATH, so every later call -- verifying a new
+    remote, uploading a report, /gdrivestatus -- would fail with "rclone: not
+    found" on a host where the sign-in had just worked."""
+    return subprocess.run([_rclone_path() or RCLONE_BIN, *args],
+                          capture_output=True, text=True, timeout=timeout)
 
 
 RCLONE_AUTH_PORT = 53682          # rclone's own fixed loopback port
@@ -6562,8 +6586,78 @@ RCLONE_AUTH_START_TIMEOUT = 20    # seconds to wait for it to print its state
 RCLONE_AUTH_FINISH_TIMEOUT = 60
 
 
+RCLONE_LOCAL_BIN = BASE_DIR / "bin" / "rclone"
+RCLONE_DOWNLOAD_URL = "https://downloads.rclone.org/rclone-current-linux-amd64.zip"
+
+
+def _rclone_path() -> Optional[str]:
+    """Where rclone actually is: the configured name if it resolves, else the
+    copy this bot fetched for itself."""
+    found = shutil.which(RCLONE_BIN)
+    if found:
+        return found
+    if Path(RCLONE_BIN).is_file():
+        return RCLONE_BIN
+    if RCLONE_LOCAL_BIN.is_file() and os.access(RCLONE_LOCAL_BIN, os.X_OK):
+        return str(RCLONE_LOCAL_BIN)
+    return None
+
+
 def _rclone_installed() -> bool:
-    return shutil.which(RCLONE_BIN) is not None or Path(RCLONE_BIN).exists()
+    return _rclone_path() is not None
+
+
+def ensure_rclone() -> tuple[bool, str]:
+    """Fetch rclone into this install's own bin/ if it isn't available.
+
+    Telling the operator to SSH in and run `curl https://rclone.org/install.sh
+    | sudo bash` is exactly the kind of friction this project was asked to
+    remove -- "user biasa akan kesulitan". rclone is one static binary, so the
+    bot can just have it.
+
+    Deliberately NOT a system install: no sudo, nothing outside BASE_DIR, and
+    deleting bin/ undoes it completely. A host that already has rclone keeps
+    using that one.
+    """
+    existing = _rclone_path()
+    if existing:
+        return True, existing
+    if sys.platform != "linux" or platform.machine() not in ("x86_64", "amd64"):
+        return False, (f"no rclone here, and I only know how to fetch the "
+                       f"linux-amd64 build (this is {sys.platform}/"
+                       f"{platform.machine()}). Install it with: "
+                       f"curl https://rclone.org/install.sh | sudo bash")
+    staging = Path(tempfile.mkdtemp(prefix="isla_rcdl_"))
+    try:
+        RCLONE_LOCAL_BIN.parent.mkdir(parents=True, exist_ok=True)
+        archive = staging / "rclone.zip"
+        with urllib.request.urlopen(RCLONE_DOWNLOAD_URL, timeout=180) as resp:
+            archive.write_bytes(resp.read())
+        with zipfile.ZipFile(archive) as z:
+            inner = next(n for n in z.namelist() if n.endswith("/rclone"))
+            z.extract(inner, staging)
+            # Moved into place only once it is complete: a half-written binary
+            # left at the final path would look installed and fail on use.
+            shutil.move(str(staging / inner), str(RCLONE_LOCAL_BIN))
+        RCLONE_LOCAL_BIN.chmod(0o755)
+    except Exception as exc:
+        logger.warning("could not fetch rclone", exc_info=True)
+        return False, (f"couldn't download rclone ({exc}). Install it with: "
+                       f"curl https://rclone.org/install.sh | sudo bash")
+    finally:
+        # finally, not just the happy path: an exception halfway through left
+        # the staging directory behind, which is how stale isla_* directories
+        # accumulated on a real server once already.
+        shutil.rmtree(staging, ignore_errors=True)
+
+    probe = subprocess.run([str(RCLONE_LOCAL_BIN), "version"],
+                           capture_output=True, text=True, timeout=30)
+    if probe.returncode != 0:
+        RCLONE_LOCAL_BIN.unlink(missing_ok=True)
+        return False, "downloaded rclone but it would not run"
+    logger.warning("rclone fetched into %s (%s)", RCLONE_LOCAL_BIN,
+                   (probe.stdout or "").splitlines()[0] if probe.stdout else "?")
+    return True, str(RCLONE_LOCAL_BIN)
 
 
 def _http_redirect_location(url: str) -> Optional[str]:
@@ -6610,9 +6704,9 @@ def gdrive_rclone_start(scope: str = "drive.file") -> tuple[bool, str, dict]:
 
     Returns (ok, auth_url_or_error, handle).
     """
-    if not _rclone_installed():
-        return False, ("rclone isn't installed on this host. Install it with: "
-                       "curl https://rclone.org/install.sh | sudo bash"), {}
+    ok, rclone = ensure_rclone()
+    if not ok:
+        return False, rclone, {}
 
     # A leftover authorize from an abandoned attempt still owns the port, and
     # the next start would fail with nothing explaining why. Best-effort:
@@ -6634,7 +6728,7 @@ def gdrive_rclone_start(scope: str = "drive.file") -> tuple[bool, str, dict]:
 
     try:
         proc = subprocess.Popen(
-            [RCLONE_BIN, "authorize", "drive", "--drive-scope", scope,
+            [rclone, "authorize", "drive", "--drive-scope", scope,
              "--auth-no-open-browser"],
             stdout=out.open("wb"), stderr=subprocess.STDOUT,
             stdin=subprocess.DEVNULL, start_new_session=True)
@@ -6743,6 +6837,25 @@ def read_gdrive_client() -> dict:
     except Exception:
         logger.warning("gdrive_oauth_client.json unreadable", exc_info=True)
         return {}
+
+
+# Google's way of saying the stored client cannot be used at all. Anything
+# else (a network blip, a rate limit) says nothing about the client itself and
+# must NOT throw it away.
+_DEAD_CLIENT_ERRORS = ("deleted_client", "invalid_client", "unauthorized_client")
+
+
+def _client_is_dead(body: dict) -> bool:
+    blob = f"{body.get('error', '')} {body.get('error_description', '')}".lower()
+    return any(e in blob for e in _DEAD_CLIENT_ERRORS) or "was deleted" in blob
+
+
+def clear_gdrive_client() -> bool:
+    if not GDRIVE_CLIENT_FILE.exists():
+        return False
+    GDRIVE_CLIENT_FILE.unlink()
+    logger.warning("stored Drive OAuth client cleared")
+    return True
 
 
 def write_gdrive_client(client_id: str, client_secret: str) -> None:

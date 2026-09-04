@@ -1,5 +1,50 @@
 # Changelog
 
+## v0.2b.64 -- the two ways connecting Drive still dead-ended
+
+Both reported from live deployments, one on each host, and neither had a way
+out from Telegram.
+
+**A saved OAuth client that Google had deleted was a one-way trap.** Its mere
+presence routes every `/connectgdrive` down the device-flow path, so the reply
+was "Google menolak memulai sign-in: The OAuth client was deleted", every
+time, with the rclone route -- which needs no Cloud project at all -- sitting
+unreachable behind it. Nothing in Telegram could remove the stored client.
+
+Now a client Google reports as `deleted_client` / `invalid_client` /
+`unauthorized_client` is cleared and the sign-in continues on the route that
+needs nothing. A *transient* failure (network, rate limit) still keeps the
+stored client: a blip must not throw away something that works.
+
+**A host without rclone was told to go and install it.** "Install it with:
+curl https://rclone.org/install.sh | sudo bash" -- asking the operator to SSH
+in and pipe a script into sudo is exactly the friction this project was asked
+to remove. rclone is one static binary, so the bot now fetches its own copy
+into `BASE_DIR/bin` when it needs one: no sudo, nothing outside the install,
+and deleting `bin/` undoes it. A host that already has rclone keeps using
+that. An architecture it cannot fetch for still gets the manual command.
+
+Verified on the deployment that had none: downloaded, ran (v1.75.0),
+idempotent on the second call, and `/usr/bin/rclone` still absent afterwards
+-- it really does not touch the system.
+
+`_rclone_run()` now resolves the path rather than invoking the bare name.
+Without that the sign-in would succeed and then every later call -- verifying
+the new remote, uploading a report, `/gdrivestatus` -- would fail with
+"rclone: not found" on the very host where it had just worked.
+
+**Two test-hygiene faults caught by watching the suite, not the assertions.**
+The run had grown from 25s to 51s and was writing `bin/rclone` into the
+checkout: three call sites still patched a detector that no longer gates
+anything, so the tests were downloading a binary from the internet on every
+run. And `ensure_rclone` cleaned its staging directory only on the happy
+path, leaking one on every failure -- the same shape as the 485 stale
+directories found on a server earlier. Cleanup moved into `finally`.
+
+Full suite: **614/614 across 30 suites**, back to 25s, no download, nothing
+left behind.
+
+
 ## v0.2b.63 -- tagging the bot on a picture, in a group
 
 Asked directly: "bagaimana agar bisa nge tag bot ketika kirim gambar?" The
