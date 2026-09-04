@@ -141,6 +141,29 @@ TURN_TOKEN_CEILING = int(os.environ.get("TURN_TOKEN_CEILING", "0") or 0)
 # ordinary turn on the deployment this was measured on, and well under the
 # 506k a single unbroken session reached there. 0 disables the hint.
 TURN_COST_HINT_TOKENS = int(os.environ.get("TURN_COST_HINT_TOKENS", "200000") or 0)
+
+
+def cost_hint_due(sess: dict, turn_in: int) -> tuple[bool, int]:
+    """Should this turn carry the "this conversation is getting expensive" note?
+
+    Returns (due, previous_level). Pulled out of the turn handler so the rule
+    can be tested directly: it is the only guard on the single largest cost in
+    the whole system, and it was quietly wrong for months.
+
+    The rule is doubling, not every turn and not once ever. Crossing the base
+    threshold warns; after that it warns again each time the per-turn cost
+    DOUBLES. Across the worst conversation measured here -- 5.15M tokens per
+    turn -- that is about five notes, each reporting a number that changed.
+    """
+    if not TURN_COST_HINT_TOKENS:
+        return False, 0
+    # Sessions written before this existed carry cost_hint_shown instead. Treat
+    # that as "already warned at the base threshold", so upgrading does not
+    # re-warn every long-running conversation the moment it resumes.
+    prev = _int(sess.get("cost_hint_at")) or (
+        TURN_COST_HINT_TOKENS if sess.get("cost_hint_shown") else 0)
+    threshold = prev * 2 if prev else TURN_COST_HINT_TOKENS
+    return turn_in >= threshold, prev
 # Deterministic collectors: known questions answered by a script, no LLM
 # involved, so a repeat of an already-solved case costs zero tokens. See /status.
 RUN_SCHEDULED = BASE_DIR / "tools" / "run_scheduled.py"
@@ -3763,6 +3786,17 @@ def shrink_video_to_fit(path: Path,
             # The estimate can miss on unusual content. Do not send something
             # that will just be rejected.
             return None, "video_still_too_large"
+        # Never worse than the input. A shrink step that produces something
+        # LARGER than what it was given is not a shrink, and this is not
+        # hypothetical here: a 3m42s clip downloaded at 32MB in AV1 came back
+        # at 67MB re-encoded to H.264 -- bigger than the source and over the
+        # limit. That case was caught only because it also broke the ceiling;
+        # a re-encode that grew the file while staying under 50MB would have
+        # been sent, logged as "shrank", and nobody would have known.
+        if out.stat().st_size >= path.stat().st_size:
+            logger.warning("refused a 'shrink' that grew %s: %d -> %d bytes",
+                           path.name, path.stat().st_size, out.stat().st_size)
+            return None, "video_shrink_made_it_bigger"
         logger.warning("shrank %s (%.1fMB) -> %s (%.1fMB)", path.name,
                        path.stat().st_size / 1048576, out.name,
                        out.stat().st_size / 1048576)
@@ -7240,6 +7274,9 @@ _MSG = {
                              "encoding-nya kelamaan"),
     "video_still_too_large": ("still over the limit after re-encoding",
                               "masih melebihi batas walau sudah dikecilkan"),
+    "video_shrink_made_it_bigger": (
+        "re-encoding made it bigger, not smaller, so the original was kept",
+        "hasil encoding malah lebih besar, jadi yang asli dipertahankan"),
     "video_shrunk": ("re-encoded to fit", "dikecilkan agar muat"),
     "gdrive_deleted": ("deleted", "dihapus"),
     "gdrive_moved": ("moved", "dipindahkan"),
@@ -9705,21 +9742,37 @@ async def _run_turn_inner(update: Update, context: ContextTypes.DEFAULT_TYPE, te
     # prompt in that same log was 352 characters. The size is history, not
     # anything they typed, so it is invisible from where they sit.
     #
-    # Said ONCE per session, when it first crosses the line: after that it
-    # stays crossed until /new, and repeating it every turn would be nagging
-    # rather than informing.
+    # It used to be said ONCE per session, on the reasoning that after the
+    # first crossing it stays crossed and repeating would be nagging. A week of
+    # real usage says that was the wrong call, and expensively so.
+    #
+    # Measured across 122,038,414 tokens / 145 turns / 35 conversations: ONE
+    # conversation took 46.4% of everything spent -- 56.7M tokens over 11 turns,
+    # 5.15M per turn -- and two conversations took 69.8%. The median
+    # conversation cost 572k. So the cost is not spread across usage, it is a
+    # couple of runaways, and the old hint fired once early in the climb and
+    # then went quiet through the entire expensive part.
+    #
+    # It now repeats on DOUBLING rather than every turn: 200k warns, then 400k,
+    # 800k, and so on. That is a handful of notes across even the worst
+    # conversation, each carrying a number that actually changed -- instead of
+    # one note at 200k and silence at 5M.
     _u = result.get("usage", {}) or {}
     turn_in = (_int(_u.get("input_tokens")) + _int(_u.get("cache_read_tokens"))
                + _int(_u.get("cache_read_input_tokens")))
     cost_note = ""
-    if (TURN_COST_HINT_TOKENS and turn_in >= TURN_COST_HINT_TOKENS
-            and not sess.get("cost_hint_shown")):
+    due, hint_at = cost_hint_due(sess, turn_in)
+    if due:
+        sess["cost_hint_at"] = turn_in
         sess["cost_hint_shown"] = True
+        grew = f" ({turn_in // max(hint_at, 1)}x)" if hint_at else ""
         cost_note = _t(lang,
             f"\n\n<i>This conversation now costs ~{turn_in // 1000}k tokens per "
-            f"turn, and will keep doing so. /new when the topic changes.</i>",
+            f"turn{grew}, and every further turn pays it again. /new starts "
+            f"fresh and keeps the memory.</i>",
             f"\n\n<i>Percakapan ini sekarang ~{turn_in // 1000}rb token per "
-            f"giliran, dan akan terus segitu. /new kalau ganti topik.</i>")
+            f"giliran{grew}, dan tiap giliran berikutnya bayar segitu lagi. "
+            f"/new untuk mulai bersih, memori tetap tersimpan.</i>")
 
     state["sessions"][active] = sess
     save_sessions(sessions)

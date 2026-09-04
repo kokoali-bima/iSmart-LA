@@ -1,5 +1,41 @@
 # Changelog
 
+## v0.2b.74 -- the expensive-conversation warning stops going quiet
+
+An evaluation of two third-party token-saving tools ended up measuring this
+project instead. A week of production usage: **122,038,414 tokens across 145
+turns and 35 conversations**. The distribution is not what anyone assumed.
+
+    1 conversation   ->  46.4% of every token spent   (56.7M over 11 turns)
+    2 conversations  ->  69.8%
+    10 of 35         ->  91.9%
+    median conversation                                        572,581
+
+So cost is not spread across usage. It is a couple of runaways. And the one
+guard aimed at exactly that -- the "this conversation is getting expensive"
+note -- fired **once per session**, early in the climb, then stayed silent
+through the entire expensive part. On the 5.15M-tokens-per-turn conversation it
+spoke a single time and never again.
+
+It now warns on **doubling**: the base threshold, then again each time the
+per-turn cost doubles. Modelled against that same runaway, that is four notes
+across eleven turns rather than one -- each carrying a number that changed --
+and a conversation that stays cheap is still never interrupted. Sessions
+written by the old build carry `cost_hint_shown` and are treated as already
+warned at the base level, so upgrading does not re-warn every long-running
+conversation the moment it resumes.
+
+The rule moved out of the turn handler into `cost_hint_due()` so it can be
+tested directly. It guards the single largest cost in the system and had been
+quietly wrong for months; that is not something to leave untestable.
+
+**Never worse than the input.** `shrink_video_to_fit` only ever compared its
+output against Telegram's 50MB ceiling, never against the file it was given. A
+re-encode that produced something *larger* than the source would have been sent
+and logged as a shrink. Not hypothetical: a 3m42s clip downloaded at 32MB in
+AV1 came back at **67MB** in H.264. That one was caught only because it also
+broke the ceiling. It now refuses any result that is not actually smaller.
+
 ## v0.2b.73 -- the agent is told what this build can do, not what the install could
 
 Asked in a group for a cut of a music video, the bot replied that it "can only
