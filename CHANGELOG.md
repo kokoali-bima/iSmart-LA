@@ -1,5 +1,23 @@
 # Changelog
 
+<!-- These entries are headed "Unreleased" on purpose: this branch proposes
+     changes, it does not cut a release. Version numbers and git tags belong to
+     whoever ships them, so nothing here claims one.
+
+     One consequence, so a reviewer is not left guessing: dev/test_release_
+     consistency.py (added in v0.2b.72) reads the TOPMOST "## " heading and
+     expects a vX.Y.Z in it, so on this branch it reports 2/4 --
+     "CHANGELOG.md has a parseable version heading" and the README/CHANGELOG
+     agreement check. That is the branch state, not a defect these commits
+     introduce: the same suite is green on origin/master, and goes green here
+     the moment these entries are given a version and tagged.
+
+     Its own docstring says the gate "fails only in states that are genuinely
+     wrong", and notes-for-an-unreleased-change is not one of them. Teaching it
+     to treat an "Unreleased" heading as "no release declared yet" would close
+     that gap, but that is the maintainer's call, not something a contributing
+     branch should decide by editing a check written one release ago. -->
+
 ## Unreleased -- newagent.sh: another deployment, in one command
 
 The last piece of the split this series is about. `install.sh` sets up ONE
