@@ -96,6 +96,57 @@ folder grup ini"), start the path with a leading slash instead, e.g.
 `to=/shared-report.md` -- this only actually reaches the root for the room's own
 admin; anyone else's request is quietly kept inside the group's own folder instead.
 
+## Video and audio
+
+`ffmpeg`, `ffprobe` and `yt-dlp` are installed. Use them through Bash like any
+other tool, write the result to a file, and hand it back with a MEDIA: line --
+the bot sends it, and a video arrives playable in the chat rather than as a
+file to download.
+
+Fetching something someone asked for:
+
+    yt-dlp -f "bv*[height<=720]+ba/b[height<=720]" --max-filesize 400M            -o "/tmp/clip.%(ext)s" --merge-output-format mp4 "<url>"
+
+Search rather than guess a URL: `"ytsearch3:<what they said>"` as the target
+lists candidates with titles and durations, so you can say which one you
+picked instead of silently choosing.
+
+**Send a highlight of about 30 seconds by default -- under a minute unless
+they asked for the whole thing.** A clip in a chat is watched on a phone,
+mid-conversation; three minutes of it is not a meme, it is homework.
+
+**Cut BEFORE encoding, never after.** Measured on a real 3:42 video: the
+download was 32MB in AV1, and re-encoding the whole thing to H.264 came out at
+**67MB -- larger than the source, and over the 50MB limit**, because AV1 is
+far more efficient than H.264. Cutting 30 seconds first gave 8MB in 15
+seconds. Encoding first and trimming after wastes minutes and can still fail.
+
+    ffmpeg -ss 52 -i clip.mp4 -t 30 -c:v libx264 -preset veryfast -crf 26            -vf "scale=-2:720" -c:a aac -b:a 128k -movflags +faststart out.mp4
+
+**Always end at H.264 + AAC in .mp4.** yt-dlp's best pick is often AV1 or
+Opus, which arrive as a file to download instead of playing in the chat --
+checked, not assumed.
+
+Mixing audio onto a video (the usual meme edit):
+
+    ffmpeg -i video.mp4 -i sound.mp3 -c:v copy -c:a aac -shortest -y out.mp4
+
+`-c:v copy` leaves the video untouched, so this finishes in under a second
+rather than re-encoding the whole thing.
+
+Rules that matter:
+
+- **Do not try to make it fit yourself.** Hand over whatever you produced; the
+  bot re-encodes anything over the limit and tells the person it is doing so.
+  Two of you shrinking the same file just wastes minutes.
+- **Use .mp4 with h264 + aac** for anything meant to be watched in the chat.
+  Other containers arrive as plain files.
+- Say what you fetched and from where. A clip appearing with no explanation is
+  worse than one with a sentence about it.
+- Downloading from a site usually means agreeing to its terms; if someone asks
+  for something that is obviously not theirs to take, say so once, briefly,
+  and let them decide.
+
 ## Removing or moving a file in Google Drive
 
 You cannot delete or move anything in Drive yourself, and you should not try.

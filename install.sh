@@ -57,7 +57,12 @@ if command -v apt-get >/dev/null 2>&1; then
   # wkhtmltopdf is here rather than behind a prompt: the brief tells the agent to
   # deliver PDF/JPEG reports, so a missing renderer is a broken feature, not a
   # preference worth interrupting the install for.
-  NEEDED_PKGS="python3 python3-venv curl git tmux jq openssh-client wkhtmltopdf"
+  # ffmpeg is here for the same reason wkhtmltopdf is: the agent can produce
+  # and send video, and most real video is over Telegram's 50MB bot limit
+  # (a measured example, Big Buck Bunny, is 722MB), so without ffmpeg to
+  # re-encode it the feature simply refuses. A missing renderer is a
+  # broken feature, not a preference worth interrupting the install for.
+  NEEDED_PKGS="python3 python3-venv curl git tmux jq openssh-client wkhtmltopdf ffmpeg"
   MISSING=""
   for p in $NEEDED_PKGS; do
     dpkg -s "$p" >/dev/null 2>&1 || MISSING="$MISSING $p"
@@ -68,6 +73,23 @@ if [ -n "$MISSING" ]; then
     sudo DEBIAN_FRONTEND=noninteractive apt-get install -y $MISSING </dev/null
 else
     ok "All required system packages already present."
+fi
+
+# yt-dlp is not in Debian/Ubuntu at a useful version -- the packaged one is
+# usually months behind, and these sites change often enough that a stale copy
+# simply stops working. Fetched as the upstream static binary instead, into
+# /usr/local/bin so it does not fight the package manager. Best-effort: this
+# is what lets the agent fetch a video someone asks for, and a deployment that
+# never does that loses nothing by its absence.
+if ! command -v yt-dlp >/dev/null 2>&1; then
+    say "Fetching yt-dlp (video download helper)"
+    if sudo curl -sL -o /usr/local/bin/yt-dlp         https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_linux         && sudo chmod +x /usr/local/bin/yt-dlp; then
+        ok "yt-dlp $(yt-dlp --version 2>/dev/null || echo installed)"
+    else
+        warn "Could not fetch yt-dlp -- asking the agent to find a video won't work until it is installed."
+    fi
+else
+    ok "yt-dlp already present."
 fi
 else
 warn "Non-apt system detected. Please make sure these are installed manually:"

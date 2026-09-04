@@ -3581,6 +3581,128 @@ def _file_sha256(p: Path) -> Optional[str]:
         return None
 
 
+# --------------------------------------------------------------------------
+# Video, audio and images: sent as what they ARE, and shrunk to fit
+#
+# Two things were wrong before. Everything went out via reply_document, so a
+# video arrived as a file you have to download before you can watch it -- fine
+# for a report, useless for something meant to be watched in the chat. And a
+# file over Telegram's 50 MB bot limit was simply refused, after all the work
+# of producing it: measured on a real video, "Big Buck Bunny" is 722 MB, so
+# refusing is the common case, not the edge one.
+#
+# ffmpeg and yt-dlp are installed by install.sh, so a fresh deployment has
+# this without doing anything. Both are optional at runtime: without ffmpeg
+# nothing here crashes, oversized files just go back to being refused.
+# --------------------------------------------------------------------------
+VIDEO_SUFFIXES = {".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v"}
+AUDIO_SUFFIXES = {".mp3", ".m4a", ".ogg", ".oga", ".wav", ".flac", ".aac"}
+IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
+
+# Aim below the hard limit rather than at it: the container overhead of a
+# re-encode is not perfectly predictable, and landing at 50.4 MB after two
+# minutes of encoding would waste the whole thing.
+TELEGRAM_VIDEO_TARGET_BYTES = 45 * 1024 * 1024
+FFMPEG_TIMEOUT = int(os.environ.get("FFMPEG_TIMEOUT_SECONDS", "900"))
+
+
+def _ffmpeg() -> Optional[str]:
+    return shutil.which("ffmpeg")
+
+
+def _ffprobe_duration(path: Path) -> Optional[float]:
+    probe = shutil.which("ffprobe")
+    if not probe:
+        return None
+    try:
+        out = subprocess.run(
+            [probe, "-v", "error", "-show_entries", "format=duration",
+             "-of", "csv=p=0", str(path)],
+            capture_output=True, text=True, timeout=60)
+        return float((out.stdout or "").strip()) if out.returncode == 0 else None
+    except Exception:
+        return None
+
+
+def shrink_video_to_fit(path: Path,
+                        target: int = TELEGRAM_VIDEO_TARGET_BYTES) -> tuple[Optional[Path], str]:
+    """Re-encode a too-large video down to `target` bytes.
+
+    Two-pass at a bitrate computed from the real duration, rather than a fixed
+    quality: only a bitrate target actually predicts the output size, which is
+    the one thing that matters here. Measured on this project's own server, 90
+    seconds of 1080p takes about 32 seconds to encode on 12 cores -- so this is
+    slow but not unreasonable, and it happens inside a turn the person is
+    already waiting on.
+
+    Returns (new_path, reason). new_path is None when it could not be done,
+    and the caller falls back to refusing the file, as before.
+    """
+    ff = _ffmpeg()
+    if not ff:
+        return None, "ffmpeg_missing"
+    duration = _ffprobe_duration(path)
+    if not duration or duration <= 0:
+        return None, "video_duration_unknown"
+
+    # Audio is budgeted first because it is the part that becomes unlistenable
+    # if squeezed; video takes whatever is left.
+    audio_kbps = 96
+    total_kbits = target * 8 / 1000
+    video_kbps = int(total_kbits / duration) - audio_kbps
+    if video_kbps < 150:
+        # Below this the result is a smear. Better to say so than to spend two
+        # minutes producing something nobody can watch.
+        return None, "video_too_long_to_fit"
+
+    work = Path(tempfile.mkdtemp(prefix="isla_shrink_"))
+    out = work / (path.stem + "-small.mp4")
+    passlog = work / "pass"
+    common = [ff, "-y", "-i", str(path), "-c:v", "libx264",
+              "-b:v", f"{video_kbps}k", "-passlogfile", str(passlog)]
+    try:
+        p1 = subprocess.run(common + ["-pass", "1", "-an", "-f", "mp4", os.devnull],
+                            capture_output=True, text=True, timeout=FFMPEG_TIMEOUT)
+        if p1.returncode != 0:
+            return None, "video_encode_failed"
+        p2 = subprocess.run(common + ["-pass", "2", "-c:a", "aac",
+                                      "-b:a", f"{audio_kbps}k",
+                                      "-movflags", "+faststart", str(out)],
+                            capture_output=True, text=True, timeout=FFMPEG_TIMEOUT)
+        if p2.returncode != 0 or not out.exists():
+            return None, "video_encode_failed"
+        if out.stat().st_size > TELEGRAM_MAX_FILE_BYTES:
+            # The estimate can miss on unusual content. Do not send something
+            # that will just be rejected.
+            return None, "video_still_too_large"
+        logger.warning("shrank %s (%.1fMB) -> %s (%.1fMB)", path.name,
+                       path.stat().st_size / 1048576, out.name,
+                       out.stat().st_size / 1048576)
+        return out, "video_shrunk"
+    except subprocess.TimeoutExpired:
+        return None, "video_encode_timeout"
+    except Exception:
+        logger.warning("video shrink failed", exc_info=True)
+        return None, "video_encode_failed"
+    finally:
+        for leftover in work.glob("pass*"):
+            leftover.unlink(missing_ok=True)
+
+
+def prune_media_work_dirs(keep_hours: int = 6) -> None:
+    """Shrunk copies are large and pile up fast. Cleared on the next shrink,
+    the same way incoming/ is -- a directory of 45 MB videos nobody is
+    watching fills a disk quickly."""
+    root = Path(tempfile.gettempdir())
+    cutoff = _dt.datetime.now().timestamp() - keep_hours * 3600
+    for d in root.glob("isla_shrink_*"):
+        try:
+            if d.is_dir() and d.stat().st_mtime < cutoff:
+                shutil.rmtree(d, ignore_errors=True)
+        except OSError:
+            pass
+
+
 async def _send_media_file(update: Update, path: str, sent_hashes: set[str]) -> None:
     p = Path(path)
     if not p.is_absolute():
@@ -3595,13 +3717,35 @@ async def _send_media_file(update: Update, path: str, sent_hashes: set[str]) -> 
         return
     size = p.stat().st_size
     if size > TELEGRAM_MAX_FILE_BYTES:
-        await _msg(update).reply_text(_t(lang,
-            f"⚠️ File {p.name} ({size / 1024 / 1024:.1f}MB) exceeds Telegram's bot "
-            f"upload limit (50MB), can't send it.",
-            f"⚠️ File {p.name} ({size / 1024 / 1024:.1f}MB) melebihi limit Telegram "
-            f"buat bot (50MB), nggak bisa dikirim.",
-        ))
-        return
+        # A video over the limit used to be refused outright, after all the
+        # work of producing or fetching it. Most real video is over it -- a
+        # measured example, Big Buck Bunny, is 722 MB -- so refusing was the
+        # common case rather than the edge one. Try to make it fit first, and
+        # say what is happening: encoding takes real time (about 32s per 90s
+        # of 1080p on this project's own server) and silence there reads as a
+        # hang.
+        shrunk, why = None, ""
+        if p.suffix.lower() in VIDEO_SUFFIXES and _ffmpeg():
+            await _msg(update).reply_text(_t(lang,
+                f"🎬 {p.name} is {size / 1048576:.0f}MB, over Telegram's 50MB "
+                f"limit for bots — re-encoding it to fit. This takes a moment.",
+                f"🎬 {p.name} berukuran {size / 1048576:.0f}MB, melebihi batas "
+                f"50MB Telegram untuk bot — saya kecilkan dulu supaya muat. "
+                f"Butuh sebentar."))
+            loop = asyncio.get_running_loop()
+            shrunk, why = await loop.run_in_executor(None, shrink_video_to_fit, p)
+            await loop.run_in_executor(None, prune_media_work_dirs)
+        if shrunk is None:
+            detail = _detail(lang, why) if why else ""
+            await _msg(update).reply_text(_t(lang,
+                f"⚠️ File {p.name} ({size / 1048576:.1f}MB) exceeds Telegram's bot "
+                f"upload limit (50MB), can't send it." + (f" ({detail})" if detail else ""),
+                f"⚠️ File {p.name} ({size / 1048576:.1f}MB) melebihi limit Telegram "
+                f"buat bot (50MB), nggak bisa dikirim." + (f" ({detail})" if detail else ""),
+            ))
+            return
+        p = shrunk
+        size = p.stat().st_size
     digest = _file_sha256(p)
     if digest is not None and digest in sent_hashes:
         logger.info("skipped duplicate media file (same content already sent): %s", p)
@@ -3624,16 +3768,47 @@ async def _send_media_file(update: Update, path: str, sent_hashes: set[str]) -> 
                 f"(token/API key). Hapus dulu bagian itu kalau memang perlu dikirim.",
             ), parse_mode="Markdown")
             return
-    try:
+    # Sent as what it actually is. Everything used to go out as a document,
+    # which for a report is right and for a video is not: it arrives as a file
+    # you must download before you can watch it. reply_video plays inline,
+    # with a thumbnail and a scrub bar; reply_audio and reply_photo likewise.
+    # A document fallback stays for everything else, and for the case where
+    # Telegram rejects the typed send -- an .mkv it will not transcode, say --
+    # because arriving as a file beats not arriving.
+    suffix = p.suffix.lower()
+    timeouts = dict(read_timeout=MEDIA_UPLOAD_TIMEOUT,
+                    write_timeout=MEDIA_UPLOAD_TIMEOUT, connect_timeout=30)
+
+    async def _send_typed() -> bool:
         with p.open("rb") as f:
-            await _msg(update).reply_document(
-                document=f,
-                filename=p.name,
-                read_timeout=MEDIA_UPLOAD_TIMEOUT,
-                write_timeout=MEDIA_UPLOAD_TIMEOUT,
-                connect_timeout=30,
-            )
-        logger.info("sent media file: %s (%d bytes)", p, size)
+            if suffix in VIDEO_SUFFIXES:
+                await _msg(update).reply_video(video=f, filename=p.name,
+                                               supports_streaming=True, **timeouts)
+            elif suffix in AUDIO_SUFFIXES:
+                await _msg(update).reply_audio(audio=f, filename=p.name, **timeouts)
+            elif suffix in IMAGE_SUFFIXES and suffix != ".gif":
+                await _msg(update).reply_photo(photo=f, **timeouts)
+            else:
+                return False
+        return True
+
+    try:
+        typed = False
+        if suffix in VIDEO_SUFFIXES | AUDIO_SUFFIXES | IMAGE_SUFFIXES:
+            try:
+                typed = await _send_typed()
+            except Exception:
+                logger.warning("typed send failed for %s, falling back to document",
+                               p.name, exc_info=True)
+                typed = False
+        if not typed:
+            with p.open("rb") as f:
+                await _msg(update).reply_document(
+                    document=f,
+                    filename=p.name,
+                    **timeouts,
+                )
+        logger.info("sent media file: %s (%d bytes, typed=%s)", p, size, typed)
         if digest is not None:
             sent_hashes.add(digest)
     except Exception:
@@ -6869,6 +7044,19 @@ _MSG = {
         "Google is rate-limiting or the quota is exhausted",
         "Google sedang membatasi rate, atau kuotanya habis"),
     "drive_ok": ("ok", "ok"),
+    "ffmpeg_missing": ("ffmpeg isn't installed on this host",
+                       "ffmpeg belum terpasang di host ini"),
+    "video_duration_unknown": ("couldn't read the video's duration",
+                               "tidak bisa membaca durasi videonya"),
+    "video_too_long_to_fit": (
+        "too long to fit in 50MB at a watchable quality",
+        "terlalu panjang untuk muat 50MB dengan kualitas yang masih enak ditonton"),
+    "video_encode_failed": ("re-encoding failed", "proses encoding gagal"),
+    "video_encode_timeout": ("re-encoding took too long",
+                             "encoding-nya kelamaan"),
+    "video_still_too_large": ("still over the limit after re-encoding",
+                              "masih melebihi batas walau sudah dikecilkan"),
+    "video_shrunk": ("re-encoded to fit", "dikecilkan agar muat"),
     "gdrive_deleted": ("deleted", "dihapus"),
     "gdrive_moved": ("moved", "dipindahkan"),
     "gdrive_path_refused": (

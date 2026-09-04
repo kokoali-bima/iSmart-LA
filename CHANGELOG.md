@@ -1,5 +1,47 @@
 # Changelog
 
+## v0.2b.70 -- video and audio, sent as what they are
+
+Asked for: find a video, mix sound onto it, send it to the chat so it plays
+like a meme. Most of the plumbing already existed -- the model has Bash and
+the bot already delivers files it names. Two things stood between that and
+working, and neither was the fetching.
+
+**Everything went out as a document.** Right for a report, wrong for a clip:
+it arrives as a file you have to download before you can watch it. Videos now
+go via `reply_video` (inline, thumbnail, scrub bar), audio via `reply_audio`,
+images via `reply_photo`, with a document fallback for anything Telegram
+refuses -- arriving as a file beats not arriving. `.gif` deliberately stays a
+document, because sent as a photo it stops moving.
+
+**Anything over the 50MB bot limit was refused outright**, after all the work
+of producing it -- and that is the common case, not the edge one: a real
+measurement with yt-dlp puts Big Buck Bunny at 722MB. Oversized video is now
+re-encoded to fit, two-pass at a bitrate computed from the real duration,
+because only a bitrate target predicts output size. The wait is announced
+first: benchmarked here, 90 seconds of 1080p takes about 32 seconds on 12
+cores, and silence for that long reads as a hang.
+
+`ffmpeg` joins the packages install.sh installs, and `yt-dlp` is fetched as
+the upstream binary -- the packaged one is months behind and these sites change
+often enough that a stale copy simply stops working. A fresh deployment has
+both without doing anything.
+
+**What the end-to-end run taught, which no amount of reasoning would have:**
+asked for a real 3:42 music video, yt-dlp returned 32MB of AV1 -- and
+re-encoding the whole thing to H.264 came out at **67MB, larger than the
+source and over the limit**, because AV1 is far more efficient. Cutting 30
+seconds first produced 8MB in 15 seconds. So both briefs now say: cut BEFORE
+encoding, always finish at H.264 + AAC (yt-dlp's best pick is often AV1/Opus,
+which arrives as a file instead of playing), and send about 30 seconds by
+default -- a three-minute clip in a chat is homework, not a meme.
+
+Verified by actually doing it: searched, downloaded, cut, encoded and
+delivered to a real chat, arriving as a playable video rather than a file.
+
+Full suite: **727/727 across 32 suites** on the real Linux target.
+
+
 ## v0.2b.69 -- the index learned to answer "what breaks if I change this"
 
 The symbol index told you whether a name existed. It could not tell you what
