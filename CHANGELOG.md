@@ -1,5 +1,39 @@
 # Changelog
 
+## v0.2b.67 -- a symbol index, so a name collision is visible before it is written
+
+`dev/code_index.py`, written directly out of the v0.2b.66 incident: a new
+`_msg(lang, detail)` silently replaced a `_msg(update)` that every reply path
+calls, and broke every message the bot sent. Nothing about writing that
+function looked wrong at the time, which is the whole problem -- a name that is
+already taken is invisible at the point you type it.
+
+It writes two files into the project's notes directory:
+
+- **SYMBOLS.md** -- all 442 top-level names: signature, line, and the first
+  line of the docstring, sorted A-Z so checking whether a name is free is one
+  search. **Duplicates are listed first and loudly**, with both signatures and
+  both line numbers.
+- **TRACE.md** -- appended, never rewritten. One dated section per run:
+  what was added, removed, re-signed or moved since the previous one, with the
+  version tag and a hash of the file. A name can be traced back to when it
+  appeared and what it replaced.
+
+Regenerated automatically by `dev/run_all.py`, so it cannot go stale: the
+index is only useful if it describes the code as it is now.
+
+Proven against the incident it exists for -- reintroducing the duplicate `_msg`
+into a scratch copy produced exactly the warning it should:
+`_msg — line 3479 _msg(update), line 6732 _msg(lang, detail)`.
+
+One bug in the guard, found by running it rather than reasoning about it: it
+skipped when `OUT_DIR.parent` did not exist, which does not work on Linux,
+where a Windows path contains no separators and is therefore ONE filename
+whose parent is `.` -- so a CI run created a directory literally named
+`C:\laragon\www\...` inside the checkout, the exact stray directory the guard
+was meant to prevent. `is_absolute()` is the honest test.
+
+
 ## v0.2b.66 -- four bugs, one of them mine and nearly shipped
 
 **A name collision that would have broken every reply.** Adding a bilingual

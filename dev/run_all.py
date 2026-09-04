@@ -51,6 +51,17 @@ if compile_check.returncode != 0:
     print(compile_check.stderr.strip() or compile_check.stdout.strip())
     sys.exit(1)
 
+# The symbol index is regenerated on every run, so it is never stale: it is
+# what makes a name collision visible BEFORE it is written, and the incident
+# that prompted it (a second _msg silently replacing the first, breaking every
+# reply) was invisible at the point of writing. Best-effort -- a failure here
+# must never stop the tests.
+try:
+    subprocess.run([sys.executable, str(DEV / "code_index.py"), str(SRC)],
+                   capture_output=True, text=True, timeout=60)
+except Exception:
+    pass
+
 suites = sorted(DEV.glob("test_*.py"))
 if not suites:
     print("no test_*.py found in dev/")
