@@ -176,7 +176,14 @@ check("the new deployment gets its own SERVICE_NAME, so it does not fight the "
       and 'SERVICE_NAME=${SERVICE_NAME}' in text)
 check("install.sh is run AS the new user, not as root -- otherwise the service "
       "would run as root and share nothing",
-      re.search(r'sudo -u "\$USER_NAME".*install\.sh', text, re.S) is not None)
+      re.search(r'sudo -H -u "\$USER_NAME".*install\.sh', text, re.S) is not None)
+# install.sh puts both CLIs in $HOME/.local/bin and agy's credentials in
+# $HOME/.gemini. Plain `sudo -u` does not necessarily reset HOME, so those can
+# land in the INVOKING user's home -- root's -- owned by root, where the service
+# user can neither write them during the install nor read them afterwards. -H
+# makes it explicit rather than depending on the host's sudoers defaults.
+check("every hand-off to the new user uses sudo -H, so $HOME is really theirs",
+      "sudo -u " not in text and text.count("sudo -H -u") >= 2)
 check("the user gets a real home directory, which is what actually separates "
       "~/.ssh, the CLI logins and rclone's config",
       "--create-home" in text)

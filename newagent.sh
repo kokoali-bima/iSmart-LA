@@ -28,10 +28,17 @@
 #
 # Usage:
 #   sudo ./newagent.sh <name> [--repo URL] [--branch NAME] [--no-install]
+#   sudo ./newagent.sh <name> --resume        # install.sh died halfway; retry it
 #
 # Example:
 #   sudo ./newagent.sh ops        # -> user isla-ops, service lite-agent-ops
 #   sudo ./newagent.sh build
+#
+# Every hand-off to the new user goes through `sudo -H`, not plain `sudo -u`.
+# install.sh puts BOTH CLIs in $HOME/.local/bin and agy's credentials in
+# $HOME/.gemini -- so without -H those land in the INVOKING user's home
+# (root's), owned by root, where the service user can neither write them during
+# the install nor read them afterwards.
 # ==============================================================================
 set -euo pipefail
 
@@ -144,7 +151,7 @@ if [ "$RESUME" -eq 0 ]; then
 
   # --- 2. the checkout -------------------------------------------------------
   say "Cloning ${BRANCH}"
-  sudo -u "$USER_NAME" git clone --branch "$BRANCH" "$REPO" "$INSTALL_DIR" \
+  sudo -H -u "$USER_NAME" git clone --branch "$BRANCH" "$REPO" "$INSTALL_DIR" \
     || die "clone failed"
   ok "cloned into ${INSTALL_DIR}"
 fi
@@ -205,7 +212,7 @@ EOF
   warn "Use a DIFFERENT bot token than any other deployment here: one token polled"
   warn "by two processes gets both rejected by Telegram with 409 Conflict."
   echo ""
-  sudo -u "$USER_NAME" env "SERVICE_NAME=${SERVICE_NAME}" \
+  sudo -H -u "$USER_NAME" env "SERVICE_NAME=${SERVICE_NAME}" \
     bash -c "cd '${INSTALL_DIR}' && ./install.sh" \
     || die "install.sh failed. ${USER_NAME} and ${INSTALL_DIR} were left in place -- re-run the install against them with:
     sudo $0 ${NAME} --resume"
@@ -221,7 +228,7 @@ if [ "$RUN_INSTALL" -eq 1 ]; then
   echo "  ${CYAN}journalctl -u ${SERVICE_NAME} -f${RESET}"
 else
   echo "Finish the install yourself:"
-  echo "  ${CYAN}sudo -u ${USER_NAME} env SERVICE_NAME=${SERVICE_NAME} bash -c 'cd ${INSTALL_DIR} && ./install.sh'${RESET}"
+  echo "  ${CYAN}sudo -H -u ${USER_NAME} env SERVICE_NAME=${SERVICE_NAME} bash -c 'cd ${INSTALL_DIR} && ./install.sh'${RESET}"
 fi
 echo ""
 echo "${BOLD}This deployment is isolated from the others by its Linux user.${RESET}"
