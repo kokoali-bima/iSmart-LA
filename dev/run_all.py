@@ -54,13 +54,32 @@ if compile_check.returncode != 0:
 # The symbol index is regenerated on every run, so it is never stale: it is
 # what makes a name collision visible BEFORE it is written, and the incident
 # that prompted it (a second _msg silently replacing the first, breaking every
-# reply) was invisible at the point of writing. Best-effort -- a failure here
-# must never stop the tests.
+# reply) was invisible at the point of writing.
+#
+# Its output used to be captured and thrown away, which defeated the entire
+# point: the tool detected duplicates and then whispered them into a variable
+# nobody read. It is printed now, and a duplicate name FAILS the run -- a
+# warning that stops nothing is a warning people learn to scroll past.
+# Exit code 3 from the index means "duplicate name found" and nothing else.
+# Any OTHER failure means the tool itself did not run -- it is not even copied
+# into the isolated projects this suite's own tests build -- and that must stay
+# best-effort, exactly as it was before: a broken index says nothing about the
+# product, and stopping the tests for it would be a false alarm.
+INDEX_DUPLICATE_EXIT = 3
+index_dupes = False
 try:
-    subprocess.run([sys.executable, str(DEV / "code_index.py"), str(SRC)],
-                   capture_output=True, text=True, timeout=60)
-except Exception:
-    pass
+    idx = subprocess.run([sys.executable, str(DEV / "code_index.py"), str(SRC)],
+                         capture_output=True, text=True, timeout=60)
+    for line in (idx.stdout or "").strip().splitlines():
+        print(f"  {line}")
+    if idx.returncode == INDEX_DUPLICATE_EXIT:
+        index_dupes = True
+    elif idx.returncode != 0:
+        print(f"  symbol index did not run (exit {idx.returncode}) -- "
+              f"continuing, this says nothing about the code")
+    print()
+except Exception as exc:
+    print(f"  symbol index did not run: {exc}\n")
 
 suites = sorted(DEV.glob("test_*.py"))
 if not suites:
@@ -113,4 +132,8 @@ if failing:
         print(f"  - {f}")
     sys.exit(1)
 if failed:
+    sys.exit(1)
+if index_dupes:
+    print("\nDUPLICATE TOP-LEVEL NAME -- the later definition silently "
+          "replaces the earlier one. See the symbol index above.")
     sys.exit(1)

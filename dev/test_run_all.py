@@ -119,6 +119,43 @@ if real_src.exists():
 else:
     print("SKIP - real lite_agent.py not found next to dev/ (unexpected layout)")
 
+# --- 5. the symbol index: fatal on a collision, harmless when absent ------
+# Both halves matter, and the second one was learned the hard way. Wiring the
+# index to fail the run was written as "any non-zero exit from code_index.py",
+# which also covers "code_index.py is not there" -- and it is deliberately not
+# copied into these isolated projects. Every scenario above went red for a
+# reason that had nothing to do with the code under test. So: exit 3 means a
+# duplicate name, anything else means the tool did not run.
+DUP_MODULE = 'def thing():\n    return 1\n\n\ndef thing():\n    return 2\n'
+
+check("a project WITHOUT code_index.py still passes -- a missing index tool "
+      "says nothing about the code and must not fail the run",
+      proc2.returncode == 0)
+
+root5 = isolated_project(DUP_MODULE, {"test_fake.py": FAKE_OK})
+shutil.copy(HERE / "code_index.py", root5 / "dev" / "code_index.py")
+proc5 = run_all(root5)
+out5 = proc5.stdout + proc5.stderr
+shutil.rmtree(root5, ignore_errors=True)
+check("a duplicate top-level name FAILS the run", proc5.returncode != 0)
+check("...and names the offender rather than just failing",
+      "thing" in out5 and "duplicate" in out5.lower())
+check("...and the suites themselves still ran and passed, so the failure is "
+      "clearly the collision and not a broken suite", "1/1" in out5)
+
+# The same project with no duplicate must be green, or the check above would
+# be indistinguishable from "the index always fails".
+root6 = isolated_project(VALID_EMPTY_MODULE, {"test_fake.py": FAKE_OK})
+shutil.copy(HERE / "code_index.py", root6 / "dev" / "code_index.py")
+proc6 = run_all(root6)
+out6 = proc6.stdout + proc6.stderr
+shutil.rmtree(root6, ignore_errors=True)
+check("...while the same setup with no duplicate passes",
+      proc6.returncode == 0)
+check("...and the index actually ran and reported, rather than being skipped "
+      "into silence the way it was on Linux",
+      "0 duplicate" in out6)
+
 failed = [n for n, ok in results if not ok]
 print(f"\n{len(results) - len(failed)}/{len(results)} passed")
 if failed:

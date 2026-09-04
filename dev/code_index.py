@@ -276,26 +276,28 @@ def main() -> None:
         version = "(no git)"
 
     syms = collect(src)
-    # Only write where the notes live. The first version of this guard checked
-    # OUT_DIR.parent.exists() and did not work: on Linux a Windows path like
-    # "C:\laragon\..." contains no separators at all, so it is ONE filename,
-    # its parent is "." which of course exists, and the run created a directory
-    # literally named C:\laragon\www\... inside the checkout -- the exact stray
-    # directory the guard was meant to prevent. is_absolute() is the honest
-    # test: that Windows path is not absolute on a POSIX host.
+    # Where to write. The configured path is the operator's notes folder on
+    # Windows; is_absolute() is the honest test for "usable here", because on
+    # Linux a Windows path like "C:\laragon\..." contains no separators at
+    # all, so it is ONE filename whose parent is "." -- an earlier guard
+    # checked only parent.exists() and cheerfully created a directory literally
+    # named C:\laragon\www\... inside the checkout.
+    #
+    # It used to SKIP when the path was unusable. That quietly disabled the
+    # whole index on Linux -- which is the machine the full suite actually runs
+    # on, so the duplicate-name check that this tool exists for was doing
+    # nothing exactly where it mattered. Now it falls back into the checkout
+    # instead: the index always gets built, and the notes copy is a bonus.
+    out_dir, where = OUT_DIR, "notes"
     if not OUT_DIR.is_absolute() or not OUT_DIR.parent.exists():
-        dupes = [k for k, v in syms.items() if len(v) > 1]
-        print(f"index skipped -- {OUT_DIR} is not a usable path on this "
-              f"machine; {len(syms)} names, {len(dupes)} duplicate(s)"
-              + (f": {', '.join(dupes)}" if dupes else ""))
-        sys.exit(1 if dupes else 0)
-    OUT_DIR.mkdir(parents=True, exist_ok=True)
+        out_dir, where = src.parent / "dev" / "index", "fallback"
+    out_dir.mkdir(parents=True, exist_ok=True)
 
     graph = call_graph(src, syms)
-    (OUT_DIR / "SYMBOLS.md").write_text(
+    (out_dir / "SYMBOLS.md").write_text(
         render_symbols(syms, src, version, graph), encoding="utf-8")
 
-    state_file = OUT_DIR / ".index-state.json"
+    state_file = out_dir / ".index-state.json"
     prev = {}
     if state_file.exists():
         try:
@@ -312,7 +314,7 @@ def main() -> None:
     else:
         note = ""
 
-    trace = OUT_DIR / "TRACE.md"
+    trace = out_dir / "TRACE.md"
     if not trace.exists():
         trace.write_text(
             "# Trace — every change to this codebase's shape\n\n"
@@ -349,12 +351,22 @@ def main() -> None:
 
     state_file.write_text(json.dumps(syms, indent=1), encoding="utf-8")
 
-    print(f"SYMBOLS.md + TRACE.md updated in {OUT_DIR}")
+    print(f"SYMBOLS.md + TRACE.md updated in {out_dir}"
+          + (" (fallback -- notes folder not reachable here)"
+             if where == "fallback" else ""))
     print(f"  {len(syms)} names, {len(dupes)} duplicate(s)"
           + (f": {', '.join(dupes)}" if dupes else ""))
     if d["added"] or d["removed"] or d["changed"]:
         print(f"  +{len(d['added'])} -{len(d['removed'])} "
               f"~{len(d['changed'])} since last run")
+    # Exit 3 -- and ONLY 3 -- when there are duplicate names, so the caller can
+    # tell "this codebase has a collision" apart from "this tool fell over".
+    # Those must not be conflated: a missing or broken index tool has nothing
+    # to say about the code, and failing the test run over it would stop
+    # everything for a reason that is not a defect in the product.
+    DUPLICATE_EXIT = 3
+    if dupes:
+        sys.exit(DUPLICATE_EXIT)
 
 
 if __name__ == "__main__":

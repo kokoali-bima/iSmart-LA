@@ -1,5 +1,45 @@
 # Changelog
 
+## v0.2b.72 -- the tracing tools now actually run, and actually stop things
+
+v0.2b.71 shipped correctly and the operator's `/update` still announced
+v0.2b.70. Nothing was broken -- the Drive fix was live on the host -- but the
+commit was pushed without a git tag, and `current_version()` is
+`git describe --tags`. The version a reader is told (README), the version the
+release notes claim (CHANGELOG) and the version the bot actually reports (the
+tag) had drifted apart, and no check existed that could notice.
+
+Three gaps in the tooling, all of the same shape: a tool that exists, runs,
+and is ignored.
+
+**The symbol index was disabled on the machine that matters.** Its output
+directory is the operator's notes folder, a Windows path. On the Linux host --
+where the full suite actually runs -- that path is unusable, and the tool
+responded by *skipping entirely*. So the duplicate-name check, the thing the
+index was built for after a second `_msg` silently replaced the first, did
+nothing exactly where everything runs. It now falls back into the checkout and
+always builds.
+
+**Its findings were captured and thrown away.** `run_all.py` invoked it with
+`capture_output=True` and discarded the result, so a detected collision was
+reported into a variable nobody read. The index now prints, and a duplicate
+top-level name FAILS the run. A warning that stops nothing is a warning people
+learn to scroll past.
+
+Wiring that up broke every scenario in `test_run_all.py` on the first attempt,
+because "fail on non-zero exit" also catches "the tool is not installed" -- and
+it is deliberately absent from the isolated projects those tests build. Exit 3
+now means *duplicate name* and nothing else; any other failure prints a note
+and continues, as it always did. Both halves are tested.
+
+**`dev/test_release_consistency.py`** closes the tag gap. README and CHANGELOG
+must agree; and release notes that are already committed must have a tag. That
+second condition is narrow on purpose -- it cannot fire while a version bump is
+still unstaged, so ordinary development stays green, and it goes red exactly
+in the state that shipped v0.2b.71. Verified both ways against a throwaway
+clone with the tag removed, which reproduced `v0.2b.70-1-g734e979` -- the
+string the operator saw.
+
 ## v0.2b.71 -- a slow share link is not a lost upload
 
 An operator got `Upload ke Drive gagal ... timed out talking to Google Drive`

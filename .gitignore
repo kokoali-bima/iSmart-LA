@@ -42,3 +42,7 @@ spend.jsonl
 OWNER_SCOPE.md
 *.log
 tools/registry.json
+
+# Symbol index when the operator notes folder is not reachable on this
+# machine (the Linux host). Generated on every full test run.
+/dev/index/
