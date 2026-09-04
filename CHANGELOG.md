@@ -1,5 +1,72 @@
 # Changelog
 
+## Unreleased -- newagent.sh: another deployment, in one command
+
+The last piece of the split this series is about. `install.sh` sets up ONE
+deployment and already says what the second one needs:
+
+    "For most setups, create a dedicated non-root user first and re-run as
+     that user."
+
+So this automates exactly that, and nothing more: create the user, clone,
+grant the one sudo right `/update` depends on, hand over to `install.sh`.
+
+**Deliberately a script and not a Telegram command**, which is the same
+argument `/addmcp` and `/addserver` settle the other way. Adding an agent means
+creating a Linux user with shell access, its own `~/.ssh`, and its own
+subscription logins -- strictly larger than anything the bot gates behind a PIN
+today. A decision that size belongs where a human already has root.
+
+**The sudo grant is the whole security argument, and it is narrower than the
+obvious version.** `/update` ends with `sudo -n systemctl restart <service>`,
+and without it the bot updates itself and never comes back -- so exactly that
+command is granted, for exactly that unit. `refresh_systemd_unit()` also wants
+`sudo -n cp <tmp> /etc/systemd/system/<unit>`, and that is refused: granting it
+would let the service user rewrite its own unit with `User=root` and take the
+host on the next restart, which would make every deployment on the box
+root-equivalent and reduce the per-user isolation to decoration. The cost of
+refusing is a convenience, not correctness -- that write is already best-effort
+in the code, logging `could not write the unit (needs sudo)` and carrying on
+without restarting, so nothing loops. Refreshing the unit after a release that
+changes the template becomes an operator action, and the README says so.
+
+The broad rights `install.sh` genuinely needs (apt, writing the unit the first
+time) are granted in a separate sudoers file removed by a `trap ... EXIT INT
+TERM` -- Ctrl-C and a failed install included. Temporary rights that can outlive
+the thing that needed them are not temporary.
+
+Details that each close a way this could go wrong:
+
+- **The name is validated, not quoted.** It becomes a username, a directory and
+  a unit name at once, so `../etc`, `x;rm -rf /`, spaces, uppercase and
+  non-ascii are refused outright. Nothing there is made safe by escaping.
+- **Validated BEFORE the root check**, found by running it rather than reading
+  it: with the checks the other way round a mistyped name sent you to find sudo
+  first, only to be turned away again for a different reason once you had it.
+- **It refuses an existing user, directory or unit.** An existing deployment
+  holds a PIN hash, sessions, SSH keys and connected Drive accounts, and
+  "provision" must never be able to mean "destroy those".
+- `install.sh` runs AS the new user, not as root -- run as root the service
+  would run as root too, and share the very `$HOME` this exists to separate.
+- The generated sudoers files are checked with `visudo -c`, and an invalid one
+  is removed rather than left in `/etc/sudoers.d` where it can break `sudo`
+  for everyone.
+
+New: `dev/test_newagent.py`, 38 tests. Runs the script as a real subprocess
+(never with root, so every path it exercises refuses before reaching anything
+privileged) for the validation half, and reads the generated sudoers rules for
+the grant half -- asserting the permanent one contains `systemctl restart` and
+does NOT contain `cp`, `/etc/systemd/system`, `daemon-reload` or a blanket
+`ALL`. Those exist to stop the grant being widened later by someone reasonably
+trying to silence that log line. **0/1 against the pre-change source.**
+
+Full suite: **789/791 across 37 suites** on this Windows dev box; the two
+failures and four skips are the long-standing Windows-only artifacts, confirmed
+pre-existing. **Not run on Linux**, and this one is entirely a Linux script:
+the validation and refusal paths are exercised here, but no user was created,
+no sudoers file written and no unit installed. That half needs a real host.
+
+
 ## Unreleased -- Drive keeps refreshing after rclone's shared client retires
 
 Google has begun charging for API requests made through rclone's built-in

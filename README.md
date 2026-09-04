@@ -227,7 +227,8 @@ credentials. Each install is already independent in everything that matters: the
 brief, memory, PIN, sessions, registered servers, MCP registry and ledger are all
 relative to the install directory.
 
-Give each one its own service name and its own Linux user:
+Each one needs its own service name and its own Linux user. `newagent.sh` does
+both, then hands over to `install.sh`:
 
 ```bash
 sudo ./newagent.sh ops      # -> user isla-ops,   service lite-agent-ops
@@ -244,6 +245,42 @@ sudo useradd -m isla-ops
 sudo -u isla-ops git clone <this-repo> /home/isla-ops/lite-agent
 cd /home/isla-ops/lite-agent && SERVICE_NAME=lite-agent-ops ./install.sh
 ```
+
+**The sudo rights it grants are narrower than you might expect, on purpose.**
+`/update` ends with `sudo -n systemctl restart <service>`, so exactly that one
+command is granted, for exactly that one unit. `refresh_systemd_unit()` also
+wants to `cp` a rendered unit into `/etc/systemd/system`, and that is **not**
+granted: it would let the service user rewrite its own unit with `User=root` and
+take the host on the next restart, which would make every deployment on the box
+root-equivalent and reduce the separate-user isolation to decoration. The bot
+already treats that write as best-effort — it logs `could not write the unit
+(needs sudo)` and carries on without restarting, so nothing loops. **Refreshing
+the unit after a release that changes the template is an operator action:**
+re-run `install.sh` as root for that deployment.
+
+The broad rights `install.sh` genuinely needs (apt, writing the unit the first
+time) are granted only while it runs, and removed by a trap on every exit path —
+Ctrl-C and a failed install included.
+
+**The service name is not optional.** Two installs sharing one unit name do not
+merely look untidy: each start re-renders `/etc/systemd/system/<name>.service`
+with *its own* directory and user, sees the other's version as out of date,
+rewrites it and restarts -- so the pair restart each other without end. The
+installer records a non-default `SERVICE_NAME` in `.env`, which is what lets the
+running process restart the right unit on `/update`.
+
+**The separate Linux user is not optional either.** These live in `$HOME` and have
+no per-install override, so two deployments under one user still share them:
+
+| | why it matters |
+|---|---|
+| `~/.ssh/agent_active` | `/unlock` in one deployment opens **write mode for both** |
+| `~/.ssh/config` | the `/addserver` block is rewritten by whichever ran last |
+| `~/.config/rclone/rclone.conf` | connected Drive accounts are pooled |
+| agy's MCP registry | `agy mcp add` is global to the user, unlike claude's per-call `--mcp-config` |
+
+Each deployment also needs its **own bot token** from @BotFather -- one token
+polled by two processes gets both rejected with `409 Conflict`.
 
 
 ### The environment brief, and how it fills itself in
@@ -973,6 +1010,7 @@ runaway background cost.
 ```
 lite_agent.py              the bot itself
 install.sh                 interactive installer
+newagent.sh                provision an ADDITIONAL deployment (own user + service)
 bootstrap.py               generates SOUL.md / GEMINI.md from a few questions
 requirements.txt
 .env.example                every setting, documented
