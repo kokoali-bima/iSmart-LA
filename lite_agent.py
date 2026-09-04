@@ -1974,12 +1974,15 @@ def harden_state_files() -> int:
                 changed += 1
         except OSError:
             logger.warning("could not lock down %s", name, exc_info=True)
-    try:
-        if MEMORY_DIR.is_dir() and (MEMORY_DIR.stat().st_mode & 0o077):
-            MEMORY_DIR.chmod(0o700)
-            changed += 1
-    except OSError:
-        logger.warning("could not lock down the memory directory", exc_info=True)
+    # Both hold per-chat content -- one room's remembered facts, one room's
+    # role -- so both are owner-only for the same reason.
+    for d in (MEMORY_DIR, CHAT_SCOPE_DIR):
+        try:
+            if d.is_dir() and (d.stat().st_mode & 0o077):
+                d.chmod(0o700)
+                changed += 1
+        except OSError:
+            logger.warning("could not lock down %s", d.name, exc_info=True)
     if changed:
         logger.warning("hardened %d state file(s) to owner-only", changed)
     return changed
@@ -2310,8 +2313,10 @@ LEARN_LINE_RE = re.compile(r"^\s*LEARN:\s*(.+?)\s*$", re.MULTILINE)
 LEARNED_ZONE_MARKER = "<!-- LEARNED_ZONE -->"
 # The LEARNED zone is re-sent at the start of every new conversation, so
 # unbounded growth would quietly raise the floor cost of every future turn.
-# Oldest entries are dropped past this cap.
-LEARNED_MAX_FACTS = 60
+# Oldest entries are dropped past this cap. Read from the environment just
+# below the logger setup -- it can reject a bad value, and a rejection nobody
+# can read is not one.
+_LEARNED_CAP_DEFAULT = 60
 # Which of the 4 tiers actually answered, in one glance -- if it's ever NOT
 # "mini" (the primary/cheapest tier), that's a visible signal something
 # upstream (rate limit, auth hiccup, timeout) forced an escalation.
@@ -2336,6 +2341,38 @@ try:  # keep the log readable only by the user the service runs as
     LOG_FILE.chmod(0o600)
 except OSError:  # pragma: no cover -- never worth failing startup over
     pass
+
+
+# How many learned facts the deployment keeps (see _LEARNED_CAP_DEFAULT).
+# Deliberately parsed HERE rather than beside the constant: it rejects bad
+# values by logging them, and until basicConfig() above has run there is
+# nowhere for that to go -- a guard whose only failure path crashes on a
+# NameError, in exactly the case it exists for, is worse than no guard.
+#
+# Tunable since /setchatscope made one deployment able to answer as genuinely
+# different things per room: those rooms share this one budget, so a busy week
+# on one silently evicts the other's oldest facts. Raising it is a real trade
+# -- every fact is re-sent when any room opens a conversation -- so the default
+# does not move. /learned shows how close to the cap you actually are; measure
+# before changing it, the same order /spend and TURN_TOKEN_CEILING ask for.
+#
+# Unlike TURN_TOKEN_CEILING, 0 is NOT "off" here. This cap exists to stop
+# unbounded growth, so removing it is the dangerous direction, not the
+# permissive one: anything unparseable or below 1 keeps the default and says so
+# rather than starting with a setting that does the opposite of what it reads
+# like.
+_learned_cap_raw = (os.environ.get("LEARNED_MAX_FACTS") or "").strip()
+try:
+    LEARNED_MAX_FACTS = int(_learned_cap_raw) if _learned_cap_raw else _LEARNED_CAP_DEFAULT
+except ValueError:
+    logger.warning("LEARNED_MAX_FACTS=%r is not a number -- keeping the default of %d",
+                   _learned_cap_raw, _LEARNED_CAP_DEFAULT)
+    LEARNED_MAX_FACTS = _LEARNED_CAP_DEFAULT
+if LEARNED_MAX_FACTS < 1:
+    logger.warning("LEARNED_MAX_FACTS=%d would leave the learned zone empty or "
+                   "unbounded -- keeping the default of %d",
+                   LEARNED_MAX_FACTS, _LEARNED_CAP_DEFAULT)
+    LEARNED_MAX_FACTS = _LEARNED_CAP_DEFAULT
 
 
 # --------------------------------------------------------------------------
@@ -2581,9 +2618,97 @@ def load_memory_text(chat_id: Optional[str] = None) -> str:
     return "\n\n".join(parts)
 
 
+# Per-chat role, on top of the one shared brief.
+#
+# /setscope is deliberately ONE setting for the whole deployment, and that is
+# right for "what is this bot for". It is wrong for the case this exists for:
+# one deployment serving a registered group of network engineers and another of
+# researchers, where the useful answer to "what kind of assistant is this"
+# genuinely differs per room.
+#
+# Written as a LAYER rather than a per-chat copy of the brief, and that is the
+# whole design decision. Hard boundaries live INSIDE the brief -- see
+# write_boundaries(), which rewrites the bullet list in SOUL.md/GEMINI.md --
+# so a per-chat brief FILE that replaced them would mean /addboundary silently
+# not reaching the chats that have one, and nothing would say so. A layer
+# cannot have that bug: the shared brief, boundaries and all, is still sent in
+# full on every turn, and this is added after it.
+#
+# The cost of that choice, stated rather than hidden: a research room still
+# carries the infrastructure brief's text it has no use for. That is token
+# overhead, not a hole -- and for a persona that should not even SEE the other
+# one's brief, the answer is a separate deployment (its own SERVICE_NAME and
+# Linux user), not this.
+CHAT_SCOPE_DIR = BASE_DIR / "chatscope"
+
+
+def _chat_scope_file(chat_id: Optional[str]) -> Optional[Path]:
+    """This chat's own role file, or None when there is no usable chat id.
+    Validated, not escaped -- same rule as _chat_memory_file()."""
+    if not chat_id or not _CHAT_ID_SAFE.match(str(chat_id)):
+        return None
+    return CHAT_SCOPE_DIR / f"{chat_id}.md"
+
+
+def chat_scope_text(chat_id: Optional[str]) -> str:
+    path = _chat_scope_file(chat_id)
+    if path is None or not path.exists():
+        return ""
+    try:
+        return path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+
+
+def set_chat_scope(chat_id: Optional[str], text: str) -> bool:
+    """Returns False when there is no usable chat id -- refusing beats writing
+    it somewhere shared, which would hand one room's role to every other."""
+    path = _chat_scope_file(chat_id)
+    if path is None:
+        return False
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        CHAT_SCOPE_DIR.chmod(0o700)
+    except OSError:
+        logger.warning("could not lock down the chat-scope directory", exc_info=True)
+    path.write_text(text.strip() + "\n", encoding="utf-8")
+    logger.warning("chat scope set for %s", chat_id)
+    return True
+
+
+def clear_chat_scope(chat_id: Optional[str]) -> bool:
+    path = _chat_scope_file(chat_id)
+    if path is None or not path.exists():
+        return False
+    path.unlink()
+    logger.warning("chat scope cleared for %s", chat_id)
+    return True
+
+
+def _chat_scope_block(chat_id: Optional[str]) -> str:
+    """The injectable form, or "". Says plainly that it overrides the role and
+    that the boundaries above it do not bend -- the brief is still there in
+    full, so this is resolving a contradiction the reader can see, not making
+    a promise about text that was withheld."""
+    text = chat_scope_text(chat_id)
+    if not text:
+        return ""
+    return (
+        "[Role for THIS chat, which takes precedence over the role stated in the "
+        "working-environment instructions. Everything else there still applies "
+        "unchanged -- the HARD BOUNDARIES above all, which are never relaxed by "
+        f"this or by anything asked in conversation:]\n{text}"
+    )
+
+
 def _brief_files() -> list[Path]:
     """Both backends' briefs. A fact learned while Gemini was answering is just
-    as true when Claude answers next, so learned facts go to both."""
+    as true when Claude answers next, so learned facts go to both.
+
+    Deliberately NOT extended with per-chat files: see CHAT_SCOPE_DIR above --
+    a per-chat role is a layer, so there is only ever one pair of briefs for
+    /addboundary and append_learned() to keep correct.
+    """
     return [p for p in (SYSTEM_PROMPT_FILE, GEMINI_PROMPT_FILE) if p.exists()]
 
 
@@ -2713,7 +2838,14 @@ def _run_claude_once(prompt: str, session_id: Optional[str], session_name: str, 
     # whether Claude Code CLI accumulates repeated flags or lets the last one
     # win was never verified and isn't worth depending on either way.
     memory_text = load_memory_text(chat_id)
-    extra_parts = [p for p in (memory_text, owner_scope_text() if owner_dm else "") if p]
+    # Order matters, and there are now four layers. The chat's own role goes
+    # LAST, so it is the nearest thing to the question when the model resolves
+    # it against the shared brief's role; the capability brief goes FIRST,
+    # since it is background the rest is read against. Same one
+    # --append-system-prompt call, for the reason above.
+    extra_parts = [p for p in (memory_text,
+                               owner_scope_text() if owner_dm else "",
+                               _chat_scope_block(chat_id)) if p]
     if not session_id:
         # Only on a FRESH session, like agy's include_env: once it is in the
         # history the model still has it, and re-sending it every turn would
@@ -2876,6 +3008,14 @@ def _build_agy_prompt(prompt: str, include_env: bool = False, owner_dm: bool = F
                 "[Additional scope, ONLY because this message is confirmed from "
                 f"the bot owner in their own private chat:]\n{extra}"
             )
+    # Every turn, not only include_env ones. The brief above is sent once per
+    # conversation because re-sending ~2.5k tokens is waste; this is a line or
+    # two, and sending it every turn means changing a room's role with
+    # /setchatscope applies to the conversation already open rather than to
+    # whichever one happens to start next.
+    chat_scope = _chat_scope_block(chat_id)
+    if chat_scope:
+        parts.append(chat_scope)
     # Placed BEFORE the early return below: on a resumed turn with an empty
     # MEMORY.md there is nothing else to prepend, and an earlier version
     # returned here -- silently dropping the mode notice in exactly the case
@@ -6100,6 +6240,98 @@ async def cmd_setownerscope(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     ), parse_mode="HTML")
 
 
+async def cmd_setchatscope(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """What KIND of assistant this is IN THIS CHAT -- /setscope, per room.
+
+    /setscope stays one shared setting on purpose, and for "what is this bot
+    for" that is the right answer. This is for the case it cannot serve: one
+    deployment where a network-engineering group and a research group both talk
+    to the same bot and genuinely need different roles.
+
+    It ADDS to the shared brief rather than replacing it, which is what keeps
+    /addboundary honest -- boundaries live inside that brief, so a per-chat
+    replacement would quietly stop delivering them here. See
+    _chat_scope_block().
+
+    Gated like /setscope and /addserver: the owner anywhere, or a registered
+    group's own admin in that group. No PIN, for the reason /rmboundary and
+    /setscope need none -- it grants no capability. The tools, the machines and
+    the boundaries are exactly what they were; only the description of the job
+    changes.
+    """
+    if not _may_run_setup(update):
+        return
+    lang = _chat_lang(update)
+    if not _is_owner(update) and not await _is_group_admin(update, context):
+        return await update.message.reply_text(_t(lang,
+            "\U0001f512 Bot owner or a group admin only.",
+            "\U0001f512 Cuma pemilik bot atau admin grup.",
+        ))
+
+    chat_id = str(update.effective_chat.id)
+    text = " ".join(context.args).strip() if context.args else ""
+
+    if not text:
+        current = chat_scope_text(chat_id)
+        shared = brief_scope() or _t(lang, "(unrecognised)", "(tidak terbaca)")
+        if current:
+            return await update.message.reply_text(_t(lang,
+                f"\U0001f9ed <b>This chat's role</b>:\n\n{_tg_escape(current)}\n\n"
+                f"Everywhere else: <i>{_tg_escape(shared)}</i> (/setscope)\n\n"
+                "<code>/setchatscope clear</code> to fall back to the shared one, "
+                "or send new text to replace it.",
+                f"\U0001f9ed <b>Peran di chat ini</b>:\n\n{_tg_escape(current)}\n\n"
+                f"Di tempat lain: <i>{_tg_escape(shared)}</i> (/setscope)\n\n"
+                "<code>/setchatscope clear</code> untuk kembali ke yang dipakai bersama, "
+                "atau kirim teks baru untuk mengganti.",
+            ), parse_mode="HTML")
+        return await update.message.reply_text(_t(lang,
+            "\U0001f9ed <b>A role for this chat alone</b>\n\n"
+            f"Right now every chat gets the same one: <i>{_tg_escape(shared)}</i>. "
+            "This overrides it here, and nowhere else -- so one deployment can serve "
+            "an infrastructure room and a research room without either seeing the "
+            "other's answer to \"what are you for\".\n\n"
+            "<code>/setchatscope machine-learning research assistant, strong on "
+            "experiment design and academic writing</code>\n\n"
+            "<i>The shared brief is still sent in full -- every hard boundary in it "
+            "still applies here, and this cannot loosen them.</i>",
+            "\U0001f9ed <b>Peran khusus buat chat ini</b>\n\n"
+            f"Sekarang semua chat dapat peran yang sama: <i>{_tg_escape(shared)}</i>. "
+            "Ini menimpanya di sini saja -- jadi satu deployment bisa melayani ruang "
+            "infrastruktur dan ruang riset tanpa keduanya melihat jawaban yang sama "
+            "untuk \"kamu ini buat apa\".\n\n"
+            "<code>/setchatscope asisten riset machine learning, kuat di rancangan "
+            "eksperimen dan penulisan akademik</code>\n\n"
+            "<i>Brief bersama tetap dikirim utuh -- semua hard boundary di dalamnya "
+            "tetap berlaku di sini, dan ini tidak bisa melonggarkannya.</i>",
+        ), parse_mode="HTML")
+
+    if text.lower() in ("clear", "hapus", "none"):
+        cleared = clear_chat_scope(chat_id)
+        return await update.message.reply_text(_t(lang,
+            "✅ Cleared -- this chat is back on the shared role."
+            if cleared else "Nothing was set for this chat.",
+            "✅ Sudah dihapus -- chat ini kembali ke peran bersama."
+            if cleared else "Chat ini memang belum diatur.",
+        ))
+
+    if not set_chat_scope(chat_id, text):
+        return await update.message.reply_text(_t(lang,
+            "⚠️ No usable chat id, so there is nowhere private to record this. "
+            "Nothing changed -- writing it somewhere shared would hand this role to "
+            "every other chat.",
+            "⚠️ Tidak ada chat id yang bisa dipakai, jadi tidak ada tempat "
+            "khusus untuk menyimpannya. Tidak ada yang diubah -- menulisnya di tempat "
+            "bersama berarti peran ini ikut ke semua chat lain.",
+        ))
+    await update.message.reply_text(_t(lang,
+        f"✅ <b>Recorded, for this chat only.</b>\n\n{_tg_escape(text)}\n\n"
+        "<i>Applies from your next message -- no /new needed.</i>",
+        f"✅ <b>Tercatat, cuma untuk chat ini.</b>\n\n{_tg_escape(text)}\n\n"
+        "<i>Berlaku mulai pesan berikutnya -- tidak perlu /new.</i>",
+    ), parse_mode="HTML")
+
+
 async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _authorized(update):
         return
@@ -6208,6 +6440,7 @@ Every reply ends with a "— by ..." tag. If it's ever NOT "{TIERS[0]['label']}"
 /session <name> — create/switch to a named session, for keeping different cases separate
 /sessions — list all saved sessions
 /setbrief <what it looks after> — set the one-line environment brief
+/setchatscope <kind of assistant> — the role for THIS chat only, overriding /setscope here
 /setgrouppin — set/change THIS group's own PIN (owner or this group's admin, run inside the group)
 /setownerscope <extra text> — extra scope for YOU only, in YOUR DM only (owner-only)
 /setpin — set/change the OWNER's PIN, works everywhere (entered on a keypad, never typed in chat)
@@ -6280,6 +6513,7 @@ Setiap balasan diakhiri tanda "— by ...". Kalau tandanya BUKAN "{TIERS[0]['lab
 /session <nama> — buat/pindah ke sesi bernama, buat pisahin kasus berbeda
 /sessions — lihat semua sesi tersimpan
 /setbrief <yang diurus> — atur brief lingkungan satu baris
+/setchatscope <jenis agent> — peran khusus untuk chat INI saja, menimpa /setscope di sini
 /setgrouppin — atur/ganti PIN milik grup INI (owner atau admin grup ini, jalankan di dalam grupnya)
 /setownerscope <teks tambahan> — scope tambahan cuma untuk KAMU, cuma di DM KAMU (owner-only)
 /setpin — atur/ganti PIN OWNER, berlaku di mana pun (lewat keypad, tidak pernah diketik di chat)
@@ -6392,6 +6626,34 @@ def _learned_facts() -> list[str]:
     return []
 
 
+def _learned_zone_tokens() -> int:
+    """Roughly what the learned zone adds to a conversation when it opens.
+
+    A count of facts is only a proxy for what anyone actually cares about here,
+    which is tokens -- and the two come apart, since a fact may be anything from
+    10 to 400 characters. This measures the zone as it really sits in the brief,
+    header included, because that is what gets sent.
+
+    HONEST LIMIT: an ESTIMATE, at roughly four characters per token, not a
+    measurement. A real count needs the model's own tokenizer, which would mean
+    a dependency this project does not have and would not carry for one status
+    line. It is shown with a "~" for that reason, and it is the right order of
+    magnitude rather than the right number.
+
+    Why this is worth showing at all: the brief is re-sent whenever a chat OPENS
+    a conversation, so on a deployment where /new is used often this is not a
+    one-off -- it is a floor paid again every time.
+    """
+    for path in _brief_files():
+        try:
+            _, learned = _split_zones(path.read_text())
+        except OSError:
+            continue
+        if learned.strip():
+            return len(learned) // 4
+    return 0
+
+
 async def cmd_learned(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Everything the agent worked out about this environment by itself."""
     if not _authorized(update):
@@ -6409,13 +6671,48 @@ async def cmd_learned(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         ))
         return
     numbered = "\n".join(f"{i}. {f[2:]}" for i, f in enumerate(facts, 1))
+    # The count against the cap, not just the count. The cap is shared by every
+    # room -- including ones answering as different things since /setchatscope
+    # -- and it evicts the OLDEST silently, so "56 of 60" is the only warning
+    # anyone gets that facts are about to start disappearing. Shown always
+    # rather than only when close: a number that appears just as it starts
+    # mattering is a number nobody has learned to read.
+    near = len(facts) >= max(1, int(LEARNED_MAX_FACTS * 0.8))
+    cap_note = ""
+    if near:
+        cap_note = _t(lang,
+            f"\n\n⚠️ Close to the cap ({LEARNED_MAX_FACTS}). Past it the OLDEST are "
+            "dropped, with nothing said. /forget the ones that no longer hold, or "
+            "raise LEARNED_MAX_FACTS in .env -- but every fact here is re-sent "
+            "whenever any chat starts a conversation, so it is a real cost, not a "
+            "free dial.",
+            f"\n\n⚠️ Sudah dekat batas ({LEARNED_MAX_FACTS}). Lewat itu yang TERLAMA "
+            "dibuang tanpa pemberitahuan. /forget yang sudah tidak berlaku, atau naikkan "
+            "LEARNED_MAX_FACTS di .env -- tapi tiap fakta di sini dikirim ulang setiap "
+            "kali ada chat memulai percakapan, jadi ini biaya nyata, bukan tombol gratis.",
+        )
+    # The token figure, not just the count. The count is a proxy; this is the
+    # thing being paid, and it is paid again every time any chat opens a
+    # conversation -- so on a deployment that uses /new freely it is a floor
+    # cost, not a one-off. "~" because it is chars/4, not a real tokenizer.
+    #
+    # Written out in full rather than through _fmt_tok(): a full zone lands
+    # somewhere around 1-2k, and _fmt_tok's "{n/1000:.0f}k" renders both 1,100
+    # and 1,900 as "1k" -- collapsing the one range where the number has to be
+    # readable to be worth showing. /spend keeps _fmt_tok, where the magnitudes
+    # are large enough for it to be the right call.
+    est = f"{_learned_zone_tokens():,}"
     await _reply_chunked(
         update,
         _t(lang,
-           f"🧠 What the agent has worked out about this environment ({len(facts)}):\n\n{numbered}"
-           "\n\nSomething wrong in there? Remove it with /forget <number>.",
-           f"🧠 Yang sudah dipelajari agent tentang lingkungan ini ({len(facts)}):\n\n{numbered}"
-           "\n\nSalah satu keliru? Hapus dengan /forget <nomor>.",
+           f"🧠 What the agent has worked out about this environment "
+           f"({len(facts)} of {LEARNED_MAX_FACTS} · ~{est} tokens, re-sent each "
+           f"time a chat starts a new conversation):\n\n{numbered}"
+           "\n\nSomething wrong in there? Remove it with /forget <number>." + cap_note,
+           f"🧠 Yang sudah dipelajari agent tentang lingkungan ini "
+           f"({len(facts)} dari {LEARNED_MAX_FACTS} · ~{est} token, dikirim ulang "
+           f"tiap kali ada chat memulai percakapan baru):\n\n{numbered}"
+           "\n\nSalah satu keliru? Hapus dengan /forget <nomor>." + cap_note,
         ),
     )
 
@@ -10063,6 +10360,7 @@ def main() -> None:
     app.add_handler(CommandHandler("setbrief", cmd_setbrief))
     app.add_handler(CommandHandler("setscope", cmd_setscope))
     app.add_handler(CommandHandler("setownerscope", cmd_setownerscope))
+    app.add_handler(CommandHandler("setchatscope", cmd_setchatscope))
     app.add_handler(CommandHandler("spend", cmd_spend))
     app.add_handler(CommandHandler("addboundary", cmd_addboundary))
     app.add_handler(CommandHandler("rmboundary", cmd_rmboundary))

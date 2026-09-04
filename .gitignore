@@ -39,6 +39,7 @@ update_state.json
 update_announce.json
 spend.jsonl
 /memory/
+/chatscope/
 OWNER_SCOPE.md
 *.log
 tools/registry.json

@@ -1,5 +1,162 @@
 # Changelog
 
+## Unreleased -- /setchatscope: a different job per room
+
+The second half of the same problem the SERVICE_NAME change below solves the
+first half of. Splitting agents by *risk class* gets you two deployments -- one
+holding SSH keys to production, one that only reads papers and writes code.
+Inside each, the rooms still need different roles: a network-engineering group
+and a Proxmox group are the same risk class and belong on the same install, but
+"what kind of assistant is this" is not the same answer for both.
+
+`/setscope` cannot serve that, deliberately -- it is one setting for the whole
+deployment, and for "what is this bot for" that is right. `/setchatscope`
+overrides the role in the chat it is run in and nowhere else. Gated like
+`/setscope` and `/addserver` (owner anywhere, or a registered group's own admin
+in that group), no PIN: it grants no capability at all. The tools, the machines
+reachable and the boundaries are exactly what they were; only the description of
+the job changes.
+
+**The design decision worth recording is that this is a LAYER, not a per-chat
+copy of the brief** -- and the obvious implementation is the copy. Hard
+boundaries live INSIDE the brief: `write_boundaries()` rewrites the bullet list
+in SOUL.md and GEMINI.md. So a per-chat brief FILE would mean a boundary added
+next week silently never reaching any room that had one, with nothing to say so
+-- a room quietly operating under last month's rules. That is the same shape of
+gap this project has been bitten by three times already (a fix that only lives
+on one path never reaching the installs that take the other).
+
+A layer cannot have it. The shared brief still goes out in full on every turn
+and the room's role is appended after it, stating plainly that it takes
+precedence over the role and that the boundaries above it are never relaxed by
+it -- a contradiction the reader can see being resolved, rather than a promise
+about text that was withheld. Proved rather than asserted: a test adds a
+boundary AFTER a room has its own role and checks the room's very next prompt
+carries it, and checks the same for a room with no role of its own.
+
+The cost is stated rather than hidden: a research room still carries
+infrastructure-brief text it has no use for. That is token overhead, not a hole,
+and a persona that should not even SEE the other's brief wants a separate
+deployment -- which is what the change below is for.
+
+Details that would each have shipped something subtly wrong:
+
+- **Sent on every turn, not only when a conversation opens.** The brief itself
+  is opening-only because re-sending ~2.5k tokens is waste; this is a line or
+  two, and gating it the same way would mean changing a room's role applied to
+  whichever conversation happened to start next rather than the one open now.
+- **Both backends, not just Claude.** agy is the DEFAULT, cheapest tier, so a
+  Claude-only version would have made per-room roles reachable only on the
+  expensive escalation path -- exactly backwards, the same trap v0.2b.52 caught
+  itself in with MCP.
+- **A write with no usable chat id is refused**, not written somewhere shared,
+  which would hand one room's role to every other -- the exact leak v0.2b.49
+  fixed for MEMORY.md. Ids are validated as optionally-negative integers rather
+  than escaped, same rule, and `chatscope/` is chmod 700 beside `memory/` for
+  the same reason both hold one room's private content.
+
+New: `dev/test_chat_scope.py`, 48 tests, behavioural rather than structural --
+the module is loaded against a scratch install, real files are written, and the
+prompt actually handed to agy is read back, with the Claude side checked by
+capturing the argv `_run_claude_once()` builds. Several tests exist only to stop
+the layer quietly becoming a replacement later, since a test that merely checked
+"the role differs per room" would pass under the broken design too.
+
+Verified in both directions. Against the pre-change source it reports **0/6 and
+stops with a readable tally** rather than dying on the first AttributeError --
+fixed after the first run did exactly that, because a detector nobody can read
+in the failing direction is not a detector. One test failure of my own was found
+the same way and was the test's fault, not the code's: it asserted on
+`ast.unparse` output including the docstring, and `_brief_files()`'s docstring
+names `CHAT_SCOPE_DIR` precisely to explain why it does not use it.
+
+**Not included, and worth naming precisely, because the obvious next step turns
+out to be the wrong one:** the learned zone is still global and still capped at
+60 facts for the whole deployment. The tempting follow-up is to make it
+per-room the way MEMORY.md went per-chat in v0.2b.49 -- but the two are not the
+same shape. `LEARN:` lines are already refused from any group
+(`_is_trusted_origin`: a private DM from a named ALLOWED_USER_IDS account), so
+a room cannot poison its own learned zone and there is no cross-room *write* to
+isolate. What the current design actually gives is "the operator teaches it once
+in their DM and every room benefits", and making the zone per-room would break
+exactly that while fixing a leak that cannot occur.
+
+What IS real, and is made more likely by this release rather than less: the
+60-fact cap is now shared between personas that can finally differ, so a busy
+infrastructure week can silently evict the research room's facts. That is a cap
+question, not an isolation one -- addressed below.
+
+### `LEARNED_MAX_FACTS`, and a cap you can see coming
+
+The cap was hardcoded and invisible. Both halves mattered once rooms could
+differ: past 60 the OLDEST fact is dropped with nothing said, so the first sign
+is a fact the agent used to know and now does not.
+
+`LEARNED_MAX_FACTS` is now read from `.env`, and `/learned` reports "N of 60"
+always -- not only once it is close, because a number that appears just as it
+starts mattering is a number nobody has learned to read -- with a warning past
+80% naming both ways out.
+
+**And the tokens, beside the count, because the count is only a proxy.** A fact
+may be 10 or 400 characters, so "52 of 60" and the thing actually being paid
+come apart. It reads `52 of 60 · ~1,358 tokens, re-sent each time a chat starts
+a new conversation` -- the second clause because on a deployment where `/new` is
+used freely (and it should be: v0.2b.62 measured one session reaching 506,250
+input tokens by its 95th turn), the learned zone is not a one-off, it is a floor
+paid again at every fresh conversation. Marked `~` and documented as chars/4:
+a real count needs the model's own tokenizer, which is a dependency this project
+does not carry for one status line.
+
+Printed in full rather than through `_fmt_tok()`, found by rendering it rather
+than trusting it: a full zone lands around 1-2k, and `_fmt_tok`'s
+`{n/1000:.0f}k` shows both 1,358 and 1,560 as "1k" -- collapsing precisely the
+band where the number has to be readable to be worth printing. `/spend` keeps
+`_fmt_tok`, where the magnitudes make it the right call. Raising it is presented as the real trade it is
+rather than a free dial: every fact is re-sent whenever ANY room opens a
+conversation, so the cap is a running cost in every room, and `/forget` on
+facts that no longer hold is often the better answer. Measure first, the order
+`/spend` and `TURN_TOKEN_CEILING` already ask for.
+
+**0 is not "off" here**, deliberately unlike `TURN_TOKEN_CEILING`: this cap is
+what stands between the briefs and unbounded growth, so removing it is the
+dangerous direction, not the permissive one. Anything unparseable, zero or
+negative keeps the default and logs why.
+
+**And the bug that guard nearly shipped with, found by writing the test for
+it.** The parsing was placed beside the constant, some twenty lines ABOVE where
+`logger` is created -- so the only path that calls `logger.warning()` would
+have died on `NameError: name 'logger' is not defined`. Confirmed by
+reconstructing it rather than reasoning about it: with a valid value the module
+imports perfectly, and with `LEARNED_MAX_FACTS=sixty` it does not import at
+all. That is the shape that ships green -- it compiles, so `/update`'s own
+compile-check passes it too, and it breaks only for the operator who typo'd
+their `.env`, by refusing to start. A guard whose sole failure path crashes, in
+exactly the case it exists for, is worse than no guard. Moved below the logger,
+and `dev/test_learned_cap.py` asserts the ordering so it cannot come back --
+verified against the reconstructed bug, where that one test fails and the rest
+pass.
+
+New: `dev/test_learned_cap.py`, 26 tests. Loads the module repeatedly with
+different environment values rather than reading the source for them, so
+"refused" means the constant really came out at the default; enforcement is
+checked by writing five facts under a cap of three and looking at which two
+survived; and the estimate is checked to track CONTENT rather than entry count,
+by comparing one 400-character fact against one short one. **9/14 against the
+pre-change source, with a tally rather than a traceback.**
+
+One test-hygiene lesson turned up three separate times in this branch, so it is
+worth stating plainly rather than as an aside: **a detector must stay READABLE
+in the direction where it fails.** These suites are pointed at a bare scratch
+copy of the module to prove they fire, and each time a new check reached for
+something that copy does not have, the suite died on an AttributeError or a
+missing file instead of reporting -- in the one run that is the entire point of
+writing it. Every section that needs a new symbol now guards for it and exits
+with a tally.
+
+Full suite: **727/729 across 35 suites** on this Windows dev box; the two
+failures and four skips are the long-standing Windows-only artifacts, confirmed
+pre-existing. **Verification on the Linux target is still pending.**
+
 
 ## Unreleased -- one host, two deployments: the unit follows SERVICE_NAME
 

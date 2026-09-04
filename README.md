@@ -60,6 +60,10 @@ down, this is the map.
   secret.
 - `/remember`'s memory is **per chat** -- a fact saved in one group's chat is never
   injected into another chat's next turn.
+- The **role itself can differ per room** (`/setchatscope`), so one deployment can
+  answer a network-engineering group and a research group as the thing each of them
+  needs -- layered on the shared brief, never replacing it, so a boundary added
+  later still reaches every room.
 - The owner alone can grant themselves extra scope that applies **only** in their
   own private DM, never in any group even when they're the one typing there
   (`/setownerscope`).
@@ -281,11 +285,45 @@ where it lands: always inside the learned zone, never anywhere else. The boundar
 enforced by code, not by the model's cooperation. Bootstrap follows the same rule --
 your hard boundaries are copied in verbatim, never paraphrased by a model.
 
+#### `/setchatscope` -- a different job per room, on one deployment
+
+`/setscope` is one shared setting, and for "what is this bot for" that's the right
+answer. It can't serve the case where a network-engineering group and a research
+group talk to the same bot and genuinely need different roles. `/setchatscope`
+overrides the role **in the chat it's run in, and nowhere else**:
+
+```
+/setchatscope machine-learning research assistant, strong on experiment design
+```
+
+Gated like `/setscope` and `/addserver` -- the owner anywhere, or a registered
+group's own admin inside that group. No PIN: it grants no capability. The tools,
+the machines it can reach and the boundaries are all exactly what they were; only
+the description of the job changes. `/setchatscope clear` returns the room to the
+shared role, and running it bare shows both.
+
+**It adds to the shared brief rather than replacing it, and that's the whole
+design.** Hard boundaries live *inside* the brief -- `/addboundary` rewrites the
+bullet list in `SOUL.md` and `GEMINI.md` -- so a per-chat brief *file* would mean a
+boundary added next week silently never reaching the rooms that have one, with
+nothing to indicate it. A layer can't have that bug: the shared brief still goes
+out in full every turn and the room's role is appended after it, saying in as many
+words that it takes precedence over the role and that the boundaries above it do
+not bend. There's a test that adds a boundary *after* a room has its own role and
+checks it still arrives.
+
+The honest cost: a research room still carries infrastructure-brief text it has no
+use for. That's token overhead, not a hole -- and if a persona shouldn't even *see*
+the other one's brief, the answer is [a separate deployment](#more-than-one-deployment-on-one-host),
+not this.
+
+Per-chat memory (`/remember`) and per-chat model overrides (`/usemodel`) already
+worked this way, so a room can carry its own role, its own facts and its own model
+without any of the three leaking sideways.
+
 #### `/setownerscope` -- extra scope, owner-only, DM-only
 
-`/setscope` is deliberately **one shared setting** -- every group and every DM sees
-the exact same brief, on purpose, so there's one predictable answer to "what is this
-bot for" everywhere it's used. `/setownerscope` sits on top of that for one specific
+`/setownerscope` sits on top of the same base for one specific
 case: the owner wants the bot to also help with general things (a joke, casual
 questions) in their own DM, without loosening what every group gets.
 
@@ -345,6 +383,7 @@ Ollama, say), since something has to translate between protocols.
 | `/update` | owner/admin + PIN | Check GitHub for a newer version and install it |
 | `/setbrief <one line>` | owner/admin | Say what this agent looks after (also the 4th item on `/start`) |
 | `/setscope <phrase>` | owner/admin | Change what KIND of assistant it is, not just what it manages |
+| `/setchatscope <phrase>` | owner/admin | The role for **this chat only**, overriding `/setscope` here -- one deployment, a different job per room |
 | `/setownerscope <text>` | owner, **own DM only** | Extra scope on top of `/setscope`, for the owner alone, in their own DM only -- never a group, even one the owner is speaking in |
 | `/logout` | owner/admin | Clear a sign-in (Gemini or Claude) for a genuinely fresh /start |
 | `/boundaries` | **0 tokens** | What the agent must never do |
