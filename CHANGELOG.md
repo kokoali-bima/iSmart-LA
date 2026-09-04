@@ -1,5 +1,81 @@
 # Changelog
 
+
+## Unreleased -- one host, two deployments: the unit follows SERVICE_NAME
+
+Wanted for a split by *risk class* rather than by job title: one agent holding
+SSH keys to production, a second one that reads papers and writes code and
+should never be able to reach the first one's credentials at all.
+
+Almost nothing stood in the way. State has been install-relative for a long
+time -- brief, memory, PIN, sessions, servers, MCP registry, ledger -- and
+`SERVICE_NAME` was already settable and already used for `/update`'s restart.
+One line never followed it:
+
+    SERVICE_UNIT_PATH = Path("/etc/systemd/system/lite-agent.service")
+
+That is not a cosmetic clash. `refresh_systemd_unit()` renders the template
+with **this** install's user and directory, `apply_hardening_on_start()` calls
+it on every start, and it reports "refreshed" whenever the file on disk differs
+from its own render. So with two installs sharing the name: B rewrites A's
+unit, A starts, sees a unit that is not its render, rewrites it and restarts,
+B does the same from the other side -- **the two restart each other without
+end.** Both bots keep answering throughout, which is what makes it easy to miss:
+nothing looks broken until someone reads `NRestarts`.
+
+The default is unchanged, so existing deployments are untouched -- verified by
+loading the module three times in one process and printing what each would
+manage: unset gives exactly the old path, `lite-agent-ops` and
+`lite-agent-build` give their own.
+
+The installer half matters as much and is the easy half to leave out, because
+nothing fails immediately without it: `install.sh` now takes `SERVICE_NAME`
+from the environment and **writes it into `.env` when it is not the default**.
+Without that line the process reads the default and goes back to restarting a
+unit that does not exist while rewriting the other deployment's file -- the same
+bug, reintroduced through the installer instead of the source. Written only when
+custom, keeping `.env`'s "overrides only" convention.
+
+Both halves of the split that this does NOT solve are documented rather than
+half-fixed, because they are `$HOME`-relative with no override: a second
+deployment needs its own **Linux user** (or `/unlock` in one opens write mode
+for both, via the shared `~/.ssh/agent_active`; and `~/.ssh/config`, rclone's
+config and agy's global MCP registry are shared too) and its own **bot token**
+(one token polled by two processes gets both rejected with `409 Conflict`).
+
+**Two pre-existing faults found while in there**, both in the file being edited:
+
+- The `chmod 600` loop in `install.sh` had lost its line continuations to a
+  one-line collapse, leaving a literal `\n` in the middle of the word list.
+  Unquoted, `sh` reads that as the word `n` -- confirmed in a real shell rather
+  than assumed (`for f in a \n b` yields `a`, `n`, `b`) -- so every install
+  chmod'd a phantom `$INSTALL_DIR/n`. Harmless only by luck, and the next person
+  to add a filename would have been editing damaged text.
+- Nothing was checking that loop against `HARDEN_600`, the list covering the
+  same files from the other direction (every start and every `/update`). A file
+  added to one and forgotten in the other is a state file that stays
+  world-readable on whichever path is not taken. They agree today; a test now
+  says so.
+
+New: `dev/test_service_name.py`, 22 tests, pure source inspection -- no systemd,
+no root, same result on any OS. Verified both ways, as the detector for a
+one-line regression has to be: **10/22 against the pre-fix tree**, naming each
+of the twelve real faults (including the phantom `\n`, which surfaced on its own
+in the drift check as `only in .sh: ['\n']`), and 22/22 after.
+
+Rebased onto v0.2b.70 and re-verified there: it touches neither the systemd
+path nor `HARDEN_600`, so only the changelog needed a hand (this entry sits
+above it, being unreleased).
+
+Full suite: **653/655 across 33 suites** on this Windows dev box. The two
+failures and four skips are the long-standing Windows-only artifacts, confirmed
+pre-existing by running the same suites against the stashed tree and getting
+byte-identical results. **Verification on the Linux target is still pending** --
+this is a systemd path, and this dev box is not Linux, so "two deployments no
+longer restart each other" rests on source inspection plus a functional check
+of the path each one resolves, not on a real host.
+
+
 ## v0.2b.74 -- the expensive-conversation warning stops going quiet
 
 An evaluation of two third-party token-saving tools ended up measuring this

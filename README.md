@@ -214,6 +214,33 @@ all. [`examples/proxmox/`](./examples/proxmox/) is one worked example, not a req
 shape -- a Kubernetes cluster, a fleet of web servers, or a CI estate all work the
 same way.
 
+### More than one deployment on one host
+
+Two agents with genuinely different jobs -- one that holds SSH keys to production,
+one that only reads papers and writes code -- are better kept apart than merged,
+because the second one's blast radius should not include the first one's
+credentials. Each install is already independent in everything that matters: the
+brief, memory, PIN, sessions, registered servers, MCP registry and ledger are all
+relative to the install directory.
+
+Give each one its own service name and its own Linux user:
+
+```bash
+sudo ./newagent.sh ops      # -> user isla-ops,   service lite-agent-ops
+sudo ./newagent.sh build    # -> user isla-build, service lite-agent-build
+```
+
+It refuses to touch an existing user, directory or unit — an existing deployment
+holds a PIN hash, sessions, SSH keys and connected Drive accounts, and
+"provision" must never be able to mean "destroy those". By hand it is the same
+three steps:
+
+```bash
+sudo useradd -m isla-ops
+sudo -u isla-ops git clone <this-repo> /home/isla-ops/lite-agent
+cd /home/isla-ops/lite-agent && SERVICE_NAME=lite-agent-ops ./install.sh
+```
+
 
 ### The environment brief, and how it fills itself in
 

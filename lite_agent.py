@@ -1985,7 +1985,15 @@ def harden_state_files() -> int:
     return changed
 
 
-SERVICE_UNIT_PATH = Path("/etc/systemd/system/lite-agent.service")
+# Named after SERVICE_NAME, not hardcoded, because every other piece of state
+# here is already BASE_DIR-relative -- two clones on one host have separate
+# briefs, memory, PIN and sessions, and the unit file was the last thing they
+# still shared. With it hardcoded, the second instance rewrites the first
+# one's unit (its own BASE_DIR and user substituted in), and then
+# apply_hardening_on_start() sees "changed" on EVERY start of both, so the two
+# restart each other indefinitely. SERVICE_NAME was already settable and
+# already used for the restart itself -- the path simply never followed it.
+SERVICE_UNIT_PATH = Path(f"/etc/systemd/system/{SERVICE_NAME}.service")
 SERVICE_TEMPLATE = BASE_DIR / "systemd" / "lite-agent.service.template"
 
 
@@ -2060,7 +2068,7 @@ def refresh_systemd_unit() -> str:
 
         backup = rendered_backup = None
         if current:
-            backup = BASE_DIR / ".lite-agent.service.bak"
+            backup = BASE_DIR / f".{SERVICE_NAME}.service.bak"
             backup.write_text(current)
             rendered_backup = str(backup)
 

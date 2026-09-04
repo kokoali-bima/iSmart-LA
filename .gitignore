@@ -32,7 +32,7 @@ model_overrides.json
 chat_language.json
 gdrive_room_accounts.json
 gdrive_oauth_client.json
-.lite-agent.service.bak
+.*.service.bak
 /incoming/
 /bin/
 update_state.json
