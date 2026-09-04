@@ -151,6 +151,20 @@ SNAPSHOT_SCRIPT = BASE_DIR / "tools" / "cluster_snapshot.py"
 # the connected account only ever exposes files rclone itself created.
 RCLONE_BIN = os.environ.get("RCLONE_BIN", "rclone")
 GDRIVE_ROOT = os.environ.get("GDRIVE_ROOT", "iSmart-LA Data")
+
+# Bound rclone's OWN retrying. Left at its defaults (--retries 3 with
+# exponential backoff, --low-level-retries 10) a single transient 5xx from
+# Drive turns a one-second upload into a minute of sleeping, and the first
+# thing to fire is our outer timeout -- which reports "timed out" for what was
+# really one bad response. With these, rclone gives up predictably and hands
+# back the actual error, and our timeout stays what it should be: a last
+# resort. Measured against a live remote: a warm upload is ~1s, and the same
+# upload straight after an OAuth token refresh took 40s, which is why the
+# ceiling below is generous rather than tight.
+RCLONE_NET_FLAGS = ["--retries", "3", "--low-level-retries", "3",
+                    "--timeout", "60s", "--contimeout", "20s"]
+GDRIVE_UPLOAD_TIMEOUT = int(os.environ.get("GDRIVE_UPLOAD_TIMEOUT_SECONDS", "300"))
+GDRIVE_LINK_TIMEOUT = int(os.environ.get("GDRIVE_LINK_TIMEOUT_SECONDS", "60"))
 RCLONE_CONF = Path.home() / ".config" / "rclone" / "rclone.conf"
 # Which connected Drive account each chat uploads to -- {chat_id: remote}.
 # Deliberately no fallback default: a room must explicitly pick one via
@@ -3689,6 +3703,64 @@ def shrink_video_to_fit(path: Path,
             leftover.unlink(missing_ok=True)
 
 
+def video_presentation(path: Path) -> dict:
+    """duration/width/height and a poster frame, for reply_video.
+
+    Telegram cannot be made to autoplay with sound -- checked against the real
+    parameter list, and none of sendVideo's 32 arguments touch autoplay,
+    muting or volume. That is the client's decision and a sensible one; a chat
+    that started blaring audio unprompted would be unusable, especially a
+    group.
+
+    What IS ours to fix is how it arrives. Without dimensions Telegram lays
+    out a generic box and corrects itself once the file is parsed, and without
+    a thumbnail the preview is a black rectangle -- so a clip that plays
+    perfectly still looks broken until it is tapped. Best-effort throughout:
+    every one of these is optional, and a video with none of them still sends.
+    """
+    info: dict = {}
+    probe = shutil.which("ffprobe")
+    if probe:
+        try:
+            out = subprocess.run(
+                [probe, "-v", "error", "-select_streams", "v:0",
+                 "-show_entries", "stream=width,height:format=duration",
+                 "-of", "default=noprint_wrappers=1:nokey=0", str(path)],
+                capture_output=True, text=True, timeout=60)
+            for line in (out.stdout or "").splitlines():
+                key, _, val = line.partition("=")
+                if key == "width" and val.isdigit():
+                    info["width"] = int(val)
+                elif key == "height" and val.isdigit():
+                    info["height"] = int(val)
+                elif key == "duration":
+                    try:
+                        info["duration"] = int(float(val))
+                    except ValueError:
+                        pass
+        except Exception:
+            logger.warning("could not probe %s for presentation", path.name, exc_info=True)
+
+    ff = _ffmpeg()
+    if ff:
+        try:
+            work = Path(tempfile.mkdtemp(prefix="isla_thumb_"))
+            thumb = work / "thumb.jpg"
+            # One second in, not frame zero: many clips open on black or a
+            # fade, which is exactly the poster frame you do not want.
+            grab = subprocess.run(
+                [ff, "-y", "-ss", "1", "-i", str(path), "-frames:v", "1",
+                 "-vf", "scale=320:-2", str(thumb)],
+                capture_output=True, text=True, timeout=120)
+            if grab.returncode == 0 and thumb.exists() and thumb.stat().st_size:
+                info["thumb_path"] = thumb
+            else:
+                shutil.rmtree(work, ignore_errors=True)
+        except Exception:
+            logger.warning("could not make a thumbnail for %s", path.name, exc_info=True)
+    return info
+
+
 def prune_media_work_dirs(keep_hours: int = 6) -> None:
     """Shrunk copies are large and pile up fast. Cleared on the next shrink,
     the same way incoming/ is -- a directory of 45 MB videos nobody is
@@ -3782,8 +3854,22 @@ async def _send_media_file(update: Update, path: str, sent_hashes: set[str]) -> 
     async def _send_typed() -> bool:
         with p.open("rb") as f:
             if suffix in VIDEO_SUFFIXES:
-                await _msg(update).reply_video(video=f, filename=p.name,
-                                               supports_streaming=True, **timeouts)
+                pres = await asyncio.get_running_loop().run_in_executor(
+                    None, video_presentation, p)
+                thumb = pres.pop("thumb_path", None)
+                try:
+                    if thumb is not None:
+                        with thumb.open("rb") as t:
+                            await _msg(update).reply_video(
+                                video=f, filename=p.name, thumbnail=t,
+                                supports_streaming=True, **pres, **timeouts)
+                    else:
+                        await _msg(update).reply_video(
+                            video=f, filename=p.name,
+                            supports_streaming=True, **pres, **timeouts)
+                finally:
+                    if thumb is not None:
+                        shutil.rmtree(thumb.parent, ignore_errors=True)
             elif suffix in AUDIO_SUFFIXES:
                 await _msg(update).reply_audio(audio=f, filename=p.name, **timeouts)
             elif suffix in IMAGE_SUFFIXES and suffix != ".gif":
@@ -3895,20 +3981,35 @@ def _gdrive_upload(remote: str, local_path: str, drive_rel_path: str) -> tuple[b
     rclone creates any missing intermediate folders on its own, so the
     caller never needs to check or create the destination first."""
     dest = f"{remote}:{GDRIVE_ROOT}/{drive_rel_path}"
+    rclone = _rclone_path() or RCLONE_BIN
     try:
         subprocess.run(
-            [_rclone_path() or RCLONE_BIN, "copyto", local_path, dest],
-            check=True, capture_output=True, text=True, timeout=120,
+            [rclone, "copyto", local_path, dest, *RCLONE_NET_FLAGS],
+            check=True, capture_output=True, text=True,
+            timeout=GDRIVE_UPLOAD_TIMEOUT,
         )
-        link = subprocess.run(
-            [_rclone_path() or RCLONE_BIN, "link", dest],
-            check=True, capture_output=True, text=True, timeout=30,
-        )
-        return True, link.stdout.strip()
     except subprocess.CalledProcessError as exc:
         return False, ((exc.stderr or exc.stdout or str(exc)) or "").strip()[:500]
     except subprocess.TimeoutExpired:
         return False, "timed out talking to Google Drive"
+
+    # The file is in Drive from this point on. The share link is a
+    # convenience on top of that, so failing to fetch one must NOT be
+    # reported as a failed upload -- doing so sends someone hunting for a
+    # report that is already sitting safely in their Drive. Measured on a
+    # live remote: the link step is normally ~5s, but it is a separate API
+    # call and fails separately.
+    try:
+        link = subprocess.run(
+            [rclone, "link", dest, *RCLONE_NET_FLAGS],
+            check=True, capture_output=True, text=True,
+            timeout=GDRIVE_LINK_TIMEOUT,
+        )
+        return True, link.stdout.strip()
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        logger.warning("uploaded %s but could not fetch a share link", dest,
+                       exc_info=True)
+        return True, ""
 
 
 async def _send_to_gdrive(update: Update, context: ContextTypes.DEFAULT_TYPE, req: dict) -> None:
@@ -3960,9 +4061,18 @@ async def _send_to_gdrive(update: Update, context: ContextTypes.DEFAULT_TYPE, re
     loop = asyncio.get_running_loop()
     ok, detail = await loop.run_in_executor(None, _gdrive_upload, remote, str(p), rel_path)
     if ok:
+        # detail is the share link, or "" when the file uploaded but the
+        # link call did not come back. Measured against the live remote,
+        # the link step normally takes ~5s but was seen taking 43s -- past
+        # the old 30s ceiling. Saying "upload failed" there sent someone
+        # hunting for a report that was already sitting in their Drive.
+        link_en = f"\n{detail}" if detail else \
+            "\n(share link unavailable this time -- the file is there)"
+        link_id = f"\n{detail}" if detail else \
+            "\n(link berbagi belum bisa diambil -- filenya sudah ada di Drive)"
         await _msg(update).reply_text(_t(lang,
-            f"\U0001f4c1 Uploaded to Drive ({remote}): {rel_path}\n{detail}",
-            f"\U0001f4c1 Terupload ke Drive ({remote}): {rel_path}\n{detail}",
+            f"\U0001f4c1 Uploaded to Drive ({remote}): {rel_path}{link_en}",
+            f"\U0001f4c1 Terupload ke Drive ({remote}): {rel_path}{link_id}",
         ))
     else:
         await _msg(update).reply_text(_t(lang,

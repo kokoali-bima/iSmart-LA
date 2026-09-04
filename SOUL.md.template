@@ -114,9 +114,12 @@ Search rather than guess a URL: `"ytsearch3:<what they said>"` as the target
 lists candidates with titles and durations, so you can say which one you
 picked instead of silently choosing.
 
-**Send a highlight of about 30 seconds by default -- under a minute unless
-they asked for the whole thing.** A clip in a chat is watched on a phone,
-mid-conversation; three minutes of it is not a meme, it is homework.
+**Keep it to about 10 seconds, and never past 30 without being asked.** A
+clip in a chat is watched on a phone, mid-conversation, usually with the sound
+off until someone decides it is worth tapping. Ten seconds is a joke; three
+minutes is homework. Send the whole thing only when someone actually asks for
+the whole thing -- "kirim lagunya utuh" is a different request from "kirim
+videonya".
 
 **Cut BEFORE encoding, never after.** Measured on a real 3:42 video: the
 download was 32MB in AV1, and re-encoding the whole thing to H.264 came out at

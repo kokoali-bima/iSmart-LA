@@ -1,5 +1,42 @@
 # Changelog
 
+## v0.2b.71 -- a slow share link is not a lost upload
+
+An operator got `Upload ke Drive gagal ... timed out talking to Google Drive`
+on a report. The report was in Drive. It had uploaded fine.
+
+`_gdrive_upload` did two things in one `try`: `rclone copyto`, then
+`rclone link` to fetch a shareable URL. Either timing out produced the same
+"upload failed". Timed against the live remote, five runs in a row:
+
+    copyto=36.5s link=5.8s     <- first call, straight after a token refresh
+    copyto=4.5s  link=4.8s
+    copyto=4.1s  link=5.3s
+    copyto=4.8s  link=43.3s    <- past the old 30s link ceiling
+    copyto=4.5s  link=4.9s
+
+So roughly one run in five blew the link ceiling while the upload itself was
+never in doubt. The two calls are now separate: once `copyto` returns, the
+file is in Drive and the upload is reported as successful no matter what the
+link call does. A missing link says so in one line instead of masquerading as
+a lost file.
+
+Also bounded rclone's own retrying (`--retries 3 --low-level-retries 3
+--timeout 60s --contimeout 20s`). Left at its defaults, one transient 5xx from
+Drive turns into a minute of backoff, and the first thing to fire is our outer
+timeout -- reporting "timed out" for what was really one bad response. The
+ceilings themselves moved to 300s for the copy and 60s for the link, both
+overridable, both chosen from the measurements above rather than guessed.
+
+**Clips arrive with their shape known.** Videos now carry `duration`, `width`,
+`height` and a poster frame taken at `-ss 1` (frame 0 is usually black), so
+Telegram lays out the player correctly instead of guessing from a blob. There
+is no autoplay-with-sound parameter to set -- `sendVideo` has 32 parameters
+and none of them touch it; muted-until-tapped is the client's own behaviour.
+
+**Meme clips default to about 10 seconds** (never past 30 unasked). Ten
+seconds is a joke; three minutes is homework.
+
 ## v0.2b.70 -- video and audio, sent as what they are
 
 Asked for: find a video, mix sound onto it, send it to the chat so it plays

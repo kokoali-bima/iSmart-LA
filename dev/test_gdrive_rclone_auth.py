@@ -434,11 +434,78 @@ async def main():
     # failed every upload with "FileNotFoundError: [Errno 2] No such file or
     # directory: 'rclone'" -- _gdrive_upload built its own subprocess call
     # instead of going through the resolver.
+    # Checked by running it, not by grepping the source: a string match here
+    # broke the moment the two calls were split apart, while the behaviour it
+    # was guarding had not changed at all.
+    calls = []
+
+    def fake_run(argv, **kw):
+        calls.append(argv)
+        return SimpleNamespace(returncode=0, stdout="https://drive/x", stderr="")
+
+    with patch.object(mod, "_rclone_path", return_value="/opt/bin/rclone"), \
+            patch.object(mod.subprocess, "run", side_effect=fake_run):
+        ok, detail = mod._gdrive_upload("gdrive", "/tmp/a.html", "r/a.html")
+    check("the upload reports success", ok and detail == "https://drive/x")
+    check("both rclone calls use the resolved path, not the bare name",
+          len(calls) == 2 and all(c[0] == "/opt/bin/rclone" for c in calls))
+    check("the copy and the link are two separate calls",
+          calls[0][1] == "copyto" and calls[1][1] == "link")
+    check("rclone's own retrying is bounded on both calls",
+          all("--low-level-retries" in c and "--contimeout" in c for c in calls))
+
+    # The bug a real operator hit: the file landed in Drive, the share-link
+    # call took 43s against a 30s ceiling, and the bot reported "Upload ke
+    # Drive gagal". Verified afterwards -- the report WAS in Drive the whole
+    # time. A slow link must never be reported as a lost upload.
+    def link_times_out(argv, **kw):
+        if argv[1] == "link":
+            raise mod.subprocess.TimeoutExpired(argv, 60)
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    with patch.object(mod, "_rclone_path", return_value="/opt/bin/rclone"), \
+            patch.object(mod.subprocess, "run", side_effect=link_times_out):
+        ok, detail = mod._gdrive_upload("gdrive", "/tmp/a.html", "r/a.html")
+    check("a share link that times out still counts as an upload", ok)
+    check("...and comes back with no link rather than a fake one", detail == "")
+
+    def link_fails(argv, **kw):
+        if argv[1] == "link":
+            raise mod.subprocess.CalledProcessError(1, argv, "", "denied")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    with patch.object(mod, "_rclone_path", return_value="/opt/bin/rclone"), \
+            patch.object(mod.subprocess, "run", side_effect=link_fails):
+        ok, detail = mod._gdrive_upload("gdrive", "/tmp/a.html", "r/a.html")
+    check("a share link that is refused still counts as an upload",
+          ok and detail == "")
+
+    # The copy itself is the part that may genuinely be lost, so it keeps
+    # reporting failure.
+    def copy_times_out(argv, **kw):
+        raise mod.subprocess.TimeoutExpired(argv, 300)
+
+    with patch.object(mod, "_rclone_path", return_value="/opt/bin/rclone"), \
+            patch.object(mod.subprocess, "run", side_effect=copy_times_out):
+        ok, detail = mod._gdrive_upload("gdrive", "/tmp/a.html", "r/a.html")
+    check("a copy that times out is still a failure",
+          not ok and "timed out" in detail)
+
+    def copy_fails(argv, **kw):
+        raise mod.subprocess.CalledProcessError(1, argv, "", "quota exceeded")
+
+    with patch.object(mod, "_rclone_path", return_value="/opt/bin/rclone"), \
+            patch.object(mod.subprocess, "run", side_effect=copy_fails):
+        ok, detail = mod._gdrive_upload("gdrive", "/tmp/a.html", "r/a.html")
+    check("a copy that errors reports what rclone actually said",
+          not ok and "quota exceeded" in detail)
+
+    check("the copy ceiling is well clear of the measured 40s cold upload",
+          mod.GDRIVE_UPLOAD_TIMEOUT >= 240)
+    check("the link ceiling clears the measured 43s worst case",
+          mod.GDRIVE_LINK_TIMEOUT >= 60)
+
     text = Path(SRC).read_text(encoding="utf-8")
-    check("the upload itself uses the resolved rclone path",
-          '[_rclone_path() or RCLONE_BIN, "copyto"' in text)
-    check("...and so does the share-link call beside it",
-          '[_rclone_path() or RCLONE_BIN, "link"' in text)
     check("no rclone invocation is left using the bare name",
           "[RCLONE_BIN," not in text)
 

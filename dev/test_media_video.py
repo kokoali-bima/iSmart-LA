@@ -217,12 +217,63 @@ async def main():
         check(f"{tpl} says to CUT before encoding, with the measurement that "
               f"makes the reason concrete",
               "Cut BEFORE encoding" in brief and "67MB" in brief)
-        check(f"{tpl} sets a default clip length, since a three-minute clip in "
-              f"a chat is homework rather than a meme",
-              "30 seconds by default" in brief)
+        check(f"{tpl} sets a short default clip length -- ten seconds is a "
+              f"joke, three minutes is homework",
+              "about 10 seconds" in brief and "never past 30" in brief)
+        check(f"{tpl} still allows the full thing when that is what was asked",
+              "only when someone actually asks" in brief)
         check(f"{tpl} insists on H.264 + AAC -- yt-dlp's best pick is often "
               f"AV1/Opus, which arrives as a file instead of playing",
               "H.264 + AAC" in brief)
+
+    # --- how it ARRIVES ----------------------------------------------------
+    # Telegram cannot be made to autoplay with sound: checked against the real
+    # parameter list, and none of sendVideo's 32 arguments touch autoplay,
+    # muting or volume. That is the client's call and a sensible one -- a chat
+    # that blared audio unprompted would be unusable in a group. What IS ours
+    # is how the clip looks before it is tapped: without dimensions Telegram
+    # lays out a generic box, and without a thumbnail the preview is black, so
+    # a video that plays perfectly still looks broken.
+    src_text = Path(SRC).read_text(encoding="utf-8")
+    check("no attempt is made to force autoplay or sound -- there is no such "
+          "parameter, and pretending otherwise would be a lie in the code",
+          "autoplay" not in src_text.lower().replace("autoplay with sound", "")
+          or "cannot be made to autoplay" in src_text)
+    check("dimensions and duration are sent, so the player is laid out right "
+          "immediately instead of correcting itself",
+          "video_presentation" in src_text)
+
+    rec = Recorder()
+    vid = make("clip2.mp4")
+    with patch.object(mod, "video_presentation",
+                      return_value={"duration": 10, "width": 1280, "height": 720}):
+        u = upd_with(rec)
+        with patch.object(mod, "_msg", return_value=rec):
+            await mod._send_media_file(u, str(vid), set())
+    check("a video still sends when there is no thumbnail to attach",
+          rec.calls == ["reply_video"])
+
+    thumb_dir = Path(tempfile.mkdtemp(prefix="isla_thumb_"))
+    (thumb_dir / "thumb.jpg").write_bytes(bytes([255, 216, 255]))
+    rec = Recorder()
+    with patch.object(mod, "video_presentation",
+                      return_value={"duration": 10, "thumb_path": thumb_dir / "thumb.jpg"}):
+        u = upd_with(rec)
+        with patch.object(mod, "_msg", return_value=rec):
+            await mod._send_media_file(u, str(vid), set())
+    check("a thumbnail is attached when one could be made", rec.calls == ["reply_video"])
+    check("...and its working directory is cleaned up afterwards, since these "
+          "accumulate one per video sent", not thumb_dir.exists())
+
+    # Probing must never be what stops a send.
+    rec = Recorder()
+    with patch.object(mod, "video_presentation", side_effect=RuntimeError("ffprobe blew up")):
+        u = upd_with(rec)
+        with patch.object(mod, "_msg", return_value=rec):
+            await mod._send_media_file(u, str(vid), set())
+    check("if probing fails the video still goes out, as a document at worst -- "
+          "presentation is a nicety, delivery is not",
+          rec.calls and rec.calls[-1] in ("reply_video", "reply_document"))
 
     failed = [n for n, ok in results if not ok]
     print(f"\n{len(results) - len(failed)}/{len(results)} passed")
