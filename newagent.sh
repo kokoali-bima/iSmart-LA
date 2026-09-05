@@ -62,6 +62,7 @@ REPO=""
 BRANCH="master"
 RUN_INSTALL=1
 RESUME=0
+RESUME_NEEDS_CLONE=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --repo)      REPO="${2:-}"; shift 2 ;;
@@ -120,7 +121,15 @@ echo ""
 # to have written one.
 if [ "$RESUME" -eq 1 ]; then
   id -u "$USER_NAME" >/dev/null 2>&1 || die "--resume, but user ${USER_NAME} does not exist -- run without it to provision from scratch"
-  [ -d "$INSTALL_DIR" ] || die "--resume, but ${INSTALL_DIR} does not exist -- run without it to provision from scratch"
+  # NOT required to exist: the clone is where this failed on a real run, and
+  # that left the user created with no directory -- neither a fresh run (user
+  # exists) nor --resume (directory does not) would proceed. Resuming now
+  # covers the clone too, so a failure anywhere in the sequence has a way
+  # forward.
+  if [ ! -d "$INSTALL_DIR" ]; then
+    say "checkout is missing -- resuming from the clone"
+    RESUME_NEEDS_CLONE=1
+  fi
   [ "$RUN_INSTALL" -eq 1 ] || die "--resume with --no-install would do nothing"
   say "Resuming: ${USER_NAME} and ${INSTALL_DIR} are already in place"
 else
@@ -129,7 +138,7 @@ else
   [ -e "$UNIT_PATH" ]   && die "${UNIT_PATH} already exists -- refusing to overwrite it"
 fi
 
-if [ "$RESUME" -eq 0 ]; then
+if [ "$RESUME" -eq 0 ] || [ "$RESUME_NEEDS_CLONE" -eq 1 ]; then
   if [ -z "$REPO" ]; then
     REPO="$(git -C "$HERE" remote get-url origin 2>/dev/null || true)"
     [ -n "$REPO" ] || die "could not read this checkout's origin -- pass --repo <url>"
@@ -139,7 +148,23 @@ if [ "$RESUME" -eq 0 ]; then
 
   command -v git >/dev/null 2>&1 || die "git is not installed"
 
+  # A LOCAL path as the source (the only option when the real repo is private
+  # and the new user has no key yet) is owned by whoever staged it, and git
+  # refuses to read a repository owned by someone else: "detected dubious
+  # ownership". Found on a real run, from both directions -- root reading the
+  # deployment, then the new user reading root's staging copy. Both the
+  # worktree and its .git are listed, because git asks for the exact path in
+  # the message and accepts nothing looser.
+  case "$REPO" in
+    /*) if [ -d "$REPO" ]; then
+          sudo -H -u "$USER_NAME" git config --global --add safe.directory "$REPO" 2>/dev/null || true
+          sudo -H -u "$USER_NAME" git config --global --add safe.directory "$REPO/.git" 2>/dev/null || true
+          say "local source: allowed ${USER_NAME} to read ${REPO}"
+        fi ;;
+  esac
+
   # --- 1. the user -----------------------------------------------------------
+  if [ "$RESUME_NEEDS_CLONE" -eq 0 ]; then
   say "Creating ${USER_NAME}"
   # A real login shell, not /usr/sbin/nologin: the Gemini and Claude sign-ins run
   # through tmux in a terminal as this user, and /update's git work happens here
@@ -148,12 +173,16 @@ if [ "$RESUME" -eq 0 ]; then
   useradd --create-home --home-dir "$HOME_DIR" --shell /bin/bash "$USER_NAME"
   chmod 750 "$HOME_DIR"
   ok "user created, home at ${HOME_DIR} (750)"
+  fi
 
   # --- 2. the checkout -------------------------------------------------------
   say "Cloning ${BRANCH}"
   sudo -H -u "$USER_NAME" git clone --branch "$BRANCH" "$REPO" "$INSTALL_DIR" \
     || die "clone failed"
-  ok "cloned into ${INSTALL_DIR}"
+  # current_version() is `git describe --tags`; a clone from a local path does
+  # not bring tags, so the bot would report a bare SHA instead of a version.
+  sudo -H -u "$USER_NAME" git -C "$INSTALL_DIR" fetch --tags --quiet "$REPO" 2>/dev/null || true
+  ok "cloned into ${INSTALL_DIR} ($(sudo -H -u "$USER_NAME" git -C "$INSTALL_DIR" describe --tags --always 2>/dev/null || echo '?'))"
 fi
 
 # --- 3. sudo rights ----------------------------------------------------------

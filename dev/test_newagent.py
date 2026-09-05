@@ -164,8 +164,24 @@ check("--resume REQUIRES the user and directory to exist, so it cannot be used "
 check("--resume still never overwrites an existing unit",
       re.search(r'RESUME.*-eq 0', text, re.S) is not None
       and '[ -e "$UNIT_PATH" ]' in text)
-check("--resume skips the user creation and the clone rather than repeating them",
-      re.search(r'if \[ "\$RESUME" -eq 0 \]; then.*useradd.*git clone.*\nfi', text, re.S) is not None)
+check("--resume never re-creates a user that already exists",
+      re.search(r'RESUME_NEEDS_CLONE" -eq 0 \].*useradd', text, re.S) is not None)
+# The clone is where a real run failed, leaving the user created and no
+# directory: a fresh run refused (user exists) and --resume refused (directory
+# does not). Resuming now covers the clone, so a failure anywhere in that
+# sequence has a way forward.
+check("--resume also clones when the checkout is the part that is missing",
+      "RESUME_NEEDS_CLONE=1" in text
+      and 'RESUME_NEEDS_CLONE" -eq 1 ]' in text)
+# A local path is the only usable source while the real repo is private and
+# the new user has no key yet -- and git refuses to read a repository owned by
+# somebody else ("detected dubious ownership"), which a staging copy always is.
+check("a local --repo is made readable to the new user rather than failing on "
+      "git's ownership check",
+      "safe.directory" in text and '"$REPO/.git"' in text)
+check("...and tags are fetched after a local clone, since a clone from a path "
+      "brings none and current_version() is `git describe --tags`",
+      'fetch --tags --quiet "$REPO"' in text)
 check("--resume with --no-install is refused, since it would do nothing at all",
       "would do nothing" in text)
 
