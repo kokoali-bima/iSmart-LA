@@ -5289,7 +5289,7 @@ async def _gdrive_begin_rclone(update: Update, context: ContextTypes.DEFAULT_TYP
     # Checked rather than announced unconditionally: a host that already has
     # rclone must not be told to wait for a download that will not happen.
     if _rclone_path() is None:
-        await update.message.reply_text(_t(lang,
+        await _msg(update).reply_text(_t(lang,
             "⏳ First time on this host — fetching rclone (a single file, "
             "~20 MB) so Drive can work. This takes a few seconds; the sign-in "
             "link comes right after.",
@@ -5305,7 +5305,7 @@ async def _gdrive_begin_rclone(update: Update, context: ContextTypes.DEFAULT_TYP
     ok, result, handle = await loop.run_in_executor(None, gdrive_rclone_start)
     if not ok:
         _gdrive_wizard.pop(chat_id, None)
-        return await update.message.reply_text(_t(lang,
+        return await _msg(update).reply_text(_t(lang,
             f"⚠️ Could not start the sign-in: {_detail('en', result)}",
             f"⚠️ Tidak bisa memulai sign-in: {_detail('id', result)}"))
 
@@ -5315,7 +5315,7 @@ async def _gdrive_begin_rclone(update: Update, context: ContextTypes.DEFAULT_TYP
         state["handle"] = handle
         state["expires"] = _dt.datetime.now().timestamp() + GDRIVE_TOKEN_WIZARD_TTL
 
-    await update.message.reply_text(_t(lang,
+    await _msg(update).reply_text(_t(lang,
         f"🔗 <b>Connect Google Drive</b> (<code>{_tg_escape(name)}</code>)\n\n"
         f"1. Open this link and approve access:\n<code>{_tg_escape(result)}</code>\n\n"
         "2. Your browser will then land on a page that <b>fails to load</b> "
@@ -5358,7 +5358,7 @@ async def _gdrive_begin_device(update: Update, context: ContextTypes.DEFAULT_TYP
         # unreachable. Reported exactly that way on a live deployment.
         if _client_is_dead(body):
             clear_gdrive_client()
-            await update.message.reply_text(_t(lang,
+            await _msg(update).reply_text(_t(lang,
                 "⚠️ That saved Google OAuth client no longer exists, so I've "
                 "removed it. Starting again the simple way — no Google Cloud "
                 "project needed.",
@@ -5369,7 +5369,7 @@ async def _gdrive_begin_device(update: Update, context: ContextTypes.DEFAULT_TYP
             return await _gdrive_begin_rclone(update, context, lang, name)
         _gdrive_wizard.pop(chat_id, None)
         detail = _detail(lang, str(body.get("error_description", "unknown")))
-        return await update.message.reply_text(_t(lang,
+        return await _msg(update).reply_text(_t(lang,
             f"⚠️ Google refused to start the sign-in: {detail}",
             f"⚠️ Google menolak memulai sign-in: {detail}",
         ))
@@ -5380,7 +5380,7 @@ async def _gdrive_begin_device(update: Update, context: ContextTypes.DEFAULT_TYP
     state = _gdrive_wizard.get(chat_id)
     if state is not None:
         state["step"] = "device_pending"
-    await update.message.reply_text(_t(lang,
+    await _msg(update).reply_text(_t(lang,
         f"🔗 <b>Connect Google Drive</b> (<code>{_tg_escape(name)}</code>)\n\n"
         f"1. Open <code>{_tg_escape(url)}</code> on any device — your phone is fine\n"
         f"2. Enter this code:\n\n<code>{_tg_escape(code)}</code>\n\n"
@@ -5512,30 +5512,30 @@ async def _handle_gdrive_wizard_input(update: Update, context: ContextTypes.DEFA
     if not state:
         return False
     lang = _chat_lang(update)
-    text = (update.message.text or "").strip()
+    text = (_msg(update).text or "").strip()
 
     if state["expires"] < _dt.datetime.now().timestamp():
         _gdrive_wizard.pop(chat_id, None)
-        await update.message.reply_text(_t(lang,
+        await _msg(update).reply_text(_t(lang,
             "\u231b That expired. Run /connectgdrive again.",
             "\u231b Sudah kedaluwarsa. Jalankan /connectgdrive lagi."))
         return True
     if text.lower() in ("/cancel", "cancel", "batal"):
         _gdrive_wizard.pop(chat_id, None)
-        await update.message.reply_text(_t(lang, "\u2716\ufe0f Cancelled.", "\u2716\ufe0f Dibatalkan."))
+        await _msg(update).reply_text(_t(lang, "\u2716\ufe0f Cancelled.", "\u2716\ufe0f Dibatalkan."))
         return True
 
     if state["step"] == "await_gdrive_label":
         name = _sanitize_gdrive_label(text)
         if not name or name == "gdrive_":
-            await update.message.reply_text(_t(lang,
+            await _msg(update).reply_text(_t(lang,
                 "That didn't leave anything usable -- letters/digits/-/_ only, "
                 "try again or /cancel.",
                 "Tidak ada yang tersisa dari itu -- huruf/angka/-/_ saja, "
                 "coba lagi atau /cancel."))
             return True
         if name in _list_gdrive_accounts():
-            await update.message.reply_text(_t(lang,
+            await _msg(update).reply_text(_t(lang,
                 f"'{_tg_escape(name)}' already exists -- pick a different label, or /cancel.",
                 f"'{_tg_escape(name)}' sudah ada -- pilih label lain, atau /cancel."))
             return True
@@ -5572,7 +5572,7 @@ async def _handle_gdrive_wizard_input(update: Update, context: ContextTypes.DEFA
         if found_id:
             state["client_id"] = found_id
         if not state.get("client_id"):
-            await update.message.reply_text(_t(lang,
+            await _msg(update).reply_text(_t(lang,
                 "I couldn't find a client ID in that. It's the long value "
                 "ending in <code>.apps.googleusercontent.com</code> — paste it "
                 "here (the secret can come in the same message or the next "
@@ -5588,7 +5588,7 @@ async def _handle_gdrive_wizard_input(update: Update, context: ContextTypes.DEFA
         if not secret:
             state["client_secret"] = ""
             state["expires"] = _dt.datetime.now().timestamp() + GDRIVE_TOKEN_WIZARD_TTL
-            await update.message.reply_text(_t(lang,
+            await _msg(update).reply_text(_t(lang,
                 "Got the client ID. Now send the <b>client secret</b> — the "
                 "shorter value on the same Google page, usually starting with "
                 "<code>GOCSPX-</code>.",
@@ -5611,7 +5611,7 @@ async def _handle_gdrive_wizard_input(update: Update, context: ContextTypes.DEFA
         if not ok:
             # Left in place on purpose: a mistyped paste should let them try
             # again with the same link, not send them back to the start.
-            return await update.message.reply_text(_t(lang,
+            return await _msg(update).reply_text(_t(lang,
                 f"⚠️ {_detail('en', result)}", f"⚠️ {_detail('id', result)}"))
         name = state.get("name") or "gdrive"
         ok, detail = await loop.run_in_executor(
@@ -5620,7 +5620,7 @@ async def _handle_gdrive_wizard_input(update: Update, context: ContextTypes.DEFA
         _gdrive_wizard.pop(chat_id, None)
         en = _tg_escape(_detail("en", str(detail)))
         id_ = _tg_escape(_detail("id", str(detail)))
-        await update.message.reply_text(
+        await _msg(update).reply_text(
             _t(lang, f"✅ <b>{_tg_escape(name)}</b> connected. {en}",
                      f"✅ <b>{_tg_escape(name)}</b> terhubung. {id_}")
             if ok else
@@ -5631,7 +5631,7 @@ async def _handle_gdrive_wizard_input(update: Update, context: ContextTypes.DEFA
 
     if state["step"] == "device_pending":
         # The waiter owns this step; anything typed here is just noise.
-        await update.message.reply_text(_t(lang,
+        await _msg(update).reply_text(_t(lang,
             "Still waiting for you to approve it in the browser. /cancel to stop.",
             "Masih menunggu Anda menyetujuinya di browser. /cancel untuk berhenti."))
         return True
@@ -5640,10 +5640,10 @@ async def _handle_gdrive_wizard_input(update: Update, context: ContextTypes.DEFA
     name = state["name"]
     _gdrive_wizard.pop(chat_id, None)
     try:
-        await update.message.delete()
+        await _msg(update).delete()
     except Exception:
         logger.info("could not delete the pasted gdrive token (needs admin rights in groups)")
-    await update.message.reply_text(_t(lang,
+    await _msg(update).reply_text(_t(lang,
         f"\u23f3 Connecting and verifying \u2018{_tg_escape(name)}\u2019\u2026",
         f"\u23f3 Menghubungkan dan memverifikasi \u2018{_tg_escape(name)}\u2019\u2026"))
     loop = asyncio.get_running_loop()
@@ -5655,7 +5655,7 @@ async def _handle_gdrive_wizard_input(update: Update, context: ContextTypes.DEFA
     if ok:
         logger.warning("gdrive account '%s' connected by user=%s chat=%s",
                        name, update.effective_user.id, chat_id)
-        await update.message.reply_text(_t(lang,
+        await _msg(update).reply_text(_t(lang,
             f"\u2705 <b>{_tg_escape(name)}</b> connected and verified -- a real upload "
             f"and folder check both succeeded, not just \u201csaved\u201d.\n\n"
             f"Run /gdrive to pick it for this room.",
@@ -5666,7 +5666,7 @@ async def _handle_gdrive_wizard_input(update: Update, context: ContextTypes.DEFA
     else:
         logger.warning("gdrive connect '%s' failed for user=%s: %s",
                        name, update.effective_user.id, detail)
-        await update.message.reply_text(_t(lang,
+        await _msg(update).reply_text(_t(lang,
             f"\u274c Couldn't connect \u2018{_tg_escape(name)}\u2019: {_tg_escape(detail)}\n\n"
             "Nothing was left half-configured. Run /connectgdrive to try again.",
             f"\u274c Gagal menghubungkan \u2018{_tg_escape(name)}\u2019: {_tg_escape(detail)}\n\n"
@@ -5689,24 +5689,24 @@ async def _handle_wizard_input(update: Update, context: ContextTypes.DEFAULT_TYP
     if state.get("step") == "await_brief":
         _wizard.pop(chat_id, None)
         if state["expires"] < _dt.datetime.now().timestamp():
-            await update.message.reply_text(_t(lang,
+            await _msg(update).reply_text(_t(lang,
                 "\u231b That expired. Run /start again.",
                 "\u231b Sudah kedaluwarsa. Jalankan /start lagi.",
             ))
             return True
-        role = (update.message.text or "").strip()
+        role = (_msg(update).text or "").strip()
         if role.lower() in ("/cancel", "cancel", "batal"):
-            await update.message.reply_text(_t(lang, "\u2716\ufe0f Cancelled.", "\u2716\ufe0f Dibatalkan."))
+            await _msg(update).reply_text(_t(lang, "\u2716\ufe0f Cancelled.", "\u2716\ufe0f Dibatalkan."))
             return True
         if len(role) < 3:
-            await update.message.reply_text(_t(lang,
+            await _msg(update).reply_text(_t(lang,
                 "That is too short to be useful. Run /start and try again.",
                 "Terlalu pendek untuk berguna. Jalankan /start dan coba lagi.",
             ))
             return True
         set_brief_role(role)
         _mark_setup("brief", update.effective_user.id)
-        await update.message.reply_text(_t(lang,
+        await _msg(update).reply_text(_t(lang,
             f"\u2705 <b>Recorded.</b> This agent looks after: <b>{_tg_escape(role)}</b>\n\n"
             "Next: /addserver to give it a machine to reach, and /addboundary for "
             "anything it must never touch. Run /start if anything else still needs "
@@ -5723,27 +5723,27 @@ async def _handle_wizard_input(update: Update, context: ContextTypes.DEFAULT_TYP
     if state["expires"] < _dt.datetime.now().timestamp():
         _wizard.pop(chat_id, None)
         state["handle"].kill()
-        await update.message.reply_text(_t(lang,
+        await _msg(update).reply_text(_t(lang,
             "⌛ That sign-in expired. Run /start to try again.",
             "⌛ Sign-in itu sudah kedaluwarsa. Jalankan /start untuk coba lagi.",
         ))
         return True
 
-    text = (update.message.text or "").strip()
+    text = (_msg(update).text or "").strip()
     if text.lower() in ("/cancel", "cancel", "batal"):
         _wizard.pop(chat_id, None)
         state["handle"].kill()
-        await update.message.reply_text(_t(lang, "✖️ Sign-in cancelled.", "✖️ Sign-in dibatalkan."))
+        await _msg(update).reply_text(_t(lang, "✖️ Sign-in cancelled.", "✖️ Sign-in dibatalkan."))
         return True
 
     handle, human = state["handle"], state["human"]
     _wizard.pop(chat_id, None)
-    await update.message.reply_text(_t(lang, f"⏳ Sending the code to {human}…", f"⏳ Mengirim kode ke {human}…"))
+    await _msg(update).reply_text(_t(lang, f"⏳ Sending the code to {human}…", f"⏳ Mengirim kode ke {human}…"))
 
     # The code was a chat message and is a credential, however short-lived --
     # take it out of the history now rather than leaving it sitting there.
     try:
-        await update.message.delete()
+        await _msg(update).delete()
     except Exception:
         logger.info("could not delete the code message (needs admin rights in groups)")
 
@@ -5754,7 +5754,7 @@ async def _handle_wizard_input(update: Update, context: ContextTypes.DEFAULT_TYP
     except Exception as exc:
         logger.exception("login completion failed")
         handle.kill()
-        await update.message.reply_text(_t(lang, f"⚠️ Sign-in failed: {exc}", f"⚠️ Sign-in gagal: {exc}"))
+        await _msg(update).reply_text(_t(lang, f"⚠️ Sign-in failed: {exc}", f"⚠️ Sign-in gagal: {exc}"))
         return True
     handle.kill()
 
@@ -5762,12 +5762,12 @@ async def _handle_wizard_input(update: Update, context: ContextTypes.DEFAULT_TYP
         provider = "agy" if "Antigravity" in human else "claude"
         _mark_setup(provider, update.effective_user.id)
         logger.warning("%s sign-in completed by user=%s", human, update.effective_user.id)
-        await update.message.reply_text(_t(lang,
+        await _msg(update).reply_text(_t(lang,
             f"✅ <b>{human} signed in.</b>\n\nRun /start to see what's left.",
             f"✅ <b>{human} sudah sign-in.</b>\n\nJalankan /start untuk lihat sisanya.",
         ), parse_mode="HTML")
     else:
-        await update.message.reply_text(_t(lang,
+        await _msg(update).reply_text(_t(lang,
             f"⚠️ {human} didn't accept that code. It may have expired — codes are "
             f"short-lived, so grabbing a fresh one usually fixes it.\n\n"
             f"<pre>{_tg_escape(screen[-500:])}</pre>\n\nRun /start to retry.",
@@ -8999,18 +8999,18 @@ async def _handle_server_input(update: Update, context: ContextTypes.DEFAULT_TYP
     state = _server_wizard.get(chat_id)
     lang = _chat_lang(update)
     if state and state["step"] == "authorize":
-        text = (update.message.text or "").strip()
+        text = (_msg(update).text or "").strip()
         if text.lower().startswith("usekey "):
             name = text.split(None, 1)[1].strip()
             key = Path.home() / ".ssh" / name
             if not key.exists() or not key.with_suffix(".pub").exists():
-                await update.message.reply_text(_t(lang,
+                await _msg(update).reply_text(_t(lang,
                     f"No keypair named '{name}' on this host. Send just the name, without .pub",
                     f"Tidak ada keypair bernama '{name}' di host ini. Kirim namanya saja, tanpa .pub",
                 ))
                 return True
             state["data"]["key"] = str(key)
-            await update.message.reply_text(_t(lang,
+            await _msg(update).reply_text(_t(lang,
                 f"🔑 Using <code>{_tg_escape(name)}</code>. Tap Test above.",
                 f"🔑 Memakai <code>{_tg_escape(name)}</code>. Tap Test di atas.",
             ), parse_mode="HTML")
@@ -9020,55 +9020,55 @@ async def _handle_server_input(update: Update, context: ContextTypes.DEFAULT_TYP
         return False
     if state["expires"] < _dt.datetime.now().timestamp():
         _server_wizard.pop(chat_id, None)
-        await update.message.reply_text(_t(lang, "⌛ That form expired. Run /addserver again.",
+        await _msg(update).reply_text(_t(lang, "⌛ That form expired. Run /addserver again.",
                                               "⌛ Form itu sudah kedaluwarsa. Jalankan /addserver lagi."))
         return True
 
-    text = (update.message.text or "").strip()
+    text = (_msg(update).text or "").strip()
     if text.lower() in ("/cancel", "cancel", "batal"):
         _server_wizard.pop(chat_id, None)
-        await update.message.reply_text(_t(lang, "✖️ Cancelled. Nothing was saved.",
+        await _msg(update).reply_text(_t(lang, "✖️ Cancelled. Nothing was saved.",
                                               "✖️ Dibatalkan. Tidak ada yang disimpan."))
         return True
 
     step, data = state["step"], state["data"]
     if step == "name":
         if not _NAME_RE.match(text):
-            await update.message.reply_text(_t(lang, "Lowercase letters, digits, - and _ only. Try again.",
+            await _msg(update).reply_text(_t(lang, "Lowercase letters, digits, - and _ only. Try again.",
                                                   "Huruf kecil, angka, - dan _ saja. Coba lagi."))
             return True
         if any(s["name"] == text for s in _read_servers()):
-            await update.message.reply_text(_t(lang, f"'{text}' already exists. Pick another name.",
+            await _msg(update).reply_text(_t(lang, f"'{text}' already exists. Pick another name.",
                                                   f"'{text}' sudah ada. Pilih nama lain."))
             return True
         data["name"] = text
         state["step"] = "host"
-        await update.message.reply_text(_srv_prompt("host", lang), parse_mode="HTML")
+        await _msg(update).reply_text(_srv_prompt("host", lang), parse_mode="HTML")
         return True
 
     if step == "host":
         if not _HOST_RE.match(text):
-            await update.message.reply_text(_t(lang, "That doesn't look like an IP or hostname. Try again.",
+            await _msg(update).reply_text(_t(lang, "That doesn't look like an IP or hostname. Try again.",
                                                   "Itu tidak seperti IP atau hostname. Coba lagi."))
             return True
         data["host"] = text
         state["step"] = "user"
-        await update.message.reply_text(_srv_prompt("user", lang), parse_mode="HTML")
+        await _msg(update).reply_text(_srv_prompt("user", lang), parse_mode="HTML")
         return True
 
     if step == "user":
         if not re.match(r"^[a-z_][a-z0-9_-]{0,31}$", text):
-            await update.message.reply_text(_t(lang, "That doesn't look like a username. Try again.",
+            await _msg(update).reply_text(_t(lang, "That doesn't look like a username. Try again.",
                                                   "Itu tidak seperti username. Coba lagi."))
             return True
         data["user"] = text
         state["step"] = "port"
-        await update.message.reply_text(_srv_prompt("port", lang), parse_mode="HTML")
+        await _msg(update).reply_text(_srv_prompt("port", lang), parse_mode="HTML")
         return True
 
     # port -> show the public key and wait for them to install it
     if not text.isdigit() or not (1 <= int(text) <= 65535):
-        await update.message.reply_text(_t(lang, "Port must be a number between 1 and 65535.",
+        await _msg(update).reply_text(_t(lang, "Port must be a number between 1 and 65535.",
                                               "Port harus angka antara 1 dan 65535."))
         return True
     data["port"] = int(text)
@@ -9086,7 +9086,7 @@ async def _handle_server_input(update: Update, context: ContextTypes.DEFAULT_TYP
     except Exception as exc:
         logger.exception("could not prepare the agent keypair")
         _server_wizard.pop(chat_id, None)
-        await update.message.reply_text(_t(lang,
+        await _msg(update).reply_text(_t(lang,
             f"⚠️ Couldn't prepare an SSH key: {exc}",
             f"⚠️ Gagal siapkan SSH key: {exc}",
         ))
@@ -9098,7 +9098,7 @@ async def _handle_server_input(update: Update, context: ContextTypes.DEFAULT_TYP
     # opposite -- an unguarded key whose NAME says read-only.
     if _keys_configured():
         pubkey = SSH_RW_KEY.with_suffix(".pub").read_text().strip()
-    await update.message.reply_text(
+    await _msg(update).reply_text(
         _t(lang,
            f"🔑 <b>Authorise the agent on {_tg_escape(data['host'])}</b>\n\n"
            "Run this <b>on that machine</b>, as "
@@ -9127,7 +9127,7 @@ async def _handle_server_input(update: Update, context: ContextTypes.DEFAULT_TYP
         # Already have a key that reaches this machine? Say so instead of
         # installing a second one. The key itself never moves through chat --
         # you pick a name, and the file stays on this host.
-        await update.message.reply_text(
+        await _msg(update).reply_text(
             _t(lang,
                "🔑 <i>Already have a key that reaches it?</i> These are on this host:\n",
                "🔑 <i>Sudah punya key yang bisa menjangkaunya?</i> Ini yang ada di host ini:\n",
@@ -10103,7 +10103,9 @@ async def _run_turn_inner(update: Update, context: ContextTypes.DEFAULT_TYPE, te
                 # Visible, not silent: auto-writes the user can't see are how a
                 # brief quietly drifts away from what they think it says.
                 bullets = "\n".join(f"• {_tg_escape(f)}" for f in newly_learned)
-                await update.message.reply_text(_t(lang,
+                # _msg(): inside the delivery block, reachable from a resumed
+                # turn (button) and from an edited message.
+                await _msg(update).reply_text(_t(lang,
                     f"🧠 <i>Recorded to environment knowledge ({len(newly_learned)} new):</i>\n{bullets}",
                     f"🧠 <i>Dicatat ke pengetahuan lingkungan ({len(newly_learned)} baru):</i>\n{bullets}",
                 ), parse_mode="HTML")
@@ -10117,7 +10119,11 @@ async def _run_turn_inner(update: Update, context: ContextTypes.DEFAULT_TYPE, te
                 await asyncio.sleep(3)
             else:
                 try:
-                    await update.message.reply_text(_t(lang,
+                    # THE line behind "even the failure notice couldn't be
+                    # delivered" in the 10:03 and 10:05 logs: the notice that
+                    # reports a failed delivery reached for the same None
+                    # target that had just caused the failure.
+                    await _msg(update).reply_text(_t(lang,
                         "⚠️ The answer finished processing but couldn't be delivered "
                         "(connection issue reaching Telegram). Please resend the same message.",
                         "⚠️ Jawaban sudah selesai diproses tapi gagal dikirim (masalah koneksi "

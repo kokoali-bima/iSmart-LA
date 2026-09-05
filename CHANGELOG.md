@@ -1,5 +1,41 @@
 # Changelog
 
+## v0.2b.76 -- the whole class, not the three that fired
+
+v0.2b.75 fixed three crashes that shared one shape: code reached for
+`update.message`, and the update was a button callback or an edited message,
+where it is None. Fixing the three that happened to fire is not fixing the
+class, so this walks the call graph instead.
+
+From every entry point where `update.message` is not guaranteed -- all fifteen
+button and keypad handlers, the unlock-and-resume flow, the turn runner, and
+`handle_message` (which admits edited messages **on purpose**, via
+`allow_edited=True`) -- 159 functions are reachable. Six of them still touched
+`update.message` directly:
+
+    _run_turn_inner              the "recorded to knowledge" note, and
+                                 THE failure notice itself -- which is why the
+                                 logs said "even the failure notice couldn't be
+                                 delivered"
+    _handle_wizard_input         reads update.message.text
+    _handle_server_input         reads update.message.text
+    _handle_gdrive_wizard_input  reads update.message.text
+    _gdrive_begin_device         replies
+    _gdrive_begin_rclone         replies
+
+The three wizards are the sharper find: `handle_message` reads
+`effective_message` and lets edited messages through, then hands them to
+wizards that read `update.message.text`. Editing a message while an OAuth code
+or a server address was pending would have crashed. Fifty lines now go through
+`_msg()`.
+
+**`dev/test_reply_target.py`** makes it permanent: it re-walks that call graph
+on every run and fails if anything reachable from an unguarded entry point
+touches `update.message` directly. The next function to get this wrong fails in
+the suite rather than in a chat.
+
+839/839 across 38 suites.
+
 ## v0.2b.75 -- the write window stops fighting the work it authorised
 
 A night of real failures, all reported by the operator, all reproduced.

@@ -129,7 +129,7 @@ ERRORS = [
                  "messages through on purpose, so the turn ran and then had "
                  "nowhere to reply.",
         "fix": "_msg() falls back to update.effective_message.",
-        "guard": "test_unlock_window.py",
+        "guard": "test_reply_target.py",
         "release": "v0.2b.75",
     },
     {
