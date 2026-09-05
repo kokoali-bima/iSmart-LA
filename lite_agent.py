@@ -143,6 +143,79 @@ TURN_TOKEN_CEILING = int(os.environ.get("TURN_TOKEN_CEILING", "0") or 0)
 TURN_COST_HINT_TOKENS = int(os.environ.get("TURN_COST_HINT_TOKENS", "200000") or 0)
 
 
+# A long turn used to look identical to a dead bot: no typing indicator lasts
+# minutes, and nothing else was sent until the answer. Measured across 178 real
+# turns on this deployment: median 29s, p75 84s, p90 284s, p95 493s, longest
+# 6841s (1h54m). 76% finish inside a minute.
+#
+# So the first note waits 90s -- three quarters of all turns never produce one
+# at all -- and after that ONE message is edited in place every 3 minutes
+# rather than a new message each time. At the 3-minute cadence that 1h54m turn
+# would otherwise have sent 38 separate messages; edited in place it stays a
+# single line that is always current.
+HEARTBEAT_FIRST_SECONDS = int(os.environ.get("HEARTBEAT_FIRST_SECONDS", "90"))
+HEARTBEAT_EVERY_SECONDS = int(os.environ.get("HEARTBEAT_EVERY_SECONDS", "180"))
+# How close to the end of the write window before the heartbeat starts offering
+# to extend it. The incident this comes from: a window opened for 10 minutes
+# while the turn it was opened for ran 18.
+WRITE_WARN_MINUTES = int(os.environ.get("WRITE_WARN_MINUTES", "5"))
+
+
+async def _progress_heartbeat(context, chat_id: int, lang: str,
+                              started: "_dt.datetime", cap: int) -> None:
+    """Keep one 'still working' line current while a turn runs.
+
+    Never lets its own failure touch the turn: every Telegram call here is
+    wrapped, because a progress note that breaks the work it is reporting on
+    would be worse than no note at all.
+    """
+    msg = None
+    try:
+        await asyncio.sleep(HEARTBEAT_FIRST_SECONDS)
+        while True:
+            secs = int((_dt.datetime.now() - started).total_seconds())
+            mins = secs // 60
+            body = _t(lang,
+                      f"⏳ Still working — {mins} min {secs % 60}s so far.",
+                      f"⏳ Masih dikerjakan — {mins} menit {secs % 60} detik.")
+            rows = []
+            until = write_mode_expires_at()
+            if until:
+                left = int((until - _dt.datetime.now().timestamp()) / 60) + 1
+                if left <= WRITE_WARN_MINUTES:
+                    room = write_mode_session_left(cap)
+                    body += _t(lang,
+                               f"\n🔓 Write access ends in about {left} min.",
+                               f"\n🔓 Akses tulis habis sekitar {left} menit lagi.")
+                    if room > 1:
+                        add = min(WRITE_MODE_DEFAULT_MINUTES, room)
+                        rows = [[InlineKeyboardButton(
+                            _t(lang, f"➕ Extend {add} min",
+                                     f"➕ Perpanjang {add} menit"),
+                            callback_data=f"extend_write:{add}")]]
+            markup = InlineKeyboardMarkup(rows) if rows else None
+            try:
+                if msg is None:
+                    msg = await context.bot.send_message(
+                        chat_id=chat_id, text=body, reply_markup=markup)
+                else:
+                    await context.bot.edit_message_text(
+                        chat_id=chat_id, message_id=msg.message_id,
+                        text=body, reply_markup=markup)
+            except Exception:
+                pass        # a stale heartbeat is not worth a failed turn
+            await asyncio.sleep(HEARTBEAT_EVERY_SECONDS)
+    except asyncio.CancelledError:
+        # The real answer lands next, so the placeholder has done its job.
+        if msg is not None:
+            try:
+                await context.bot.delete_message(chat_id=chat_id,
+                                                 message_id=msg.message_id)
+            except Exception:
+                pass
+        raise
+
+
 def cost_hint_due(sess: dict, turn_in: int) -> tuple[bool, int]:
     """Should this turn carry the "this conversation is getting expensive" note?
 
@@ -459,12 +532,22 @@ WRITE_STATE_FILE = BASE_DIR / "write_mode.json"
 SSH_ACTIVE_KEY = Path(os.environ.get("SSH_ACTIVE_KEY", str(Path.home() / ".ssh/agent_active")))
 SSH_RO_KEY = Path(os.environ.get("SSH_RO_KEY", str(Path.home() / ".ssh/agent_readonly")))
 SSH_RW_KEY = Path(os.environ.get("SSH_RW_KEY", str(Path.home() / ".ssh/agent_write")))
-WRITE_MODE_MAX_MINUTES = int(os.environ.get("WRITE_MODE_MAX_MINUTES", "60"))
-WRITE_MODE_DEFAULT_MINUTES = int(os.environ.get("WRITE_MODE_DEFAULT_MINUTES", "15"))
-# Ceiling when /unlock is opened from a group rather than a DM -- open-ended
-# write access for the whole window, not one pre-approved action, so it gets
-# a shorter leash than the 60-minute DM ceiling regardless of what is asked for.
-WRITE_MODE_GROUP_MAX_MINUTES = int(os.environ.get("WRITE_MODE_GROUP_MAX_MINUTES", "10"))
+# Six hours is the ceiling, thirty minutes the default. Both were raised after
+# a night that showed the old numbers were not a safety property, they were a
+# nuisance that produced MORE unlocks: a 10-minute group window opened at
+# 23:06:50 for a turn that ran until 23:25:01 -- eighteen minutes, because agy
+# failed over mid-turn and the second model started from scratch. The window
+# died with nine minutes of work still to go, and the operator was asked to
+# unlock again, twice inside 33 seconds. Fourteen unlocks in one day.
+#
+# A window too short to cover one turn does not reduce exposure. It just trains
+# whoever is holding the phone to approve without reading.
+WRITE_MODE_MAX_MINUTES = int(os.environ.get("WRITE_MODE_MAX_MINUTES", "360"))
+WRITE_MODE_DEFAULT_MINUTES = int(os.environ.get("WRITE_MODE_DEFAULT_MINUTES", "30"))
+# Groups still get their own knob, because a group window is open-ended access
+# for every member rather than one pre-approved action. It now matches the DM
+# ceiling by default -- lower it here if a room should have a shorter leash.
+WRITE_MODE_GROUP_MAX_MINUTES = int(os.environ.get("WRITE_MODE_GROUP_MAX_MINUTES", "360"))
 
 
 def _keys_configured() -> bool:
@@ -512,13 +595,50 @@ def lock_write_mode() -> None:
             logger.exception("could not swap back to the read-only key")
 
 
-def unlock_write_mode(minutes: int, max_minutes: Optional[int] = None) -> float:
+def unlock_write_mode(minutes: int, max_minutes: Optional[int] = None,
+                      extend: bool = False) -> float:
+    """Open the write window, or push out the one already open.
+
+    `opened_at` is recorded so an EXTENSION can be granted without asking for
+    the PIN again while still being bounded: the PIN authorised a session, and
+    that session may not outlive the ceiling however many times it is extended.
+    Without that timestamp, "extend" would be an unlimited renewal and the
+    ceiling would mean nothing.
+    """
     minutes = max(1, min(minutes, max_minutes or WRITE_MODE_MAX_MINUTES))
-    until = _dt.datetime.now().timestamp() + minutes * 60
+    now = _dt.datetime.now().timestamp()
+    opened_at = now
+    if extend:
+        try:
+            prev = json.loads(WRITE_STATE_FILE.read_text())
+            opened_at = float(prev.get("opened_at") or now)
+        except (OSError, ValueError, TypeError):
+            opened_at = now
+    until = now + minutes * 60
+    # Never past the ceiling measured from the ORIGINAL PIN, not from this
+    # extension -- otherwise a chain of extensions is an open-ended unlock.
+    hard_stop = opened_at + (max_minutes or WRITE_MODE_MAX_MINUTES) * 60
+    until = min(until, hard_stop)
     _point_active_key_at(SSH_RW_KEY)
-    WRITE_STATE_FILE.write_text(json.dumps({"until": until}))
-    logger.warning("WRITE MODE OPENED for %d minute(s)", minutes)
+    WRITE_STATE_FILE.write_text(json.dumps({"until": until, "opened_at": opened_at}))
+    logger.warning("WRITE MODE %s until +%d minute(s)",
+                   "EXTENDED" if extend else "OPENED", int((until - now) / 60))
     return until
+
+
+def write_mode_session_left(max_minutes: Optional[int] = None) -> int:
+    """Minutes still available to extend into, from the original PIN. Zero when
+    the session has used its whole ceiling and a fresh PIN is required."""
+    try:
+        prev = json.loads(WRITE_STATE_FILE.read_text())
+        opened_at = float(prev.get("opened_at") or 0)
+    except (OSError, ValueError, TypeError):
+        return 0
+    if not opened_at:
+        return 0
+    cap = (max_minutes or WRITE_MODE_MAX_MINUTES) * 60
+    left = (opened_at + cap) - _dt.datetime.now().timestamp()
+    return max(0, int(left / 60))
 
 
 def write_mode_notice() -> str:
@@ -1236,16 +1356,27 @@ def _rebuild_ssh_config(items: list[dict]) -> None:
 def test_server_ssh(host: str, user: str, port: int, timeout: int = 20,
                     key_path: Optional[str] = None) -> tuple[bool, str]:
     key = Path(key_path) if key_path else agent_keypair()[0]
+    # A BARE command, with no shell operators. The probe used to be
+    # `echo ISMART_OK && uname -sr`, and our OWN read-only guard refused it:
+    # pve-ro-guard denies any `&`, `;`, backtick or redirect outright, before
+    # it ever looks at the verbs. So every /addserver against an
+    # already-secured Proxmox failed with "refused -- this key is read-only",
+    # while the key itself was fine. Reproduced on both hosts in this fleet.
+    # The only server that ever registered got in before the guard existed.
+    #
+    # `uname -sr` needs no sentinel: it either answers "Linux <release>" or it
+    # did not run. That is the same evidence ISMART_OK was carrying, without
+    # asking the guard to parse a compound command.
     proc = subprocess.run(
         ["ssh", "-i", str(key), "-p", str(port),
          "-o", "StrictHostKeyChecking=no", "-o", "BatchMode=yes",
          "-o", f"ConnectTimeout={timeout}", f"{user}@{host}",
-         "echo ISMART_OK && uname -sr"],
+         "uname -sr"],
         capture_output=True, text=True, timeout=timeout + 10,
     )
-    if "ISMART_OK" in proc.stdout:
-        detail = proc.stdout.replace("ISMART_OK", "").strip()
-        return True, detail or "connected"
+    out = (proc.stdout or "").strip()
+    if proc.returncode == 0 and out and "refused" not in out.lower():
+        return True, out
     return False, (proc.stderr or proc.stdout or "no response").strip()[-400:]
 
 
@@ -3580,11 +3711,29 @@ def _chunk_lines(text: str, limit: int) -> list[str]:
 
 
 def _msg(update: Update):
-    """The message to reply to, whether this turn came from the user typing or
-    from them tapping a button (a callback update has no .message)."""
+    """The message to reply to, whatever kind of update this is.
+
+    Three cases, and the third one cost a night of failed deliveries. A typed
+    message has .message. A tapped button has none -- the message hangs off
+    .callback_query. And an EDITED message has neither: PTB puts it on
+    .edited_message.
+
+    _authorized() lets edited messages through on purpose (editing a message to
+    add the @mention you forgot is a normal thing to do), and its comment says
+    that path "reads effective_message instead" -- but this helper never did.
+    So an edited message passed the gate, ran a full turn, and then died in
+    _reply_chunked with "'NoneType' object has no attribute 'reply_text'",
+    twice per turn, including on the notice that was meant to report the
+    failure. Real logs, 10:03 and 10:05 this morning.
+
+    effective_message is PTB's own answer to exactly this question, so use it
+    rather than growing another branch per update type.
+    """
     if update.message is not None:
         return update.message
-    return update.callback_query.message if update.callback_query else None
+    if update.callback_query is not None:
+        return update.callback_query.message
+    return update.effective_message
 
 
 async def _reply_chunked(update: Update, text: str, tag_html: str = "",
@@ -4097,7 +4246,17 @@ def _gdrive_upload(remote: str, local_path: str, drive_rel_path: str) -> tuple[b
             timeout=GDRIVE_UPLOAD_TIMEOUT,
         )
     except subprocess.CalledProcessError as exc:
-        return False, ((exc.stderr or exc.stdout or str(exc)) or "").strip()[:500]
+        blob = ((exc.stderr or exc.stdout or str(exc)) or "").strip()
+        # rclone's shared Google client_id is used by everybody who never made
+        # their own, so its project-wide query quota runs out from time to time
+        # and Google answers 403 "Quota exceeded for quota metric 'Queries'".
+        # Nothing is wrong with the account, the file or the config, and it
+        # clears on its own -- verified: the same remote listed fine five hours
+        # later. Saying that is more useful than pasting rclone's CRITICAL line,
+        # which reads like the Drive connection is broken.
+        if "403" in blob and "quota" in blob.lower():
+            return False, "gdrive_shared_quota"
+        return False, blob[:500]
     except subprocess.TimeoutExpired:
         return False, "timed out talking to Google Drive"
 
@@ -4181,6 +4340,17 @@ async def _send_to_gdrive(update: Update, context: ContextTypes.DEFAULT_TYPE, re
         await _msg(update).reply_text(_t(lang,
             f"\U0001f4c1 Uploaded to Drive ({remote}): {rel_path}{link_en}",
             f"\U0001f4c1 Terupload ke Drive ({remote}): {rel_path}{link_id}",
+        ))
+    elif detail == "gdrive_shared_quota":
+        await _msg(update).reply_text(_t(lang,
+            f"\u23f3 Drive is rate-limited right now, so {rel_path} was not "
+            f"uploaded. This is Google's shared quota for rclone's public "
+            f"client, not a problem with your account or the file \u2014 it "
+            f"clears on its own. Ask again in a few minutes.",
+            f"\u23f3 Drive sedang kena batas laju, jadi {rel_path} belum "
+            f"terupload. Ini kuota bersama Google untuk klien publik rclone, "
+            f"bukan masalah akun atau file Anda \u2014 dan pulih sendiri. "
+            f"Minta lagi beberapa menit lagi.",
         ))
     else:
         await _msg(update).reply_text(_t(lang,
@@ -6488,6 +6658,38 @@ async def cmd_unlock(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         return
 
     cap = _effective_unlock_cap(update)
+    # Already open? Then this is not a new authorisation, it is someone
+    # checking or wanting more time -- so say what is left and offer to extend,
+    # rather than putting the PIN keypad up again. Fourteen unlocks were
+    # recorded in one day, most of them this exact situation.
+    open_until = write_mode_expires_at()
+    if open_until:
+        left = int((open_until - _dt.datetime.now().timestamp()) / 60) + 1
+        session_left = write_mode_session_left(cap)
+        rows = []
+        if session_left > 1:
+            add = min(WRITE_MODE_DEFAULT_MINUTES, session_left)
+            rows = [[InlineKeyboardButton(
+                _t(lang, f"➕ Extend {add} min", f"➕ Perpanjang {add} menit"),
+                callback_data=f"extend_write:{add}")]]
+        await _msg(update).reply_text(
+            _t(lang,
+               f"🔓 Write mode is already open — about <b>{left} minute(s)</b> left.\n"
+               f"No second PIN needed."
+               + (f" You can extend up to {session_left} more minute(s) on this "
+                  f"session." if session_left > 1 else
+                  " This session has used its full window; /lock then /unlock "
+                  "for a new one."),
+               f"🔓 Write mode masih terbuka — sisa sekitar <b>{left} menit</b>.\n"
+               f"Tidak perlu PIN lagi."
+               + (f" Bisa diperpanjang sampai {session_left} menit lagi di sesi "
+                  f"ini." if session_left > 1 else
+                  " Sesi ini sudah memakai jatah penuhnya; /lock lalu /unlock "
+                  "untuk sesi baru."),
+            ),
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(rows) if rows else None)
+        return
     minutes = min(WRITE_MODE_DEFAULT_MINUTES, cap)
     if context.args:
         try:
@@ -6509,6 +6711,48 @@ async def cmd_unlock(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
            f"🔓 Konfirmasi buka write mode untuk {min(minutes, cap)} menit.",
         ),
     )
+
+
+async def cmd_extend_write_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Push out an open write window WITHOUT asking for the PIN again.
+
+    The PIN authorised a session, not a stopwatch. Infrastructure work runs for
+    hours, and re-entering the PIN every half hour does not make anything safer
+    -- it makes the prompt something people clear without reading, which is the
+    opposite of what it is for.
+
+    What keeps this bounded is unlock_write_mode(extend=True): the ceiling is
+    measured from the ORIGINAL unlock, so extensions cannot chain past it. When
+    the session has spent its whole ceiling, a fresh PIN is required.
+    """
+    query = update.callback_query
+    await query.answer()
+    lang = _chat_lang(update)
+    if not await _may_authorize_group_action(update, context):
+        return
+    if not write_mode_expires_at():
+        await query.edit_message_text(_t(lang,
+            "🔒 The window already closed. /unlock to open a new one.",
+            "🔒 Jendelanya sudah tertutup. /unlock untuk membuka yang baru."))
+        return
+    cap = _effective_unlock_cap(update)
+    try:
+        asked = int(query.data.split(":", 1)[1])
+    except (ValueError, IndexError):
+        asked = WRITE_MODE_DEFAULT_MINUTES
+    room = write_mode_session_left(cap)
+    if room < 1:
+        await query.edit_message_text(_t(lang,
+            "⏳ This session has used its full window. /lock then /unlock for a new one.",
+            "⏳ Sesi ini sudah memakai jatah penuhnya. /lock lalu /unlock untuk sesi baru."))
+        return
+    until = unlock_write_mode(min(asked, room), max_minutes=cap, extend=True)
+    left = int((until - _dt.datetime.now().timestamp()) / 60) + 1
+    await query.edit_message_text(_t(lang,
+        f"🔓 Extended — about {left} minute(s) of write access left. No PIN needed: "
+        f"same session.",
+        f"🔓 Diperpanjang — sisa sekitar {left} menit akses tulis. Tanpa PIN: "
+        f"masih sesi yang sama."))
 
 
 async def cmd_lock(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -9215,7 +9459,11 @@ async def offer_unlock(update: Update, reason: str, original_prompt: str,
             "\n\n<i>Saya tidak bisa tahu VM mana yang dimaksud, jadi tidak ada tawaran "
             "snapshot. Snapshot sendiri dulu kalau itu penting.</i>",
         ) + note
-    await update.message.reply_text(
+    # _msg(), not update.message: this is reached from _do_unlock_and_resume,
+    # which runs inside a BUTTON callback, where update.message is always None.
+    # It crashed there for real -- twice last night, taking the whole turn down
+    # after the work had already been done.
+    await _msg(update).reply_text(
         _t(lang,
            f"🔒 <b>The agent needs write access.</b>\n\n"
            f"It wants to: <b>{_tg_escape(reason[:300])}</b>\n\n"
@@ -9647,6 +9895,13 @@ async def _run_turn_inner(update: Update, context: ContextTypes.DEFAULT_TYPE, te
     resume-after-unlock flow, which has no incoming message of its own.
     """
     chat_id = str(update.effective_chat.id)
+    # Was write mode already open when this turn STARTED? The re-offer at the
+    # end must not fire for a turn the operator already authorized. Checked
+    # here rather than at the end because a long turn can outlive its own
+    # window -- which is exactly what happened: unlocked at 23:06:50 for ten
+    # minutes, turn finished at 23:25:01, and the end-of-turn check saw a
+    # closed window and asked for the PIN all over again.
+    write_open_at_start = write_mode_expires_at() is not None
 
     sessions = load_sessions()
     state = get_chat_state(sessions, chat_id)
@@ -9664,6 +9919,11 @@ async def _run_turn_inner(update: Update, context: ContextTypes.DEFAULT_TYPE, te
     started = _dt.datetime.now()
 
     lang = _chat_lang(update)
+    # One "still working" line, edited in place, while the model runs. Started
+    # here and cancelled in the finally below so it can never outlive its turn.
+    beat = asyncio.create_task(_progress_heartbeat(
+        context, update.effective_chat.id, lang, started,
+        _effective_unlock_cap(update)))
     try:
         # run_combo shells out to agy/claude and blocks for minutes at a time
         # -- one live turn was measured at 4m35s. Called directly, as it was
@@ -9678,8 +9938,18 @@ async def _run_turn_inner(update: Update, context: ContextTypes.DEFAULT_TYPE, te
         )
     except Exception as exc:
         logger.exception("combo run failed")
-        await update.message.reply_text(_t(lang, f"⚠️ Error: {exc}", f"⚠️ Error: {exc}"))
+        # _msg(), not update.message: this path is reachable from the
+        # unlock-and-resume button and from an edited message, where
+        # update.message is None -- the same shape that took down two turns
+        # last night in offer_unlock and _reply_chunked.
+        target = _msg(update)
+        if target is not None:
+            await target.reply_text(_t(lang, f"⚠️ Error: {exc}", f"⚠️ Error: {exc}"))
         return
+    finally:
+        # Always: the heartbeat must not outlive the turn it reports on, on
+        # the error path or the success one.
+        beat.cancel()
 
     # Gemini's own session can die silently between turns (see
     # _agy_attempt_needs_reauth) -- the chain already failed over to Claude for
@@ -9869,10 +10139,28 @@ async def _run_turn_inner(update: Update, context: ContextTypes.DEFAULT_TYPE, te
     # Refused by the node guard? Offer to unlock (snapshotting first if the
     # operator wants) and re-run. Nothing is guessed from the wording of the
     # request -- the guard already decided; we are only reacting to it.
+    wants_write = (needs_write
+                   or blocked_by_readonly(result.get("result") or "", attempts))
+    if write_open_at_start and wants_write and not write_mode_expires_at():
+        # Authorized when it started, expired while it ran. Say so in one line
+        # instead of putting up a second unlock card -- the operator already
+        # answered this question for this piece of work, and asking again is
+        # how a security prompt turns into a reflex.
+        # A separate line, not appended to cost_note: the reply itself already
+        # went out ~60 lines above, so anything added to that string now would
+        # be written and never sent.
+        logger.warning("write window expired mid-turn (chat=%s)", chat_id)
+        target = _msg(update)
+        if target is not None:
+            await target.reply_text(_t(lang,
+                "🔓 The write window closed while this was still running. "
+                "/unlock again to finish it.",
+                "🔓 Jendela write tertutup saat ini masih berjalan. "
+                "/unlock lagi untuk menyelesaikannya."))
     if (await _may_authorize_group_action(update, context) and _keys_configured()
             and not write_mode_expires_at()
-            and (needs_write
-                 or blocked_by_readonly(result.get("result") or "", attempts))):
+            and not write_open_at_start
+            and wants_write):
         await offer_unlock(
             update,
             needs_write or "make a change it was blocked from making",
@@ -10068,6 +10356,8 @@ def main() -> None:
     app.add_handler(CommandHandler("gdrivestatus", cmd_gdrivestatus))
     app.add_handler(CallbackQueryHandler(cmd_server_button, pattern="^srv:"))
     app.add_handler(CallbackQueryHandler(cmd_needwrite_button, pattern="^nw:"))
+    app.add_handler(CallbackQueryHandler(cmd_extend_write_button,
+                                        pattern="^extend_write:"))
     app.add_handler(CommandHandler("agentstatus", cmd_agentstatus))
     app.add_handler(CommandHandler("providers", cmd_providers))
     app.add_handler(CommandHandler("schedules", cmd_schedules))

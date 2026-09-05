@@ -81,6 +81,25 @@ try:
 except Exception as exc:
     print(f"  symbol index did not run: {exc}\n")
 
+# The error index is the other half: SYMBOLS.md answers "does this name exist",
+# ERRORS.md answers "has this gone wrong before, and what stops it now". Its
+# exit 3 means a shipped bug lost the test that was guarding it -- which is how
+# the same bug gets released twice -- so it fails the run for the same reason a
+# duplicate name does. Any other failure is the tool's problem, not the code's.
+index_unguarded = False
+try:
+    err = subprocess.run([sys.executable, str(DEV / "error_index.py"), str(SRC)],
+                         capture_output=True, text=True, timeout=60)
+    for line in (err.stdout or "").strip().splitlines():
+        print(f"  {line}")
+    if err.returncode == INDEX_DUPLICATE_EXIT:
+        index_unguarded = True
+    elif err.returncode != 0:
+        print(f"  error index did not run (exit {err.returncode}) -- continuing")
+    print()
+except Exception as exc:
+    print(f"  error index did not run: {exc}\n")
+
 suites = sorted(DEV.glob("test_*.py"))
 if not suites:
     print("no test_*.py found in dev/")
@@ -136,4 +155,8 @@ if failed:
 if index_dupes:
     print("\nDUPLICATE TOP-LEVEL NAME -- the later definition silently "
           "replaces the earlier one. See the symbol index above.")
+    sys.exit(1)
+if index_unguarded:
+    print("\nA SHIPPED BUG LOST ITS GUARD -- see the error index above. "
+          "Restore the test or write a new one before releasing.")
     sys.exit(1)

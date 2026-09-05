@@ -1,5 +1,70 @@
 # Changelog
 
+## v0.2b.75 -- the write window stops fighting the work it authorised
+
+A night of real failures, all reported by the operator, all reproduced.
+
+**`/addserver` could not add anything, and it was our own guard doing it.**
+The Kota Bima Proxmox refused every attempt with `pve-ro-guard: refused -- this
+key is read-only`, though the key was installed correctly. The probe was
+`echo ISMART_OK && uname -sr`, and pve-ro-guard denies any `&`, `;`, backtick
+or redirect outright, before it looks at which verbs were used. So the sentinel
+that existed to prove the command ran was the exact reason it could not run.
+Reproduced on both hosts; the one server that ever registered got in before the
+guard was installed on it. The probe is now a bare `uname -sr`, verified
+against both hosts.
+
+**The PIN was asked for twice, and then the turn died.** From the logs:
+
+    23:06:50  WRITE MODE OPENED for 10 minute(s)   -> expires 23:16:50
+    23:06:51  running agy
+    23:21:26  running agy (failover, same turn)
+    23:25:01  AttributeError: 'NoneType' has no attribute 'reply_text'
+
+The window was ten minutes; the turn took eighteen, because agy failed over
+mid-turn and the second model started from scratch. The end-of-turn check saw a
+closed window and re-offered the unlock -- and `offer_unlock` reached for
+`update.message`, which is always None inside a button callback, so the whole
+turn died after the work was done. Fourteen unlocks in one day.
+
+Three changes. The default window is **30 minutes** and the ceiling **6 hours**.
+The end-of-turn re-offer is suppressed when the window was open at turn start,
+with a one-line note instead of a fresh PIN keypad. And `offer_unlock` replies
+through `_msg()`.
+
+**A second `/unlock` no longer opens a second keypad.** It reports the time
+left and offers an extend button that needs **no PIN** -- the PIN authorised a
+session, not a stopwatch, and infrastructure work runs for hours. What keeps it
+bounded is that the ceiling is measured from the ORIGINAL unlock, so extensions
+cannot chain past it; when the session has spent its ceiling, a fresh PIN is
+required.
+
+**Deliveries failed with nowhere to reply.** At 10:03 and 10:05, twice each,
+then "even the failure notice couldn't be delivered". `_msg()` handled typed
+messages and button callbacks but not EDITED ones, where both are None --
+though `_authorized()` lets edited messages through on purpose. It now falls
+back to `update.effective_message`.
+
+**A long turn no longer looks like a dead bot.** Measured across 178 real
+turns: median 29s, p75 84s, p90 284s, longest 6841s (1h54m); 76% finish inside
+a minute. So one "still working" line appears after 90 seconds and is **edited
+in place** every 3 minutes -- at that cadence the 1h54m turn would otherwise
+have sent 38 separate messages. When the write window is nearly up it carries
+the extend button.
+
+**Drive quota errors read like Drive is broken.** rclone's shared client_id ran
+out of Google's project-wide query quota and returned
+`403 Quota exceeded for quota metric 'Queries'`, which was pasted at the
+operator verbatim. Nothing was wrong with the account, file or config -- the
+same remote listed fine five hours later. It now says so.
+
+**New: `dev/error_index.py` and `ERRORS.md`.** Every failure this project has
+shipped, what caused it, and the test that guards it -- and the run FAILS when
+an entry points at a test that no longer exists, because a regression quietly
+losing its guard is how the same bug ships twice.
+
+832/832 across 37 suites.
+
 ## v0.2b.74 -- the expensive-conversation warning stops going quiet
 
 An evaluation of two third-party token-saving tools ended up measuring this
